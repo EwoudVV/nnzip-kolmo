@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kolmo"
+version = "0.0.1"
+description = "Online-trained neural compression. The model is grown from scratch during compression and re-grown identically during decompression."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+keywords = ["compression", "arithmetic-coding", "transformer", "hutter-prize"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.20",
+    "constriction>=0.3",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools]
+packages = ["kolmo"]
