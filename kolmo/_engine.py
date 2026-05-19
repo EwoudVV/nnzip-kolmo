@@ -14,7 +14,8 @@ from kolmo.model import KolmoTransformer
 
 SEED = 42
 LR = 1e-3
-CONTEXT = 512
+CONTEXT = 128  # sliding-window cap; smaller = faster, less long-range context
+BLOCK_SIZE = 16  # accumulate this many byte-losses before each optimizer step
 BOS = 0  # implicit start-of-stream byte, never written to disk
 
 
@@ -43,12 +44,18 @@ def predict(model: KolmoTransformer, context: list[int]) -> tuple[np.ndarray, to
     return probs, last_logits
 
 
-def train_step(optimizer: torch.optim.Optimizer, last_logits: torch.Tensor, byte: int) -> None:
-    """One backward + optimizer step on the actual byte. Both compress and
-    decompress call this with the same byte at the same step, so weights stay
-    in lockstep."""
-    target = torch.tensor([byte], dtype=torch.long)
-    loss = nn.functional.cross_entropy(last_logits.unsqueeze(0), target)
+def train_block(
+    optimizer: torch.optim.Optimizer,
+    block_logits: list[torch.Tensor],
+    block_bytes: list[int],
+) -> None:
+    """One backward + optimizer step on a block of accumulated per-byte logits.
+    Both compress and decompress call this with the same block at the same step,
+    so weights stay in lockstep. Amortizing the optimizer step across many bytes
+    is a major speedup on CPU, where the per-step overhead dominates."""
+    logits = torch.stack(block_logits)  # (block_size, vocab)
+    targets = torch.tensor(block_bytes, dtype=torch.long)
+    loss = nn.functional.cross_entropy(logits, targets)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()

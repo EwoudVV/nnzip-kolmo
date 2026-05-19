@@ -3,7 +3,14 @@ compressor used and reading the arithmetic-coded probability stream."""
 
 import struct
 
-from kolmo._engine import BOS, new_model_and_optimizer, predict, slide, train_step
+from kolmo._engine import (
+    BLOCK_SIZE,
+    BOS,
+    new_model_and_optimizer,
+    predict,
+    slide,
+    train_block,
+)
 from kolmo.codec import RangeDecoder
 from kolmo.compress import MAGIC
 
@@ -20,11 +27,24 @@ def decompress(blob: bytes) -> bytes:
 
     context = [BOS]
     output = bytearray()
+    block_logits: list = []
+    block_bytes: list[int] = []
+
     for _ in range(n_bytes):
         probs, last_logits = predict(model, context)
         byte = decoder.decode(probs)
         output.append(byte)
-        train_step(optimizer, last_logits, byte)
+        block_logits.append(last_logits)
+        block_bytes.append(byte)
+
+        if len(block_bytes) >= BLOCK_SIZE:
+            train_block(optimizer, block_logits, block_bytes)
+            block_logits = []
+            block_bytes = []
+
         context = slide(context, byte)
+
+    if block_bytes:
+        train_block(optimizer, block_logits, block_bytes)
 
     return bytes(output)
