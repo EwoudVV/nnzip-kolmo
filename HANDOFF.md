@@ -235,6 +235,33 @@ CONTEXT=512 was *very slightly worse* across the board (noise around the same pl
 
 - **Lesson:** More context alone doesn't break the plateau. The model is **capacity-limited**, not context-limited. A 3M-active-param model trained on 8KB doesn't have enough capacity to learn the corpus's statistics deeply enough to outperform gzip's exact-match dictionary.
 
+### 5. Bigger model — also didn't help enough
+
+Tried making the compressor/decompressor engine instantiate:
+
+```python
+KolmoTransformer(d_model=384, n_heads=12, n_layers=6)
+```
+
+That model has **17,126,400 params**. Correctness still held: all 13 tests passed in 54.8s. Quick 1KB timing:
+
+| Config | kolmo | gzip | enc + dec |
+|---|---:|---:|---:|
+| baseline d=256/l=4 | 56.2% | 55.3% | ~22s |
+| big d=384/l=6 | 55.9% | 55.3% | 46.8s |
+
+Crossover rows before the experiment was stopped:
+
+| Size | gzip | baseline kolmo | big-model kolmo |
+|---|---:|---:|---:|
+| 1KB | 55.3% | 56.2% | 55.9% |
+| 2KB | 50.0% | 51.8% | 52.0% |
+| 4KB | 47.8% | 50.0% | 50.4% |
+
+Stopped before the 8KB row because 2KB/4KB were already worse and slower. **Reverted the code to the baseline model.**
+
+- **Lesson:** raw capacity alone is not the wall, at least not in this naive form. The next most likely issue is the training schedule: constant Adam `lr=1e-3` may be undertraining or destabilizing the online model. Try learning-rate schedule / repeated block training / cold-start mitigation before making the model bigger again.
+
 ---
 
 ## The plateau and what to do about it
@@ -257,17 +284,9 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 In rough order of expected payoff:
 
-#### (A) Bigger model — `d_model=384`, `n_layers=6`
+#### (A) Learning rate schedule / better online optimizer
 
-```python
-KolmoTransformer(d_model=384, n_layers=6, n_heads=12)
-```
-
-This roughly doubles parameter count. Training time per block roughly doubles. Should give the model meaningfully more capacity. **Try this first.**
-
-#### (B) Learning rate warmup
-
-Adam at constant `lr=1e-3` from step 0 with a random model is suboptimal. Try:
+Adam at constant `lr=1e-3` from step 0 with a random model is suboptimal. The bigger-model experiment made this hypothesis stronger. Try:
 
 ```python
 # In _engine.py:
@@ -281,9 +300,13 @@ def make_lr_schedule(optimizer, warmup_steps=50, peak_lr=3e-3):
 
 Apply in `new_model_and_optimizer()`, call `scheduler.step()` in `train_block`.
 
-#### (C) Multi-pass over short prefixes
+#### (B) Multi-pass over short prefixes
 
 The first ~hundred bytes get encoded by a random model and waste bits. Idea: train the model on bytes 1..N *before* encoding byte 1. Two-pass approach. The decoder does the same warm-up. But this only helps once — after that the live training takes over.
+
+#### (C) Bigger model with better training
+
+`d_model=384`, `n_layers=6`, `n_heads=12` alone was worse at 2KB/4KB. It may still help after the optimizer/training schedule is improved, but don't try it again as a standalone change.
 
 #### (D) RoPE / relative position embeddings
 
@@ -293,13 +316,13 @@ The first ~hundred bytes get encoded by a random model and waste bits. Idea: tra
 
 Embed ~1KB of generic English text into the source. Both sides train on it before starting the real input. This shifts the model away from random init, which should help the cold-start tax.
 
-**I'd start with (A) since it's the simplest test of the capacity hypothesis.**
+**I'd start with (A), now that the simple capacity test has failed.**
 
 ---
 
 ## What's the current state?
 
-`CONTEXT=256`, `BLOCK_SIZE=16`, KV cache enabled. All 13 tests pass in ~30s. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Plateau at ~50% on 4-8KB has been measured and confirmed twice. The next move is a bigger model.
+`CONTEXT=256`, `BLOCK_SIZE=16`, KV cache enabled. All 13 tests pass in ~30s on the baseline model. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Plateau at ~50% on 4-8KB has been measured and confirmed twice. A naive bigger model did not help. The next move is a training-schedule experiment.
 
 ---
 
@@ -407,7 +430,7 @@ The user has a Google Cloud free trial available ($300 / 90 days for new account
 3. Read `kolmo/model.py` — especially `CausalSelfAttention.forward` to understand the KV cache.
 4. Check whether `/tmp/kolmo_crossover3.log` has the final 8KB row. If yes, evaluate whether to keep `CONTEXT=512` or revert to 256.
 5. Run the full test suite to confirm everything is green: `cd /Users/kids/Documents/nnzip-kolmo && /Users/kids/compression-experiment/venv/bin/python -m pytest tests/ -v`.
-6. Propose to the user: "try bigger model (d_model=384, n_layers=6) to test the capacity hypothesis." Get a yes, then implement, run benchmark, commit + push.
+6. Propose to the user: "try a learning-rate schedule / better online optimizer, because context and naive capacity both failed." Get a yes, then implement, run benchmark, commit + push.
 
 ---
 
