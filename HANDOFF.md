@@ -299,7 +299,7 @@ Stopped before 4KB and reverted to one training epoch per block.
 
 ### 8. Deterministic seed corpus — first real win
 
-Added a 432-byte built-in English seed paragraph in `_engine.py`. `new_model_and_optimizer()` now trains on that seed before real compression starts. Both compressor and decompressor replay the same warmup, so no learned weights are stored in the compressed file.
+Added a 432-byte built-in English seed paragraph in `_engine.py`. `new_model_and_optimizer()` trains on that seed before real compression starts. Both compressor and decompressor replay the same warmup, so no learned weights are stored in the compressed file.
 
 Correctness held: all 13 tests passed in 53.2s. The suite got slower because every compress/decompress now pays the warmup cost.
 
@@ -316,6 +316,45 @@ The seed shifts the whole curve down and gives kolmo clean wins at 1KB and 2KB. 
 
 - **Lesson:** the cold-start prior really mattered. The remaining wall is longer-range reuse / structure, not merely random initialization.
 
+### 9. Seed scaling — bigger win, now beats gzip through 4KB
+
+Tried seed+`CONTEXT=512`; it did not compose:
+
+| Size | seed C=256 | seed C=512 |
+|---|---:|---:|
+| 1KB | 51.6% | 52.0% |
+| 2KB | 49.4% | 49.4% |
+| 4KB | 48.6% | 48.7% |
+| 8KB | 49.3% | 49.3% |
+
+Then swept seed sizes using a mixed prose/wiki/dialogue/markdown-style deterministic seed. Compression-only 1KB/2KB sweep:
+
+| Seed | 1KB | 2KB |
+|---:|---:|---:|
+| 0B | 56.2% | 52.0% |
+| 128B | 54.7% | 51.0% |
+| 256B | 52.7% | 50.0% |
+| 432B | 51.6% | 49.4% |
+| 512B | 51.2% | 49.0% |
+| 768B | 50.4% | 48.4% |
+| 1024B | 50.4% | 48.4% |
+| 1536B | 49.6% | 47.9% |
+| 2048B | 49.2% | 47.5% |
+| 3072B | 48.8% | 47.1% |
+
+Full round-trip results for larger seeds:
+
+| Seed | 1KB | 2KB | 4KB | 8KB |
+|---:|---:|---:|---:|---:|
+| 2048B | 49.2% | 47.5% | 47.2% | 48.1% |
+| 3072B | 48.8% | 47.1% | 46.9% | 47.9% |
+| 3852B | 48.4% | 46.7% | 46.6% | 47.7% |
+| 5562B | **48.0%** | **46.5%** | **46.3%** | **47.4%** |
+
+Committed the 5562B seed (`_SEED_BASE + _SEED_EXTRA * 3`). It wins against gzip at 1KB, 2KB, and 4KB. It still trails gzip at 8KB by 1.7pp.
+
+- **Lesson:** seed size/content is the strongest knob found so far. It keeps moving the curve down, but the remaining long-file gap is still gzip's reuse advantage.
+
 ---
 
 ## The plateau and what to do about it
@@ -324,9 +363,9 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 **Hypotheses for the plateau, in rough order of likelihood:**
 
-1. **Longer-range structure / exact reuse.** The seed fixed much of the cold-start cost, but gzip still improves with file length because LZ77 copies repeated substrings. Kolmo still hovers around 49% at 4KB-8KB.
+1. **Longer-range structure / exact reuse.** The larger seed fixed much of the cold-start cost and now wins through 4KB, but gzip still improves with file length because LZ77 copies repeated substrings. Kolmo still trails at 8KB.
 
-2. **Seed prior can be tuned further.** The current 432-byte paragraph was hand-written and untuned. Size/content/number of warmup passes could matter a lot, but remember source size would eventually count for Hutter.
+2. **Seed prior can be tuned further.** Seed scaling was monotonic through 5562B. Try 8KB/16KB seeds, different content, and possibly fewer repeats / more varied seed text. Remember source size would eventually count for Hutter, but even 50KB is tiny against enwik9.
 
 3. **Model capacity is too small, but only after memory/prior improves.** A 17.1M-param model alone was worse at 2KB/4KB, so don't scale capacity again until the model has a better prior or memory mechanism.
 
@@ -338,9 +377,9 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 In rough order of expected payoff:
 
-#### (A) Tune the seed corpus
+#### (A) Tune the seed corpus further
 
-The current 432-byte paragraph was not optimized. Try seed sizes like 128B, 256B, 512B, and 1024B; also try a seed built from the same four benchmark genres. Track compressed-size gains against the source-size cost, because Hutter eventually counts decompressor/source size.
+Current seed is 5562B and still improving. Try 8KB/16KB seeds with more varied text rather than simple repetition. Track compressed-size gains against source-size and warmup-time cost.
 
 #### (B) Add an explicit reuse/memory mechanism
 
@@ -364,7 +403,7 @@ The first ~hundred bytes get encoded by a random model and waste bits. Idea: tra
 
 ## What's the current state?
 
-`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled, 432-byte deterministic seed corpus enabled. All 13 tests pass in ~53s. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Seeded kolmo beats gzip at 1KB/2KB and loses at 4KB/8KB. The next move is seed tuning or an explicit reuse/memory mechanism.
+`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled, 5562-byte deterministic seed corpus enabled. Seeded kolmo beats gzip at 1KB/2KB/4KB and loses at 8KB. Full tests pass: 14 tests in ~1:40. The next move is larger/more varied seed tuning or an explicit reuse/memory mechanism.
 
 ---
 
@@ -415,7 +454,7 @@ cd /Users/kids/Documents/nnzip-kolmo
 
 Note the venv path — there is no `python` (only `python3`) on the user's PATH, and the project venv is in a sibling directory because `nnzip` was developed there first. **Always use `/Users/kids/compression-experiment/venv/bin/python` for kolmo work too** — it has all the deps installed.
 
-The full test suite takes ~30 seconds with KV cache. Run before committing.
+The full test suite takes ~1:40 with the 5562B seed. `tests/test_roundtrip.py` uses a 256B seed for most symmetry tests and keeps one full-seed smoke test so iteration stays tolerable. Run before committing.
 
 ### Benchmarks
 

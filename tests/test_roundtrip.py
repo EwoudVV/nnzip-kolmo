@@ -6,7 +6,21 @@ online-training architecture works end-to-end.
 
 import pytest
 
+import kolmo._engine as engine
 from kolmo import compress, decompress
+
+DEFAULT_SEED_CORPUS = engine.SEED_CORPUS
+FAST_SEED_CORPUS = DEFAULT_SEED_CORPUS[:256]
+
+
+@pytest.fixture(autouse=True)
+def fast_seed_corpus(monkeypatch):
+    """Most round-trip tests exercise codec symmetry, not seed quality.
+
+    Keep one explicit full-seed smoke test below; use a short deterministic
+    seed everywhere else so the suite stays runnable during iteration.
+    """
+    monkeypatch.setattr(engine, "SEED_CORPUS", FAST_SEED_CORPUS)
 
 
 def test_roundtrip_short():
@@ -38,6 +52,14 @@ def test_roundtrip_binary_bytes():
     """Round-trip should work on arbitrary byte values, not just printable
     ASCII — the codec must not depend on UTF-8 validity."""
     data = bytes(range(256))  # every possible byte value exactly once
+    blob = compress(data)
+    assert decompress(blob) == data
+
+
+def test_roundtrip_default_seed_smoke(monkeypatch):
+    """The production seed is much larger, so keep a direct smoke test for it."""
+    monkeypatch.setattr(engine, "SEED_CORPUS", DEFAULT_SEED_CORPUS)
+    data = b"default seed smoke"
     blob = compress(data)
     assert decompress(blob) == data
 

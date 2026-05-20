@@ -20,7 +20,7 @@ LR = 1e-3
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # bytes between optimizer steps
 BOS = 0  # implicit start-of-stream byte, never written to disk
-SEED_CORPUS = (
+_SEED_BASE = (
     b"English text is full of small regularities. Letters form words, words "
     b"form phrases, and phrases repeat with punctuation, spacing, and rhythm. "
     b"A compressor that begins from a blank model wastes bits learning that "
@@ -28,6 +28,33 @@ SEED_CORPUS = (
     b"to familiar patterns. This short seed paragraph gives the online model a "
     b"deterministic prior without storing learned weights in the compressed file."
 )
+_SEED_EXTRA = (
+    b"\n\nThe morning train crossed the river while people read notes, checked maps, "
+    b"and talked quietly about school, weather, work, and travel. A useful "
+    b"English prior should know that spaces are common, commas separate clauses, "
+    b"and a period is often followed by a space and a capital letter. "
+    b"\n\nReference entry: compression is the process of representing information with "
+    b"fewer symbols. A dictionary method stores repeated phrases as pointers, "
+    b"while a statistical method assigns shorter codes to likely events. Both "
+    b"approaches rely on patterns that appear again after they have been seen. "
+    b"\n\nDialogue:\nAlice: Did the model remember the phrase from earlier?\nBen: It remembered "
+    b"letters and spaces, but not the exact sentence.\nAlice: Then we need a "
+    b"better prior or a small memory for repeated text.\n"
+    b"\n# Notes\n\n- Train deterministically.\n- Keep encoder and decoder symmetric.\n- "
+    b"Measure gzip, kolmo, ratio, and time.\n- Revert changes that only help tiny cases.\n"
+    b"\nThe second paragraph repeats the lesson in different words: text contains "
+    b"local spelling rules, medium-range grammar, and long-range reuse. A model "
+    b"that handles only local spelling will plateau, but a model with useful "
+    b"memory can keep improving as the document becomes longer. "
+    b"\n\nNumbers and punctuation also matter: 2026-05-20, 1,024 bytes, 2,048 bytes, "
+    b"and 4,096 bytes should be parsed as ordinary text rather than surprises. "
+    b"Lists, headings, and quoted speech are common in mixed corpora. "
+    b"\n\nA final neutral passage describes a city library with shelves, tables, lamps, "
+    b"catalog records, quiet readers, printed forms, and old magazines. The same "
+    b"words return in nearby sentences, and the compressor should spend fewer "
+    b"bits each time the pattern becomes familiar. "
+)
+SEED_CORPUS = _SEED_BASE + _SEED_EXTRA * 3
 
 
 def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:

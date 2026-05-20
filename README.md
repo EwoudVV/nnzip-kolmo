@@ -21,12 +21,12 @@ Current prototype result on a clean 8.9 KB mixed text corpus:
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
-| 1 KB | 55.3% | **51.6%** |
-| 2 KB | 50.0% | **49.4%** |
-| 4 KB | **47.8%** | 48.6% |
-| 8 KB | **45.7%** | 49.3% |
+| 1 KB | 55.3% | **48.0%** |
+| 2 KB | 50.0% | **46.5%** |
+| 4 KB | 47.8% | **46.3%** |
+| 8 KB | **45.7%** | 47.4% |
 
-Kolmo now wins on tiny text prefixes after a deterministic 432-byte seed-corpus warmup. Gzip still wins on longer files because exact substring reuse remains the hard part.
+Kolmo now wins on small text prefixes after a deterministic 5.5 KB seed-corpus warmup. Gzip still wins at 8 KB because exact substring reuse remains the hard part.
 
 ## How it works (conceptually)
 
