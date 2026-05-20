@@ -297,6 +297,25 @@ Stopped before 4KB and reverted to one training epoch per block.
 
 - **Lesson:** repeated local training overfits the just-seen block or destabilizes future predictions. The plateau is not simply "not enough optimizer steps on the latest bytes."
 
+### 8. Deterministic seed corpus — first real win
+
+Added a 432-byte built-in English seed paragraph in `_engine.py`. `new_model_and_optimizer()` now trains on that seed before real compression starts. Both compressor and decompressor replay the same warmup, so no learned weights are stored in the compressed file.
+
+Correctness held: all 13 tests passed in 53.2s. The suite got slower because every compress/decompress now pays the warmup cost.
+
+Full crossover:
+
+| Size | gzip | baseline kolmo | seeded kolmo |
+|---|---:|---:|---:|
+| 1KB | 55.3% | 56.2% | **51.6%** |
+| 2KB | 50.0% | 51.8% | **49.4%** |
+| 4KB | 47.8% | 50.0% | 48.6% |
+| 8KB | 45.7% | 50.0% | 49.3% |
+
+The seed shifts the whole curve down and gives kolmo clean wins at 1KB and 2KB. It does **not** solve the long-file plateau; gzip still pulls ahead by 8KB.
+
+- **Lesson:** the cold-start prior really mattered. The remaining wall is longer-range reuse / structure, not merely random initialization.
+
 ---
 
 ## The plateau and what to do about it
@@ -305,11 +324,11 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 **Hypotheses for the plateau, in rough order of likelihood:**
 
-1. **Cold-start / prior problem.** The model begins random, so the early stream is expensive. Higher LR helped 512B/1KB but hurt longer files; extra train epochs also hurt. A small deterministic seed corpus or better initialization is now the most plausible next test.
+1. **Longer-range structure / exact reuse.** The seed fixed much of the cold-start cost, but gzip still improves with file length because LZ77 copies repeated substrings. Kolmo still hovers around 49% at 4KB-8KB.
 
-2. **The model is not learning the right kind of structure.** It learns byte/character statistics, but gzip's advantage is exact substring reuse. The neural model may need a different objective, recurrence/memory, or tokenization to exploit phrase-level reuse.
+2. **Seed prior can be tuned further.** The current 432-byte paragraph was hand-written and untuned. Size/content/number of warmup passes could matter a lot, but remember source size would eventually count for Hutter.
 
-3. **Model capacity is too small, but only after training improves.** A 17.1M-param model alone was worse at 2KB/4KB, so don't scale capacity again until the model has a better prior or memory mechanism.
+3. **Model capacity is too small, but only after memory/prior improves.** A 17.1M-param model alone was worse at 2KB/4KB, so don't scale capacity again until the model has a better prior or memory mechanism.
 
 4. **Context window is still too small.** Less likely given the 512-token test was slightly worse through 8KB.
 
@@ -319,29 +338,33 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 In rough order of expected payoff:
 
-#### (A) Seed corpus / deterministic pre-training warmup
+#### (A) Tune the seed corpus
 
-Embed ~1KB of generic English text into the source and train on it before starting the real input. Both compressor and decompressor do the same warmup from the same literal bytes, so no weights are shipped. This directly targets the random-model cold start and should help tiny prefixes without using an aggressive LR that hurts longer files.
+The current 432-byte paragraph was not optimized. Try seed sizes like 128B, 256B, 512B, and 1024B; also try a seed built from the same four benchmark genres. Track compressed-size gains against the source-size cost, because Hutter eventually counts decompressor/source size.
 
-#### (B) Multi-pass over short prefixes
+#### (B) Add an explicit reuse/memory mechanism
+
+The remaining gap is gzip's exact substring copying. Options: expose recent n-gram hashes as features, add a tiny deterministic dictionary/pointer side model, or blend neural probabilities with an adaptive n-gram model. Keep it symmetric and source-small.
+
+#### (C) Multi-pass over short prefixes
 
 The first ~hundred bytes get encoded by a random model and waste bits. Idea: train the model on bytes 1..N *before* encoding byte 1. Two-pass approach. The decoder does the same warm-up. But this only helps once — after that the live training takes over.
 
-#### (C) Bigger model with better training
+#### (D) Bigger model with better training
 
 `d_model=384`, `n_layers=6`, `n_heads=12` alone was worse at 2KB/4KB. It may still help after the optimizer/training schedule is improved, but don't try it again as a standalone change.
 
-#### (D) RoPE / relative position embeddings
+#### (E) RoPE / relative position embeddings
 
 `max_context=16384` is wasteful and won't generalize to enwik9 (1 GB). Switch to rotary or ALiBi position embeddings. Doesn't necessarily help with the plateau but is a prerequisite for scaling.
 
-**I'd start with (A), now that the simple capacity test has failed.**
+**I'd start with (A), because the seed corpus is the first knob that clearly helped.**
 
 ---
 
 ## What's the current state?
 
-`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled. All 13 tests pass in ~30s on the baseline model. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Plateau at ~50% on 4-8KB has been measured and confirmed twice. Naive bigger model, simple LR tweaks, and extra train epochs did not help. The next move is cold-start mitigation with a deterministic seed corpus.
+`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled, 432-byte deterministic seed corpus enabled. All 13 tests pass in ~53s. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Seeded kolmo beats gzip at 1KB/2KB and loses at 4KB/8KB. The next move is seed tuning or an explicit reuse/memory mechanism.
 
 ---
 
@@ -449,7 +472,7 @@ The user has a Google Cloud free trial available ($300 / 90 days for new account
 3. Read `kolmo/model.py` — especially `CausalSelfAttention.forward` to understand the KV cache.
 4. Check whether `/tmp/kolmo_crossover3.log` has the final 8KB row. If yes, evaluate whether to keep `CONTEXT=512` or revert to 256.
 5. Run the full test suite to confirm everything is green: `cd /Users/kids/Documents/nnzip-kolmo && /Users/kids/compression-experiment/venv/bin/python -m pytest tests/ -v`.
-6. Propose to the user: "try a deterministic seed corpus warmup, because context, naive capacity, simple LR changes, and extra train epochs all failed." Get a yes, then implement, run benchmark, commit + push.
+6. Propose to the user: "tune the deterministic seed corpus next, because it is the first knob that actually moved the curve." Get a yes, then implement, run benchmark, commit + push.
 
 ---
 

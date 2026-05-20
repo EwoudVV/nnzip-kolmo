@@ -20,6 +20,14 @@ LR = 1e-3
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # bytes between optimizer steps
 BOS = 0  # implicit start-of-stream byte, never written to disk
+SEED_CORPUS = (
+    b"English text is full of small regularities. Letters form words, words "
+    b"form phrases, and phrases repeat with punctuation, spacing, and rhythm. "
+    b"A compressor that begins from a blank model wastes bits learning that "
+    b"spaces are common, vowels follow consonants, and sentences often return "
+    b"to familiar patterns. This short seed paragraph gives the online model a "
+    b"deterministic prior without storing learned weights in the compressed file."
+)
 
 
 def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
@@ -29,7 +37,20 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
     model = KolmoTransformer()
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    _prime_model(model, optimizer)
     return model, optimizer
+
+
+def _prime_model(
+    model: KolmoTransformer,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    """Train on a tiny built-in corpus before real data starts."""
+    history = [BOS]
+    for pos in range(0, len(SEED_CORPUS), BLOCK_SIZE):
+        block = list(SEED_CORPUS[pos : pos + BLOCK_SIZE])
+        train_block(model, optimizer, history, block)
+        history = update_history(history, block)
 
 
 def _trim_caches(caches: list, max_len: int) -> list:
