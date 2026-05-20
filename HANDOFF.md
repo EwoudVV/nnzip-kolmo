@@ -351,9 +351,24 @@ Full round-trip results for larger seeds:
 | 3852B | 48.4% | 46.7% | 46.6% | 47.7% |
 | 5562B | **48.0%** | **46.5%** | **46.3%** | **47.4%** |
 
-Committed the 5562B seed (`_SEED_BASE + _SEED_EXTRA * 3`). It wins against gzip at 1KB, 2KB, and 4KB. It still trails gzip at 8KB by 1.7pp.
+Committed the 5562B seed (`_SEED_BASE + _SEED_EXTRA * 3`). It wins against gzip at 1KB, 2KB, and 4KB. It still trails gzip at 8KB by 1.7pp. Be careful with the narrative: on a 1KB input, the seed is 5.4x larger than the file, so the 1KB win is not the clean evidence. The 2KB/4KB wins are more meaningful, and the 8KB gap is the real next problem.
 
 - **Lesson:** seed size/content is the strongest knob found so far. It keeps moving the curve down, but the remaining long-file gap is still gzip's reuse advantage.
+
+### 10. Final seed-size pass — diminishing returns, stop here
+
+Tried one more seed pass with extra varied generated text, keeping `CONTEXT=256`. Compression-only results:
+
+| Seed | 4KB | 8KB |
+|---:|---:|---:|
+| 5562B | 46.3% | 47.4% |
+| 8192B | 46.0% | 47.2% |
+| 11264B | 45.8% | 47.0% |
+| 16384B | 45.8% | 46.9% |
+
+Gzip is 47.8% at 4KB and 45.7% at 8KB. Bigger seeds still help, but the marginal return is shrinking hard: tripling the seed from 5.5KB to 16KB only buys ~0.5pp at 8KB and still does not catch gzip. Kept the production seed at 5562B.
+
+- **Lesson:** cap seed tuning for now. The remaining 8KB gap needs an explicit reuse/copy mechanism, not a forever-growing English prior.
 
 ---
 
@@ -365,7 +380,7 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 1. **Longer-range structure / exact reuse.** The larger seed fixed much of the cold-start cost and now wins through 4KB, but gzip still improves with file length because LZ77 copies repeated substrings. Kolmo still trails at 8KB.
 
-2. **Seed prior can be tuned further.** Seed scaling was monotonic through 5562B. Try 8KB/16KB seeds, different content, and possibly fewer repeats / more varied seed text. Remember source size would eventually count for Hutter, but even 50KB is tiny against enwik9.
+2. **Seed prior can be tuned further, but it is no longer the main lever.** Seed scaling was monotonic through 16KB, but returns diminished. Keep the 5562B seed for now unless a much better seed design appears.
 
 3. **Model capacity is too small, but only after memory/prior improves.** A 17.1M-param model alone was worse at 2KB/4KB, so don't scale capacity again until the model has a better prior or memory mechanism.
 
@@ -377,13 +392,15 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 In rough order of expected payoff:
 
-#### (A) Tune the seed corpus further
-
-Current seed is 5562B and still improving. Try 8KB/16KB seeds with more varied text rather than simple repetition. Track compressed-size gains against source-size and warmup-time cost.
-
-#### (B) Add an explicit reuse/memory mechanism
+#### (A) Add an explicit reuse/memory mechanism
 
 The remaining gap is gzip's exact substring copying. Options: expose recent n-gram hashes as features, add a tiny deterministic dictionary/pointer side model, or blend neural probabilities with an adaptive n-gram model. Keep it symmetric and source-small.
+
+Start dumb: find exact recent matches, encode a copy event only when it is clearly cheaper than literals, and measure whether 8KB moves. Do not jump straight to full context mixing.
+
+#### (B) Tune the seed corpus further
+
+Current seed is 5562B. 8KB/11KB/16KB seeds helped only a little, so pause seed growth unless you have a better seed design than "more generic English text."
 
 #### (C) Multi-pass over short prefixes
 
@@ -397,13 +414,13 @@ The first ~hundred bytes get encoded by a random model and waste bits. Idea: tra
 
 `max_context=16384` is wasteful and won't generalize to enwik9 (1 GB). Switch to rotary or ALiBi position embeddings. Doesn't necessarily help with the plateau but is a prerequisite for scaling.
 
-**I'd start with (A), because the seed corpus is the first knob that clearly helped.**
+**I'd start with (A), because seed growth has hit diminishing returns and gzip's remaining advantage is exact copy/reuse.**
 
 ---
 
 ## What's the current state?
 
-`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled, 5562-byte deterministic seed corpus enabled. Seeded kolmo beats gzip at 1KB/2KB/4KB and loses at 8KB. Full tests pass: 14 tests in ~1:40. The next move is larger/more varied seed tuning or an explicit reuse/memory mechanism.
+`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled, 5562-byte deterministic seed corpus enabled. Seeded kolmo beats gzip at 1KB/2KB/4KB and loses at 8KB. Full tests pass: 14 tests in ~1:40. The next move is an explicit reuse/copy mechanism.
 
 ---
 

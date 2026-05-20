@@ -17,7 +17,7 @@ This is the same architecture that the current Hutter Prize contenders use, in c
 | 5 | Match SOTA on enwik9 (~0.85 bpb) | — |
 | 6 | Submit to Marcus Hutter and win the actual prize | — |
 
-Current prototype result on a clean 8.9 KB mixed text corpus:
+Current prototype result on a clean 8.9 KB mixed text corpus, with a deterministic 5.5 KB English seed warmup compiled into the decompressor source:
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
@@ -26,7 +26,7 @@ Current prototype result on a clean 8.9 KB mixed text corpus:
 | 4 KB | 47.8% | **46.3%** |
 | 8 KB | **45.7%** | 47.4% |
 
-Kolmo now wins on small text prefixes after a deterministic 5.5 KB seed-corpus warmup. Gzip still wins at 8 KB because exact substring reuse remains the hard part.
+The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB win. Gzip still wins at 8 KB because exact substring reuse remains the hard part.
 
 ## How it works (conceptually)
 
