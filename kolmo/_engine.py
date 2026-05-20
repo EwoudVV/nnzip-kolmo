@@ -62,13 +62,9 @@ EVENT_PROBS = np.array([1.0 - COPY_PROB, COPY_PROB], dtype=np.float64)
 
 
 def offset_probs(n: int) -> np.ndarray:
-    """Probability distribution over offset values 0..n-1 (representing actual
-    offsets 1..n). Uses 1/sqrt(k) decay — favors small offsets but keeps
-    long offsets affordable for files with paragraph-level repetition.
-
-    Empirically 1/k was too aggressive at 32KB+ where many useful matches
-    live in the 1000+ offset range.
-    """
+    """Static prior over offset values 0..n-1 (representing actual offsets
+    1..n). Uses 1/sqrt(k) — a reasonable starting point before any events
+    are observed. Used by OffsetModel as the initial Laplace prior."""
     if n <= 0:
         return np.array([], dtype=np.float64)
     raw = 1.0 / np.sqrt(np.arange(1, n + 1, dtype=np.float64))
@@ -83,6 +79,38 @@ def length_probs(n: int) -> np.ndarray:
         return np.array([], dtype=np.float64)
     raw = 1.0 / np.arange(1, n + 1, dtype=np.float64)
     return raw / raw.sum()
+
+
+class OffsetModel:
+    """Adaptive probability model for copy offsets.
+
+    Both compress and decompress hold an instance and call `observe` after
+    every copy event, in the same order with the same offsets — so the
+    distribution evolves bit-identically on both sides.
+
+    The model maintains Laplace-smoothed counts over the offset range 1..N.
+    Counts start at the static 1/sqrt(k) prior (scaled so its total mass is
+    `prior_strength`), so very early events have a sensible distribution
+    before any are observed. As events accumulate, the empirical distribution
+    increasingly dominates.
+    """
+
+    def __init__(self, window: int, prior_strength: float = 128.0):
+        self.window = window
+        # Initialize with 1/sqrt(k) prior scaled to total mass = prior_strength.
+        prior = offset_probs(window) * prior_strength
+        self.counts = prior.astype(np.float64)
+
+    def probs_for(self, max_offset: int) -> np.ndarray:
+        """Return normalized probabilities over offsets 1..max_offset
+        (returned as array of length max_offset)."""
+        p = self.counts[:max_offset].copy()
+        return p / p.sum()
+
+    def observe(self, offset: int) -> None:
+        """Record a 1:1 offset observation. offset is 1-indexed (offset=1 is
+        the immediately previous byte)."""
+        self.counts[offset - 1] += 1.0
 
 
 def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:

@@ -17,10 +17,10 @@ from kolmo._engine import (
     COPY_MIN,
     COPY_WINDOW,
     EVENT_PROBS,
+    OffsetModel,
     find_copy,
     length_probs,
     new_model_and_optimizer,
-    offset_probs,
     step_cache,
     train_block,
     update_history,
@@ -37,6 +37,7 @@ def compress(data: bytes) -> bytes:
 
     model, optimizer = new_model_and_optimizer()
     encoder = RangeEncoder()
+    offset_model = OffsetModel(COPY_WINDOW)
 
     history = [BOS]
     copy_history = bytearray()
@@ -72,8 +73,9 @@ def compress(data: bytes) -> bytes:
             encoder.encode(1, EVENT_PROBS)
             max_offset = min(COPY_WINDOW, len(copy_history))
             max_len = min(COPY_MAX, len(data) - pos) - COPY_MIN + 1
-            encoder.encode(offset - 1, offset_probs(max_offset))
+            encoder.encode(offset - 1, offset_model.probs_for(max_offset))
             encoder.encode(length - COPY_MIN, length_probs(max_len))
+            offset_model.observe(offset)
             start = len(copy_history) - offset
             copied = copy_history[start : start + length]
             for byte in copied:
