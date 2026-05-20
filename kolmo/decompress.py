@@ -1,9 +1,9 @@
-"""Decompress kolmo blobs by re-running the same training trajectory the
-compressor used and reading the arithmetic-coded probability stream.
+"""Decompress kolmo blobs by replaying the compressor's trajectory.
 
-Mirrors compress.py exactly: warm cache, step cache per byte to get probs,
-decode each byte using the same probs the encoder used, then run the same
-training step at the block boundary.
+The arithmetic stream contains literal events and copy events. Literals decode
+one byte from the neural probability distribution; copies reproduce bytes from
+recent output history. Both paths still feed the reconstructed bytes through
+the model and train every BLOCK_SIZE bytes.
 """
 
 import struct
@@ -11,6 +11,10 @@ import struct
 from kolmo._engine import (
     BLOCK_SIZE,
     BOS,
+    COPY_MAX,
+    COPY_MIN,
+    COPY_WINDOW,
+    EVENT_PROBS,
     new_model_and_optimizer,
     step_cache,
     train_block,
@@ -31,27 +35,56 @@ def decompress(blob: bytes) -> bytes:
     decoder = RangeDecoder(payload)
 
     history = [BOS]
+    pending: list[int] = []
     output = bytearray()
+    probs = None
+    caches = None
+    pos_offset = 0
+
+    def ensure_cache():
+        nonlocal probs, caches, pos_offset
+        if probs is None:
+            probs, caches, pos_offset = warm_cache(model, history)
+
+    def observe_byte(byte: int):
+        nonlocal history, pending, probs, caches, pos_offset
+        ensure_cache()
+        probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
+        pending.append(byte)
+        if len(pending) == BLOCK_SIZE:
+            train_block(model, optimizer, history, pending)
+            history = update_history(history, pending)
+            pending = []
+            probs = None
+            caches = None
+            pos_offset = 0
+
     decoded_total = 0
     while decoded_total < n_bytes:
-        m = min(BLOCK_SIZE, n_bytes - decoded_total)
-        block: list[int] = []
+        event = decoder.decode(EVENT_PROBS)
+        if event == 1:
+            known = history + pending
+            max_offset = min(COPY_WINDOW, len(known))
+            max_len = min(COPY_MAX, n_bytes - decoded_total)
+            if max_offset == 0 or max_len < COPY_MIN:
+                raise ValueError("invalid copy event in kolmo blob")
+            offset = decoder.decode_uniform(max_offset) + 1
+            length = decoder.decode_uniform(max_len - COPY_MIN + 1) + COPY_MIN
+            start = len(known) - offset
+            copied = known[start : start + length]
+            for byte in copied:
+                output.append(byte)
+                observe_byte(byte)
+            decoded_total += length
+            continue
 
-        probs, caches, pos_offset = warm_cache(model, history)
+        ensure_cache()
         byte = decoder.decode(probs)
-        block.append(byte)
         output.append(byte)
+        observe_byte(byte)
+        decoded_total += 1
 
-        for _ in range(1, m):
-            probs, caches, pos_offset = step_cache(
-                model, block[-1], caches, pos_offset
-            )
-            byte = decoder.decode(probs)
-            block.append(byte)
-            output.append(byte)
-
-        train_block(model, optimizer, history, block)
-        history = update_history(history, block)
-        decoded_total += m
+    if pending:
+        train_block(model, optimizer, history, pending)
 
     return bytes(output)

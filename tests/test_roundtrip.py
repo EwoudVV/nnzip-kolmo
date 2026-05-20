@@ -8,6 +8,7 @@ import pytest
 
 import kolmo._engine as engine
 from kolmo import compress, decompress
+from kolmo.compress import MAGIC
 
 DEFAULT_SEED_CORPUS = engine.SEED_CORPUS
 FAST_SEED_CORPUS = DEFAULT_SEED_CORPUS[:256]
@@ -26,6 +27,7 @@ def fast_seed_corpus(monkeypatch):
 def test_roundtrip_short():
     data = b"hello world"
     blob = compress(data)
+    assert blob.startswith(MAGIC)
     assert decompress(blob) == data
 
 

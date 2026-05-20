@@ -1,14 +1,11 @@
 """Compress raw bytes by online-training a transformer and arithmetic-coding
 the resulting probability stream.
 
-Per-block algorithm:
-  1. Warm the KV cache by running a fresh forward over the current history.
-     Get probs for the first byte of the block.
-  2. For each subsequent byte in the block, feed one token through the model
-     using the cache (O(T) per byte instead of O(T²)).
-  3. After the block, run a full forward over (history + block) with
-     gradient tracking, compute cross-entropy loss, backward + step.
-  4. Cache is now stale (weights changed). Next block restarts at step 1.
+The stream is a sequence of literal events and copy events. Literals are
+encoded with neural probabilities; copies encode an offset/length pair into
+recent already-observed bytes. Either way, the model observes the reconstructed
+bytes and trains every BLOCK_SIZE bytes, so decompression can replay the same
+trajectory.
 """
 
 import struct
@@ -16,6 +13,11 @@ import struct
 from kolmo._engine import (
     BLOCK_SIZE,
     BOS,
+    COPY_MAX,
+    COPY_MIN,
+    COPY_WINDOW,
+    EVENT_PROBS,
+    find_copy,
     new_model_and_optimizer,
     step_cache,
     train_block,
@@ -24,7 +26,7 @@ from kolmo._engine import (
 )
 from kolmo.codec import RangeEncoder
 
-MAGIC = b"KMO1"
+MAGIC = b"KMO2"
 
 
 def compress(data: bytes) -> bytes:
@@ -35,24 +37,57 @@ def compress(data: bytes) -> bytes:
     encoder = RangeEncoder()
 
     history = [BOS]
+    pending: list[int] = []
+    probs = None
+    caches = None
+    pos_offset = 0
+
+    def ensure_cache():
+        nonlocal probs, caches, pos_offset
+        if probs is None:
+            probs, caches, pos_offset = warm_cache(model, history)
+
+    def observe_byte(byte: int):
+        nonlocal history, pending, probs, caches, pos_offset
+        ensure_cache()
+        probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
+        pending.append(byte)
+        if len(pending) == BLOCK_SIZE:
+            train_block(model, optimizer, history, pending)
+            history = update_history(history, pending)
+            pending = []
+            probs = None
+            caches = None
+            pos_offset = 0
+
     pos = 0
     while pos < len(data):
-        block_end = min(pos + BLOCK_SIZE, len(data))
-        block = list(data[pos:block_end])
-        m = len(block)
-
-        probs, caches, pos_offset = warm_cache(model, history)
-        encoder.encode(block[0], probs)
-
-        for i in range(1, m):
-            probs, caches, pos_offset = step_cache(
-                model, block[i - 1], caches, pos_offset
+        known = history + pending
+        copy = find_copy(data, pos, known)
+        if copy is not None:
+            offset, length = copy
+            encoder.encode(1, EVENT_PROBS)
+            encoder.encode_uniform(offset - 1, min(COPY_WINDOW, len(known)))
+            encoder.encode_uniform(
+                length - COPY_MIN,
+                min(COPY_MAX, len(data) - pos) - COPY_MIN + 1,
             )
-            encoder.encode(block[i], probs)
+            start = len(known) - offset
+            copied = known[start : start + length]
+            for byte in copied:
+                observe_byte(byte)
+            pos += length
+            continue
 
-        train_block(model, optimizer, history, block)
-        history = update_history(history, block)
-        pos += m
+        ensure_cache()
+        encoder.encode(0, EVENT_PROBS)
+        byte = data[pos]
+        encoder.encode(byte, probs)
+        observe_byte(byte)
+        pos += 1
+
+    if pending:
+        train_block(model, optimizer, history, pending)
 
     payload = encoder.finish()
     return MAGIC + struct.pack(">I", len(data)) + payload

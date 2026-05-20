@@ -21,12 +21,12 @@ Current prototype result on a clean 8.9 KB mixed text corpus, with a determinist
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
-| 1 KB | 55.3% | **48.0%** |
-| 2 KB | 50.0% | **46.5%** |
-| 4 KB | 47.8% | **46.3%** |
-| 8 KB | **45.7%** | 47.4% |
+| 1 KB | 55.3% | **47.7%** |
+| 2 KB | 50.0% | **46.1%** |
+| 4 KB | 47.8% | **45.6%** |
+| 8 KB | **45.7%** | 46.3% |
 
-The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB win. Gzip still wins at 8 KB because exact substring reuse remains the hard part.
+The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB win. A first tiny copy mechanism narrows the 8 KB gzip gap to 0.5 percentage points, but gzip still wins there.
 
 ## How it works (conceptually)
 
@@ -35,8 +35,9 @@ The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB win
    - Run a forward pass to get a probability distribution over the next byte
    - Use that distribution to encode the actual next byte with arithmetic coding
    - Run a backward pass on the actual byte (so the model learns from it)
-3. The compressed file contains *only* the arithmetic-coded bitstream — no model weights.
-4. Decompression mirrors the loop exactly: same starting weights, same training schedule, same probability distributions at every step.
+3. If the next bytes exactly match recent history, encode a small copy event instead of literal bytes.
+4. The compressed file contains *only* the arithmetic-coded bitstream — no model weights.
+5. Decompression mirrors the loop exactly: same starting weights, same training schedule, same probability distributions at every step.
 
 ## Development
 

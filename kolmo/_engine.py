@@ -10,7 +10,6 @@ only done once per block.
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from kolmo.model import KolmoTransformer
@@ -20,6 +19,10 @@ LR = 1e-3
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # bytes between optimizer steps
 BOS = 0  # implicit start-of-stream byte, never written to disk
+COPY_PROB = 0.005
+COPY_WINDOW = 256
+COPY_MIN = 8
+COPY_MAX = 32
 _SEED_BASE = (
     b"English text is full of small regularities. Letters form words, words "
     b"form phrases, and phrases repeat with punctuation, spacing, and rhythm. "
@@ -55,6 +58,7 @@ _SEED_EXTRA = (
     b"bits each time the pattern becomes familiar. "
 )
 SEED_CORPUS = _SEED_BASE + _SEED_EXTRA * 3
+EVENT_PROBS = np.array([1.0 - COPY_PROB, COPY_PROB], dtype=np.float64)
 
 
 def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
@@ -158,3 +162,30 @@ def update_history(history: list[int], new_bytes: list[int]) -> list[int]:
     if len(history) > CONTEXT:
         history = history[-CONTEXT:]
     return history
+
+
+def find_copy(data: bytes, pos: int, known: list[int]) -> tuple[int, int] | None:
+    """Find a simple non-overlapping LZ-style match in recent known bytes.
+
+    Returns (offset, length), where offset=1 means "copy from the previous byte".
+    """
+    remaining = len(data) - pos
+    if remaining < COPY_MIN:
+        return None
+
+    max_offset = min(COPY_WINDOW, len(known))
+    best_offset = 0
+    best_len = 0
+    for offset in range(1, max_offset + 1):
+        max_len = min(COPY_MAX, remaining, offset)
+        start = len(known) - offset
+        length = 0
+        while length < max_len and known[start + length] == data[pos + length]:
+            length += 1
+        if length > best_len:
+            best_offset = offset
+            best_len = length
+
+    if best_len < COPY_MIN:
+        return None
+    return best_offset, best_len

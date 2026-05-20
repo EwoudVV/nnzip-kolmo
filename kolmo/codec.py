@@ -21,6 +21,9 @@ class RangeEncoder:
     def encode(self, symbol: int, probs: np.ndarray) -> None:
         self._enc.encode(symbol, _categorical(probs))
 
+    def encode_uniform(self, symbol: int, n_symbols: int) -> None:
+        self.encode(symbol, np.ones(n_symbols, dtype=np.float64) / n_symbols)
+
     def finish(self) -> bytes:
         return self._enc.get_compressed().tobytes()
 
@@ -32,3 +35,7 @@ class RangeDecoder:
 
     def decode(self, probs: np.ndarray) -> int:
         return int(self._dec.decode(_categorical(probs)))
+
+    def decode_uniform(self, n_symbols: int) -> int:
+        probs = np.ones(n_symbols, dtype=np.float64) / n_symbols
+        return self.decode(probs)
