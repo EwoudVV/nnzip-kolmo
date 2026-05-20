@@ -37,6 +37,7 @@ def compress(data: bytes) -> bytes:
     encoder = RangeEncoder()
 
     history = [BOS]
+    copy_history = bytearray()
     pending: list[int] = []
     probs = None
     caches = None
@@ -48,9 +49,10 @@ def compress(data: bytes) -> bytes:
             probs, caches, pos_offset = warm_cache(model, history)
 
     def observe_byte(byte: int):
-        nonlocal history, pending, probs, caches, pos_offset
+        nonlocal history, copy_history, pending, probs, caches, pos_offset
         ensure_cache()
         probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
+        copy_history.append(byte)
         pending.append(byte)
         if len(pending) == BLOCK_SIZE:
             train_block(model, optimizer, history, pending)
@@ -62,18 +64,17 @@ def compress(data: bytes) -> bytes:
 
     pos = 0
     while pos < len(data):
-        known = history + pending
-        copy = find_copy(data, pos, known)
+        copy = find_copy(data, pos, bytes(copy_history))
         if copy is not None:
             offset, length = copy
             encoder.encode(1, EVENT_PROBS)
-            encoder.encode_uniform(offset - 1, min(COPY_WINDOW, len(known)))
+            encoder.encode_uniform(offset - 1, min(COPY_WINDOW, len(copy_history)))
             encoder.encode_uniform(
                 length - COPY_MIN,
                 min(COPY_MAX, len(data) - pos) - COPY_MIN + 1,
             )
-            start = len(known) - offset
-            copied = known[start : start + length]
+            start = len(copy_history) - offset
+            copied = copy_history[start : start + length]
             for byte in copied:
                 observe_byte(byte)
             pos += length

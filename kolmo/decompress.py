@@ -35,6 +35,7 @@ def decompress(blob: bytes) -> bytes:
     decoder = RangeDecoder(payload)
 
     history = [BOS]
+    copy_history = bytearray()
     pending: list[int] = []
     output = bytearray()
     probs = None
@@ -47,9 +48,10 @@ def decompress(blob: bytes) -> bytes:
             probs, caches, pos_offset = warm_cache(model, history)
 
     def observe_byte(byte: int):
-        nonlocal history, pending, probs, caches, pos_offset
+        nonlocal history, copy_history, pending, probs, caches, pos_offset
         ensure_cache()
         probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
+        copy_history.append(byte)
         pending.append(byte)
         if len(pending) == BLOCK_SIZE:
             train_block(model, optimizer, history, pending)
@@ -63,15 +65,14 @@ def decompress(blob: bytes) -> bytes:
     while decoded_total < n_bytes:
         event = decoder.decode(EVENT_PROBS)
         if event == 1:
-            known = history + pending
-            max_offset = min(COPY_WINDOW, len(known))
+            max_offset = min(COPY_WINDOW, len(copy_history))
             max_len = min(COPY_MAX, n_bytes - decoded_total)
             if max_offset == 0 or max_len < COPY_MIN:
                 raise ValueError("invalid copy event in kolmo blob")
             offset = decoder.decode_uniform(max_offset) + 1
             length = decoder.decode_uniform(max_len - COPY_MIN + 1) + COPY_MIN
-            start = len(known) - offset
-            copied = known[start : start + length]
+            start = len(copy_history) - offset
+            copied = copy_history[start : start + length]
             for byte in copied:
                 output.append(byte)
                 observe_byte(byte)

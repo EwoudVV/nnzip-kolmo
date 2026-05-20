@@ -21,12 +21,22 @@ Current prototype result on a clean 8.9 KB mixed text corpus, with a determinist
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
-| 1 KB | 55.3% | **47.7%** |
-| 2 KB | 50.0% | **46.1%** |
-| 4 KB | 47.8% | **45.6%** |
-| 8 KB | **45.7%** | 46.3% |
+| 1 KB | 55.3% | **47.3%** |
+| 2 KB | 50.0% | **45.3%** |
+| 4 KB | 47.8% | **45.0%** |
+| 8 KB | 45.7% | **44.9%** |
 
-The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB win. A first tiny copy mechanism narrows the 8 KB gzip gap to 0.5 percentage points, but gzip still wins there.
+The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB/8 KB win. A first copy mechanism now looks back 4 KB independently of the transformer's 256-byte context.
+
+Longer slope test on a deterministic 32 KB mixed corpus:
+
+| Size | gzip -9 | kolmo |
+|---:|---:|---:|
+| 8 KB | 45.7% | **44.9%** |
+| 16 KB | **35.5%** | 37.9% |
+| 32 KB | **20.0%** | 24.7% |
+
+This means the current architecture finally wins at 8 KB, but gzip still pulls away on larger files. The next bottleneck is making copy references cheaper and stronger.
 
 ## How it works (conceptually)
 
