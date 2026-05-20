@@ -93,7 +93,7 @@ class KolmoTransformer(nn.Module):
         d_model: int = 256,
         n_heads: int = 8,
         n_layers: int = 4,
-        max_context: int = 4096,
+        max_context: int = 16384,
     ):
         super().__init__()
         self.vocab_size = vocab_size

@@ -15,12 +15,12 @@ def test_forward_returns_logits_with_expected_shape():
 
 
 def test_param_count_is_in_target_range():
-    """Default config should land near 3-8M parameters. Position-emb is the
-    biggest single contributor since max_context=4096."""
+    """Default config should land near 5-10M parameters. Position-emb is
+    the biggest single contributor since max_context=16384."""
     model = KolmoTransformer()
     n = model.num_parameters()
-    assert 3_000_000 < n < 8_000_000, (
-        f"unexpected param count {n:,} (target 3-8M)"
+    assert 5_000_000 < n < 12_000_000, (
+        f"unexpected param count {n:,} (target 5-12M)"
     )
 
 
