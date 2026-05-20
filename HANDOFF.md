@@ -220,12 +220,19 @@ ad0d914 Initial commit
 - **Encode 1KB: 12.8s. Decode: 9.6s. Ratio: 56.2%. Full test suite: 270s → 29s (9x).**
 - **Lesson:** This is the right architectural direction. The numerical equivalence tests pass, meaning the math is consistent between full-forward and incremental-forward.
 
-### 4. CONTEXT=512 (just tried, results partial as of writing)
+### 4. CONTEXT=512 — didn't help
 
-- 1KB: 56.6% (worse than CONTEXT=256's 56.2%? Or noise — they're very close).
-- 2KB: 52.0%
-- 4KB: 50.2%
-- **8KB: still running when this handoff was written. Check `/tmp/kolmo_crossover3.log` for status.**
+Full results compared to CONTEXT=256:
+
+| Size | gzip | kolmo C=256 | kolmo C=512 |
+|---|---|---|---|
+| 1KB | 55.3% | 56.2% | 56.6% |
+| 2KB | 50.0% | 51.8% | 52.0% |
+| 4KB | 47.8% | 50.0% | 50.2% |
+| 8KB | 45.7% | 50.0% | 50.1% |
+
+CONTEXT=512 was *very slightly worse* across the board (noise around the same plateau). **Reverted to CONTEXT=256** after this experiment, because the bigger context costs roughly 4x more training compute per block for no benefit.
+
 - **Lesson:** More context alone doesn't break the plateau. The model is **capacity-limited**, not context-limited. A 3M-active-param model trained on 8KB doesn't have enough capacity to learn the corpus's statistics deeply enough to outperform gzip's exact-match dictionary.
 
 ---
@@ -290,17 +297,9 @@ Embed ~1KB of generic English text into the source. Both sides train on it befor
 
 ---
 
-## What's running RIGHT NOW
+## What's the current state?
 
-A crossover benchmark with `CONTEXT=512`:
-
-```
-/Users/kids/compression-experiment/venv/bin/python benchmarks/crossover.py 2>&1 | tee /tmp/kolmo_crossover3.log
-```
-
-Partial results (1KB-4KB) showed the plateau persists. 8KB result will arrive any moment. Check the log file for the final row. The exit code 0 task notification means it's done.
-
-If it completed: don't bother re-running the same numbers. **Commit the changed CONTEXT=512 (if it's not already committed) only if the 8KB result is meaningfully better than CONTEXT=256's 4.3pp gap.** Otherwise revert to `CONTEXT=256` to save user's encode time.
+`CONTEXT=256`, `BLOCK_SIZE=16`, KV cache enabled. All 13 tests pass in ~30s. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Plateau at ~50% on 4-8KB has been measured and confirmed twice. The next move is a bigger model.
 
 ---
 
