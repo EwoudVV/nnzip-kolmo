@@ -282,6 +282,21 @@ Stopped before 8KB and reverted to `LR=1e-3`.
 
 - **Lesson:** a higher LR helps cold-start compression but worsens the plateau. Simple LR tuning is not enough; the promising direction is probably a more structural training change, such as extra training passes on already-seen bytes, a seed/warmup corpus, or a schedule that starts high and decays instead of warming up.
 
+### 7. Extra train epochs per block — worse
+
+Tried `TRAIN_EPOCHS=2` inside `train_block`: after each block is encoded/decoded, run two optimizer passes over the same known `(history + block)` data before moving to the next block. This is symmetric and round-trip-safe. Correctness held: all 13 tests passed in 43.8s.
+
+Results:
+
+| Size | gzip | baseline epochs=1 | train_epochs=2 |
+|---|---:|---:|---:|
+| 1KB | 55.3% | 56.2% | 56.2% |
+| 2KB | 50.0% | 51.8% | 52.5% |
+
+Stopped before 4KB and reverted to one training epoch per block.
+
+- **Lesson:** repeated local training overfits the just-seen block or destabilizes future predictions. The plateau is not simply "not enough optimizer steps on the latest bytes."
+
 ---
 
 ## The plateau and what to do about it
@@ -290,11 +305,11 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 **Hypotheses for the plateau, in rough order of likelihood:**
 
-1. **The model is not assimilating observations deeply enough.** It gets one optimizer step per 16-byte block, so it learns broad byte/character statistics but may not adapt hard enough to phrase-level structure before gzip's dictionary starts pulling away. **Most likely cause after context, bigger-model, and simple-LR tests.**
+1. **Cold-start / prior problem.** The model begins random, so the early stream is expensive. Higher LR helped 512B/1KB but hurt longer files; extra train epochs also hurt. A small deterministic seed corpus or better initialization is now the most plausible next test.
 
-2. **Cold-start tax is large.** The first hundreds of bytes are encoded by a nearly random model. Higher LR helped 512B/1KB but hurt longer files, so the cold-start problem is real but a plain LR bump is too blunt.
+2. **The model is not learning the right kind of structure.** It learns byte/character statistics, but gzip's advantage is exact substring reuse. The neural model may need a different objective, recurrence/memory, or tokenization to exploit phrase-level reuse.
 
-3. **Model capacity is too small, but only after training improves.** A 17.1M-param model alone was worse at 2KB/4KB, so don't scale capacity again until the online training loop is better.
+3. **Model capacity is too small, but only after training improves.** A 17.1M-param model alone was worse at 2KB/4KB, so don't scale capacity again until the model has a better prior or memory mechanism.
 
 4. **Context window is still too small.** Less likely given the 512-token test was slightly worse through 8KB.
 
@@ -304,15 +319,13 @@ kolmo's compression ratio flatlines around 50% somewhere around 4KB. gzip keeps 
 
 In rough order of expected payoff:
 
-#### (A) Extra training passes on already-seen bytes
+#### (A) Seed corpus / deterministic pre-training warmup
 
-Right now each block gets one optimizer step after it is encoded/decoded. Try `TRAIN_EPOCHS=2` or `3` inside `train_block`: run the same full forward + backward + optimizer step multiple times on the known `(history + block)` data before moving to the next block. This is symmetric because the decoder knows the block after decoding it. It costs more time but directly tests whether the model is under-assimilating observations.
+Embed ~1KB of generic English text into the source and train on it before starting the real input. Both compressor and decompressor do the same warmup from the same literal bytes, so no weights are shipped. This directly targets the random-model cold start and should help tiny prefixes without using an aggressive LR that hurts longer files.
 
-#### (B) Multi-pass over short prefixes / seed corpus
+#### (B) Multi-pass over short prefixes
 
 The first ~hundred bytes get encoded by a random model and waste bits. Idea: train the model on bytes 1..N *before* encoding byte 1. Two-pass approach. The decoder does the same warm-up. But this only helps once — after that the live training takes over.
-
-Related idea: embed ~1KB of generic English text into the source and train on it before starting the real input. This shifts the model away from random init without shipping weights.
 
 #### (C) Bigger model with better training
 
@@ -328,7 +341,7 @@ Related idea: embed ~1KB of generic English text into the source and train on it
 
 ## What's the current state?
 
-`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled. All 13 tests pass in ~30s on the baseline model. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Plateau at ~50% on 4-8KB has been measured and confirmed twice. Naive bigger model and simple LR tweaks did not help. The next move is extra training passes per block or cold-start mitigation.
+`CONTEXT=256`, `BLOCK_SIZE=16`, `LR=1e-3`, KV cache enabled. All 13 tests pass in ~30s on the baseline model. The crossover benchmark is committed and reproducible (`python benchmarks/crossover.py`). Plateau at ~50% on 4-8KB has been measured and confirmed twice. Naive bigger model, simple LR tweaks, and extra train epochs did not help. The next move is cold-start mitigation with a deterministic seed corpus.
 
 ---
 
@@ -436,7 +449,7 @@ The user has a Google Cloud free trial available ($300 / 90 days for new account
 3. Read `kolmo/model.py` — especially `CausalSelfAttention.forward` to understand the KV cache.
 4. Check whether `/tmp/kolmo_crossover3.log` has the final 8KB row. If yes, evaluate whether to keep `CONTEXT=512` or revert to 256.
 5. Run the full test suite to confirm everything is green: `cd /Users/kids/Documents/nnzip-kolmo && /Users/kids/compression-experiment/venv/bin/python -m pytest tests/ -v`.
-6. Propose to the user: "try extra training passes per block, because context, naive capacity, and simple LR changes all failed." Get a yes, then implement, run benchmark, commit + push.
+6. Propose to the user: "try a deterministic seed corpus warmup, because context, naive capacity, simple LR changes, and extra train epochs all failed." Get a yes, then implement, run benchmark, commit + push.
 
 ---
 
