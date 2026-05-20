@@ -81,6 +81,36 @@ def length_probs(n: int) -> np.ndarray:
     return raw / raw.sum()
 
 
+class EventModel:
+    """Adaptive probability model for the literal/copy event flag.
+
+    The fixed EVENT_PROBS = [0.995, 0.005] assumes a 0.5% copy rate, but real
+    text shows 5-15% rates once enough history is available. This costs ~7.6
+    bits per copy flag with the static prior; with adaptation, copies in long
+    files cost ~3 bits.
+
+    Both encoder and decoder hold an instance and call `observe` after every
+    event, in the same order — distribution evolves bit-identically.
+    """
+
+    def __init__(self, prior_copy: float = 0.05, prior_strength: float = 50.0):
+        self.copy_count = prior_copy * prior_strength
+        self.literal_count = (1.0 - prior_copy) * prior_strength
+
+    def probs(self) -> np.ndarray:
+        total = self.copy_count + self.literal_count
+        return np.array(
+            [self.literal_count / total, self.copy_count / total],
+            dtype=np.float64,
+        )
+
+    def observe(self, event: int) -> None:
+        if event == 1:
+            self.copy_count += 1.0
+        else:
+            self.literal_count += 1.0
+
+
 class OffsetModel:
     """Adaptive probability model for copy offsets.
 

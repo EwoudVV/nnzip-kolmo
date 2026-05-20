@@ -6,8 +6,8 @@ Usage:
     python3 benchmarks/copy_stats.py
 
 Iterates over the benchmark corpus prefixes and reports a histogram of offset
-log-bins and length values that find_copy would actually emit. Compares the
-empirical distribution to the current 1/k prior the encoder uses.
+log-bins and length values that find_copy would actually emit. Reports both
+the local (short) corpus and the procedurally-extended long corpus.
 """
 
 import math
@@ -20,7 +20,6 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 
 from kolmo._engine import (  # noqa: E402
-    COPY_MAX,
     COPY_MIN,
     COPY_WINDOW,
     find_copy,
@@ -32,39 +31,97 @@ from kolmo._engine import (  # noqa: E402
 CORPUS_DIR = Path(
     "/Users/kids/compression-experiment/compression-experiments/benchmarks/corpus"
 )
-SOURCE_FILES = [
+SHORT_FILES = [
     "prose_modern.txt",
     "wiki_factual.txt",
     "dialogue.txt",
     "markdown_docs.md",
-    "code_python.py",
-    "json_data.json",
-    "repetitive.txt",
 ]
 
 
-def gather_events(data: bytes) -> list[tuple[int, int]]:
-    """Replay find_copy over data and return the list of (offset, length)
-    events the encoder would emit."""
-    history = bytearray()
-    events = []
-    pos = 0
-    while pos < len(data):
-        copy = find_copy(data, pos, bytes(history))
-        if copy is None:
-            history.append(data[pos])
-            pos += 1
-            continue
-        offset, length = copy
-        events.append((offset, length))
-        chunk = data[pos : pos + length]
-        history.extend(chunk)
-        pos += length
-    return events
+def build_short_corpus() -> bytes:
+    parts = [
+        (CORPUS_DIR / f).read_bytes().rstrip(b"\n") for f in SHORT_FILES
+    ]
+    return b"\n\n".join(parts) + b"\n"
+
+
+def build_long_corpus() -> bytes:
+    """Same as benchmarks/long_crossover.py — extends the short corpus with
+    deterministic procedurally-generated paragraphs."""
+    parts = [
+        (CORPUS_DIR / f).read_bytes().rstrip(b"\n")
+        for f in [
+            "prose_modern.txt",
+            "wiki_factual.txt",
+            "dialogue.txt",
+            "markdown_docs.md",
+            "code_python.py",
+            "json_data.json",
+            "repetitive.txt",
+        ]
+    ]
+    subjects = [
+        "the archivist", "a small research team", "the compression model",
+        "the city council", "an old river map", "the school robotics club",
+        "the public library", "a weather station",
+    ]
+    actions = [
+        "recorded", "compared", "revised", "summarized",
+        "questioned", "indexed", "tested", "explained",
+    ]
+    objects = [
+        "a table of measurements", "the repeated phrase in the report",
+        "a sequence of byte patterns", "the notes from the meeting",
+        "a paragraph with several clauses", "the local history archive",
+        "a list of names and dates", "the result of the benchmark",
+    ]
+    for i in range(240):
+        s = subjects[i % len(subjects)]
+        a = actions[(i * 3 + 1) % len(actions)]
+        o = objects[(i * 5 + 2) % len(objects)]
+        paragraph = (
+            f"\n\nSection {i:03d}. {s.title()} {a} {o}. The entry "
+            f"included numbers {128 + i}, {256 + 2 * i}, and {4096 + 3 * i}, "
+            "plus a note about context, memory, prediction, and exact reuse. "
+            "In the dialogue version, one person asked whether the earlier "
+            "sentence could be copied, and another answered that literal "
+            "prediction and copy references solve different problems. The "
+            "wording changes each time, but ordinary English punctuation and "
+            "spacing remain stable."
+        ).encode("ascii")
+        parts.append(paragraph)
+    return b"\n\n".join(parts) + b"\n"
+
+
+def gather_events(data: bytes, window: int) -> list[tuple[int, int]]:
+    """Replay find_copy over data, simulating a given window. Returns (offset,
+    length) events."""
+    import kolmo._engine as engine
+
+    old_window = engine.COPY_WINDOW
+    engine.COPY_WINDOW = window
+    try:
+        history = bytearray()
+        events = []
+        pos = 0
+        while pos < len(data):
+            copy = find_copy(data, pos, bytes(history))
+            if copy is None:
+                history.append(data[pos])
+                pos += 1
+                continue
+            offset, length = copy
+            events.append((offset, length))
+            chunk = data[pos : pos + length]
+            history.extend(chunk)
+            pos += length
+        return events
+    finally:
+        engine.COPY_WINDOW = old_window
 
 
 def offset_bin(offset: int) -> str:
-    """Coarse log-spaced bin for visualizing offset distribution."""
     if offset <= 0:
         return "0"
     e = int(math.log2(offset))
@@ -73,56 +130,42 @@ def offset_bin(offset: int) -> str:
     return f"{lo}-{hi - 1}"
 
 
+def report(name: str, data: bytes, window: int) -> None:
+    events = gather_events(data, window)
+    if not events:
+        print(f"{name}: no copy events at window={window}")
+        return
+
+    offsets = [o for o, _ in events]
+    lengths = [length for _, length in events]
+    copied = sum(lengths)
+    bins = Counter(offset_bin(o) for o in offsets)
+
+    print(f"\n{name}  window={window}B  events={len(events)}  "
+          f"copied={copied}B ({100 * copied / len(data):.1f}%)")
+    print("  offset log-bins:")
+    for bin_label, cnt in sorted(
+        bins.items(), key=lambda kv: int(kv[0].split("-")[0])
+    ):
+        pct = 100 * cnt / len(events)
+        bar = "#" * int(pct / 2)
+        print(f"    {bin_label:>10}: {cnt:>4}  {pct:5.1f}%  {bar}")
+
+
 def main() -> None:
-    parts = []
-    for f in SOURCE_FILES:
-        parts.append((CORPUS_DIR / f).read_bytes().rstrip(b"\n"))
-    raw = b"\n\n".join(parts) + b"\n"
+    short = build_short_corpus()
+    long_corp = build_long_corpus()
 
-    for n in [4096, 8192, 16384]:
-        if n > len(raw):
-            break
-        data = raw[:n]
-        events = gather_events(data)
-        if not events:
-            print(f"{n}B: no copy events")
-            continue
+    print(f"short corpus: {len(short):,}B   long corpus: {len(long_corp):,}B")
 
-        offsets = [o for o, _ in events]
-        lengths = [length for _, length in events]
-        copied = sum(lengths)
-
-        bins = Counter(offset_bin(o) for o in offsets)
-        len_hist = Counter(lengths)
-
-        print(f"\n{n}B  copy_events={len(events)}  bytes_copied={copied}  "
-              f"({100 * copied / n:.1f}%)")
-        print("  offset log-bins:")
-        for bin_label, cnt in sorted(
-            bins.items(),
-            key=lambda kv: int(kv[0].split("-")[0]),
-        ):
-            pct = 100 * cnt / len(events)
-            bar = "#" * int(pct / 2)
-            print(f"    {bin_label:>9}: {cnt:>4}  {pct:5.1f}%  {bar}")
-        print("  length histogram:")
-        for length, cnt in sorted(len_hist.items()):
-            pct = 100 * cnt / len(events)
-            bar = "#" * int(pct / 2)
-            print(f"    {length:>3}: {cnt:>4}  {pct:5.1f}%  {bar}")
-
-        # Compare empirical vs current encoder prior
-        max_offset = min(COPY_WINDOW, n)
-        prior_offset = offset_probs(max_offset)
-        emp_offset_bits = 0.0
-        prior_offset_bits = 0.0
-        for off in offsets:
-            empirical_p = offsets.count(off) / len(offsets)
-            emp_offset_bits += -math.log2(empirical_p) if empirical_p > 0 else 0
-            prior_offset_bits += -math.log2(prior_offset[off - 1])
-        print(f"  offset coding cost (current 1/k prior): {prior_offset_bits:.0f} bits"
-              f"  | empirical optimum: {emp_offset_bits:.0f} bits"
-              f"  | uniform: {len(events) * math.log2(max_offset):.0f} bits")
+    for window in [4096, 8192, 16384]:
+        print(f"\n=== window={window}B ===")
+        for n in [4096, 8192]:
+            if n <= len(short):
+                report(f"short[{n}]", short[:n], window)
+        for n in [16384, 32768]:
+            if n <= len(long_corp):
+                report(f"long[{n}]", long_corp[:n], window)
 
 
 if __name__ == "__main__":
