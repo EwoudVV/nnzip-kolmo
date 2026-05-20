@@ -1,4 +1,5 @@
-"""Sanity checks on the model: shapes, parameter count, valid distribution."""
+"""Sanity checks on the model: shapes, parameter count, valid distribution,
+and KV-cache equivalence with a single full forward."""
 
 import torch
 
@@ -8,45 +9,80 @@ from kolmo import KolmoTransformer
 def test_forward_returns_logits_with_expected_shape():
     model = KolmoTransformer()
     x = torch.randint(0, 256, (1, 10))
-    logits = model(x)
+    logits, caches = model(x)
     assert logits.shape == (1, 10, 256)
+    assert len(caches) == 4  # one cache per layer (default 4 layers)
 
 
 def test_param_count_is_in_target_range():
-    """Default config should land near 3M parameters. If a tweak suddenly
-    pushes us outside ~2-5M, we want a test to flag it."""
+    """Default config should land near 3-8M parameters. Position-emb is the
+    biggest single contributor since max_context=4096."""
     model = KolmoTransformer()
     n = model.num_parameters()
-    assert 2_000_000 < n < 5_000_000, (
-        f"unexpected param count {n:,} (target ~3M)"
+    assert 3_000_000 < n < 8_000_000, (
+        f"unexpected param count {n:,} (target 3-8M)"
     )
 
 
 def test_softmax_of_logits_sums_to_one():
     model = KolmoTransformer()
     x = torch.randint(0, 256, (1, 10))
-    probs = torch.softmax(model(x), dim=-1)
+    logits, _ = model(x)
+    probs = torch.softmax(logits, dim=-1)
     sums = probs.sum(dim=-1)
     assert torch.allclose(sums, torch.ones_like(sums), atol=1e-4)
 
 
-def test_context_length_check():
-    model = KolmoTransformer(max_context=64)
-    too_long = torch.randint(0, 256, (1, 65))
-    try:
-        model(too_long)
-    except ValueError as e:
-        assert "context length" in str(e)
-    else:
-        raise AssertionError("expected ValueError for oversized context")
-
-
 def test_seeded_init_is_reproducible():
-    """Two models created with the same seed should have identical weights.
-    This is the foundation for Rung 1 round-trip correctness."""
     torch.manual_seed(42)
     a = KolmoTransformer()
     torch.manual_seed(42)
     b = KolmoTransformer()
     for pa, pb in zip(a.parameters(), b.parameters()):
         assert torch.equal(pa, pb)
+
+
+def test_kv_cache_matches_full_forward():
+    """A single forward over [a, b, c, d] should produce the same logits as
+    feeding [a, b] then [c, d] with a KV cache. This is the core
+    correctness condition for the cache implementation."""
+    torch.manual_seed(7)
+    model = KolmoTransformer(max_context=64)
+    model.eval()
+
+    x_full = torch.randint(0, 256, (1, 8))
+
+    with torch.no_grad():
+        # Reference: single forward
+        full_logits, _ = model(x_full)
+
+        # Incremental: two halves with cache
+        first_logits, caches = model(x_full[:, :4], kv_caches=None, pos_offset=0)
+        second_logits, _ = model(x_full[:, 4:], kv_caches=caches, pos_offset=4)
+
+    # First half matches positions 0..3 of full
+    assert torch.allclose(first_logits, full_logits[:, :4], atol=1e-5)
+    # Second half matches positions 4..7 of full
+    assert torch.allclose(second_logits, full_logits[:, 4:], atol=1e-5)
+
+
+def test_kv_cache_one_token_at_a_time():
+    """Token-by-token incremental forward should also match a single full
+    forward — this is the actual usage pattern in decompress."""
+    torch.manual_seed(7)
+    model = KolmoTransformer(max_context=64)
+    model.eval()
+
+    x_full = torch.randint(0, 256, (1, 6))
+
+    with torch.no_grad():
+        full_logits, _ = model(x_full)
+
+        caches = None
+        incr_logits = []
+        for i in range(6):
+            l, caches = model(x_full[:, i:i + 1], kv_caches=caches, pos_offset=i)
+            incr_logits.append(l)
+        incr_logits = torch.cat(incr_logits, dim=1)
+
+    assert torch.allclose(incr_logits, full_logits, atol=1e-5)

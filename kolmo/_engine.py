@@ -2,20 +2,23 @@
 
 Both directions need to walk the model through the *same* training trajectory:
 build identical weights, predict identical probabilities, take identical
-optimizer steps. Anything that affects model state has to live here so the two
-sides can't drift.
+optimizer steps. The KV cache lets each direction do most of the predictions
+incrementally (O(T) per byte instead of O(T²)); the training step still needs
+a full forward over the recent history with gradient tracking, but that's
+only done once per block.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from kolmo.model import KolmoTransformer
 
 SEED = 42
 LR = 1e-3
-CONTEXT = 128  # sliding-window cap; smaller = faster, less long-range context
-BLOCK_SIZE = 16  # accumulate this many byte-losses before each optimizer step
+CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
+BLOCK_SIZE = 16  # bytes between optimizer steps
 BOS = 0  # implicit start-of-stream byte, never written to disk
 
 
@@ -29,41 +32,81 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
     return model, optimizer
 
 
-def predict(model: KolmoTransformer, context: list[int]) -> tuple[np.ndarray, torch.Tensor]:
-    """Forward pass with gradient tracking. Returns (probs as numpy float64,
-    logits tensor for backprop).
+def _trim_caches(caches: list, max_len: int) -> list:
+    """Slide the KV cache window: keep only the last `max_len` positions."""
+    out = []
+    for c in caches:
+        if c["k"].shape[2] > max_len:
+            out.append({
+                "k": c["k"][:, :, -max_len:],
+                "v": c["v"][:, :, -max_len:],
+            })
+        else:
+            out.append(c)
+    return out
 
-    Gradient tracking stays on because the same forward pass feeds both the
-    encoding (probs) and the training step (logits → loss). One forward per
-    byte is the whole compute budget.
+
+def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray, list, int]:
+    """Run a fresh forward over `history` (no grad) to rebuild the KV cache
+    and get the prediction for the next byte. Used at the start of each block,
+    after a training step has invalidated the previous cache.
+
+    Returns (probs over next byte as float64 numpy, kv_caches, pos_after).
     """
-    x = torch.tensor([context], dtype=torch.long)
-    logits = model(x)  # (1, T, 256)
-    last_logits = logits[0, -1]  # (256,)
-    probs = torch.softmax(last_logits, dim=-1).detach().numpy().astype(np.float64)
-    return probs, last_logits
+    x = torch.tensor([history], dtype=torch.long)
+    with torch.no_grad():
+        logits, caches = model(x, kv_caches=None, pos_offset=0)
+    probs = torch.softmax(logits[0, -1], dim=-1).numpy().astype(np.float64)
+    return probs, caches, len(history)
+
+
+def step_cache(
+    model: KolmoTransformer,
+    byte: int,
+    caches: list,
+    pos_offset: int,
+) -> tuple[np.ndarray, list, int]:
+    """Feed one new byte using the cache. Returns (probs over next byte,
+    updated caches, new pos_offset)."""
+    x = torch.tensor([[byte]], dtype=torch.long)
+    with torch.no_grad():
+        logits, caches = model(x, kv_caches=caches, pos_offset=pos_offset)
+    caches = _trim_caches(caches, CONTEXT)
+    probs = torch.softmax(logits[0, -1], dim=-1).numpy().astype(np.float64)
+    return probs, caches, pos_offset + 1
 
 
 def train_block(
+    model: KolmoTransformer,
     optimizer: torch.optim.Optimizer,
-    block_logits: list[torch.Tensor],
+    history: list[int],
     block_bytes: list[int],
 ) -> None:
-    """One backward + optimizer step on a block of accumulated per-byte logits.
-    Both compress and decompress call this with the same block at the same step,
-    so weights stay in lockstep. Amortizing the optimizer step across many bytes
-    is a major speedup on CPU, where the per-step overhead dominates."""
-    logits = torch.stack(block_logits)  # (block_size, vocab)
+    """Run a full forward with gradient over `history + block_bytes`, compute
+    cross-entropy loss against the block targets, backward + optimizer step.
+
+    Both compress and decompress call this with the same arguments at the
+    same step, so weights stay in lockstep.
+    """
+    full = (history + block_bytes)[-CONTEXT:]
+    m = len(block_bytes)
+    n_hist = len(full) - m
+
+    x = torch.tensor([full], dtype=torch.long)
+    logits, _ = model(x, kv_caches=None, pos_offset=0)
+    # Predictions for block bytes come from logits at positions [n_hist-1 .. n_hist+m-2]
+    block_logits = logits[0, n_hist - 1 : n_hist + m - 1]
+
     targets = torch.tensor(block_bytes, dtype=torch.long)
-    loss = nn.functional.cross_entropy(logits, targets)
+    loss = F.cross_entropy(block_logits, targets)
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
 
-def slide(context: list[int], byte: int) -> list[int]:
-    """Append byte and trim to max context length."""
-    context = context + [byte]
-    if len(context) > CONTEXT:
-        context = context[-CONTEXT:]
-    return context
+def update_history(history: list[int], new_bytes: list[int]) -> list[int]:
+    """Append new bytes to the sliding-window history."""
+    history = history + new_bytes
+    if len(history) > CONTEXT:
+        history = history[-CONTEXT:]
+    return history
