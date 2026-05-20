@@ -15,7 +15,9 @@ from kolmo._engine import (
     COPY_MIN,
     COPY_WINDOW,
     EVENT_PROBS,
+    length_probs,
     new_model_and_optimizer,
+    offset_probs,
     step_cache,
     train_block,
     update_history,
@@ -69,8 +71,8 @@ def decompress(blob: bytes) -> bytes:
             max_len = min(COPY_MAX, n_bytes - decoded_total)
             if max_offset == 0 or max_len < COPY_MIN:
                 raise ValueError("invalid copy event in kolmo blob")
-            offset = decoder.decode_uniform(max_offset) + 1
-            length = decoder.decode_uniform(max_len - COPY_MIN + 1) + COPY_MIN
+            offset = decoder.decode(offset_probs(max_offset)) + 1
+            length = decoder.decode(length_probs(max_len - COPY_MIN + 1)) + COPY_MIN
             start = len(copy_history) - offset
             copied = copy_history[start : start + length]
             for byte in copied:

@@ -61,6 +61,30 @@ SEED_CORPUS = _SEED_BASE + _SEED_EXTRA * 3
 EVENT_PROBS = np.array([1.0 - COPY_PROB, COPY_PROB], dtype=np.float64)
 
 
+def offset_probs(n: int) -> np.ndarray:
+    """Probability distribution over offset values 0..n-1 (representing actual
+    offsets 1..n). Uses 1/sqrt(k) decay — favors small offsets but keeps
+    long offsets affordable for files with paragraph-level repetition.
+
+    Empirically 1/k was too aggressive at 32KB+ where many useful matches
+    live in the 1000+ offset range.
+    """
+    if n <= 0:
+        return np.array([], dtype=np.float64)
+    raw = 1.0 / np.sqrt(np.arange(1, n + 1, dtype=np.float64))
+    return raw / raw.sum()
+
+
+def length_probs(n: int) -> np.ndarray:
+    """Probability distribution over length-MIN values 0..n-1. Favors shorter
+    matches via 1/k decay — match-length distribution is steeper than offset
+    distribution in practice."""
+    if n <= 0:
+        return np.array([], dtype=np.float64)
+    raw = 1.0 / np.arange(1, n + 1, dtype=np.float64)
+    return raw / raw.sum()
+
+
 def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
     """Build a model with deterministic init. Both compress and decompress
     must call this and get bit-identical starting weights."""
