@@ -77,7 +77,8 @@ def compress(data: bytes) -> bytes:
             max_offset = min(COPY_WINDOW, len(copy_history))
             max_len = min(COPY_MAX, len(data) - pos) - COPY_MIN + 1
             encoder.encode(offset - 1, offset_model.probs_for(max_offset))
-            encoder.encode(length - COPY_MIN, length_model.probs_for(max_len))
+            if max_len > 1:
+                encoder.encode(length - COPY_MIN, length_model.probs_for(max_len))
             offset_model.observe(offset)
             length_model.observe(length - COPY_MIN)
             start = len(copy_history) - offset
