@@ -21,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parent.parent
 sys.path.insert(0, str(REPO))
 
+from kolmo._engine import train_block  # noqa: E402
 from kolmo.model import KolmoTransformer  # noqa: E402
 from kolmo.stable_init import stable_init_model  # noqa: E402
 
@@ -41,24 +42,13 @@ def main() -> None:
     initial_hash = hash_state(dict(model.named_parameters()))
     print(f"initial weights sha256: {initial_hash}")
 
-    # One training step on a fixed input
+    # One training step on a fixed input — uses the real train_block so
+    # we measure the actual pipeline (including any deterministic
+    # post-processing of gradients).
     history = list(b"\x00" + b"the quick brown fox jumps over the lazy dog. ")
     block_bytes = list(b"the quick brown ")  # 16 bytes
-    full = history + block_bytes
-    n_hist = len(history)
-    m = len(block_bytes)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    x = torch.tensor([full], dtype=torch.long)
-    logits, _ = model(x, kv_caches=None, pos_offset=0)
-    block_logits = logits[0, n_hist - 1 : n_hist + m - 1]
-    targets = torch.tensor(block_bytes, dtype=torch.long)
-    loss = F.cross_entropy(block_logits, targets)
-    print(f"loss: {loss.item():.10f}")
-
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+    train_block(model, optimizer, history, block_bytes)
 
     after_hash = hash_state(dict(model.named_parameters()))
     print(f"after-step weights sha256: {after_hash}")
