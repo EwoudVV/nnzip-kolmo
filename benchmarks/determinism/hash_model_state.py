@@ -21,6 +21,7 @@ sys.path.insert(0, str(REPO))
 
 from kolmo._engine import new_model_and_optimizer
 from kolmo.model import KolmoTransformer
+from kolmo.stable_init import stable_init_model
 
 
 def hash_model(model: KolmoTransformer) -> str:
@@ -33,8 +34,12 @@ def hash_model(model: KolmoTransformer) -> str:
 
 def main() -> None:
     torch.manual_seed(42)
-    initial = KolmoTransformer()
-    print(f"initial {hash_model(initial)}")
+    pytorch_default = KolmoTransformer()
+    print(f"pytorch_default {hash_model(pytorch_default)}")
+
+    stable_initial = KolmoTransformer()
+    stable_init_model(stable_initial, 42)
+    print(f"stable_initial {hash_model(stable_initial)}")
 
     primed, _ = new_model_and_optimizer()
     print(f"after_prime {hash_model(primed)}")

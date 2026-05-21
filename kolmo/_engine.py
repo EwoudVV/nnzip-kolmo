@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from kolmo.model import KolmoTransformer
+from kolmo.stable_init import stable_init_model
 
 SEED = 42
 LR = 1e-3
@@ -189,6 +190,7 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
     model = KolmoTransformer()
+    stable_init_model(model, SEED)
     model.to(_select_device())
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
