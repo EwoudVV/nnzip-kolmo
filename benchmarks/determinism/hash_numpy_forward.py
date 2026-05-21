@@ -41,6 +41,10 @@ def main() -> None:
     print(f"shape {logits.shape}")
     print(f"dtype {logits.dtype}")
     print(f"sha256 {hashlib.sha256(logits.tobytes()).hexdigest()}")
+    for scale in (1_000_000, 100_000, 10_000):
+        quantized = np.rint(logits * scale).astype(np.int64)
+        digest = hashlib.sha256(quantized.tobytes()).hexdigest()
+        print(f"q{scale} {digest}")
     print("first8 " + " ".join(f"{x:.9f}" for x in logits[0, :8]))
 
 
