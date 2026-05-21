@@ -22,7 +22,7 @@ BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
 COPY_WINDOW = 8192
 COPY_MIN = 8
-COPY_MAX = 128
+COPY_MAX = 256
 _SEED_BASE = (
     b"English text is full of small regularities. Letters form words, words "
     b"form phrases, and phrases repeat with punctuation, spacing, and rhythm. "
