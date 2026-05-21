@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
 from kolmo.model import KolmoTransformer
 from kolmo.stable_init import stable_init_model
 
@@ -235,7 +236,11 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
     x = torch.tensor([history], dtype=torch.long, device=device)
     with torch.no_grad():
         logits, caches = model(x, kv_caches=None, pos_offset=0)
-    probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy().astype(np.float64)
+    last_logits = logits[0, -1].cpu().numpy().astype(np.float64)
+    # Quantize through deterministic int frequencies so probs derived
+    # from float math on different machines collapse to the same values.
+    freqs = logits_to_int_freqs(last_logits)
+    probs = freqs.astype(np.float64) / float(TOTAL_FREQ)
     return probs, caches, len(history)
 
 
@@ -252,7 +257,9 @@ def step_cache(
     with torch.no_grad():
         logits, caches = model(x, kv_caches=caches, pos_offset=pos_offset)
     caches = _trim_caches(caches, CONTEXT)
-    probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy().astype(np.float64)
+    last_logits = logits[0, -1].cpu().numpy().astype(np.float64)
+    freqs = logits_to_int_freqs(last_logits)
+    probs = freqs.astype(np.float64) / float(TOTAL_FREQ)
     return probs, caches, pos_offset + 1
 
 

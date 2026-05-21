@@ -11,7 +11,11 @@ import constriction
 
 def _categorical(probs: np.ndarray):
     p = probs.astype(np.float64, copy=False)
-    return constriction.stream.model.Categorical(p, perfect=False)
+    # perfect=True does exact-rational quantization, which makes the
+    # arithmetic-coder boundaries identical across machines for the same
+    # input probs. Combined with our deterministic int-freq probs upstream,
+    # this gives bit-identical encoding regardless of CPU architecture.
+    return constriction.stream.model.Categorical(p, perfect=True)
 
 
 class RangeEncoder:
