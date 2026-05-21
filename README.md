@@ -21,22 +21,22 @@ Current prototype result on a clean 8.9 KB mixed text corpus, with a determinist
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
-| 1 KB | 55.3% | **47.3%** |
-| 2 KB | 50.0% | **45.3%** |
-| 4 KB | 47.8% | **45.0%** |
-| 8 KB | 45.7% | **44.9%** |
+| 1 KB | 55.3% | **46.9%** |
+| 2 KB | 50.0% | **44.9%** |
+| 4 KB | 47.8% | **44.2%** |
+| 8 KB | 45.7% | **43.9%** |
 
-The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB/8 KB win. A first copy mechanism now looks back 4 KB independently of the transformer's 256-byte context.
+The 1 KB result is seed-dominated, so the cleaner milestone is the 2 KB/4 KB/8 KB win. The copy mechanism looks back 8 KB independently of the transformer's 256-byte context, with three adaptive models (offset, length, event-flag) that learn the corpus's repetition structure online.
 
 Longer slope test on a deterministic 32 KB mixed corpus:
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
-| 8 KB | 45.7% | **44.9%** |
-| 16 KB | **35.5%** | 37.9% |
-| 32 KB | **20.0%** | 24.7% |
+| 8 KB | 45.7% | **43.9%** |
+| 16 KB | **35.5%** | 36.3% |
+| 32 KB | **20.0%** | 21.2% |
 
-This means the current architecture finally wins at 8 KB, but gzip still pulls away on larger files. The next bottleneck is making copy references cheaper and stronger.
+kolmo wins at 8 KB. At 16 KB and 32 KB gzip still wins, but the gap has shrunk: 32 KB was a 4.7 pp gap when the copy mechanism first landed, now it's 1.2 pp. The remaining wall is gzip's long-range exact-repeat matching, which kolmo can only partially approximate with a finite copy window.
 
 ## How it works (conceptually)
 
