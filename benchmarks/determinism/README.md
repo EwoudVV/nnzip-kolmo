@@ -11,12 +11,26 @@ input, we have a deterministic compressor.
 | Within-machine | ✅ | ✅ | ✅ |
 | Match Mac CPU | — | ❌ | ❌ |
 
-The fault line is **CPU architecture** (Apple Silicon vs x86), not the device.
-PyTorch float operations diverge between architectures.
+The original fault line was **CPU architecture** (Apple Silicon vs x86), not
+the device. PyTorch CPU and CUDA matched on Windows, but Mac CPU differed.
+
+Rung 2 progress:
+
+| Probe | Result |
+|---|---|
+| Stable initializer | ✅ Mac and Windows produce identical initial weights |
+| PyTorch seed warmup | ❌ weights diverge after training on the built-in seed corpus |
+| NumPy forward pass | ❌ logits are close but not byte-identical across Mac and Windows |
+
+This means NumPy is useful as a readable stepping stone, but it is not enough
+for prize-grade determinism. The final path needs controlled arithmetic
+(likely fixed-point for forward/backward/optimizer math).
 
 ## Scripts
 
 - `hash_compress.py` — compress a fixed input, print sha256. Run on multiple machines, compare hashes.
+- `hash_model_state.py` — hash PyTorch default init, stable init, and post-seed-warmup weights.
+- `hash_numpy_forward.py` — hash a pure-NumPy forward pass from stable weights.
 - `make_blob.py PATH` — save a compressed blob to PATH.
 - `try_decompress.py PATH` — try to decompress, report whether output matches expected.
 
