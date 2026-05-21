@@ -29,9 +29,12 @@ import numpy as np
 TOTAL_FREQ: int = 1 << 16
 
 # Grid used to quantize logits BEFORE softmax. Errors smaller than this all
-# round to the same integer. The cross-machine NumPy probe showed 1e-7 max
-# error on the tiny model; 1e-4 is a generous safety margin.
-LOGIT_GRID: float = 1.0 / 16384.0  # ~6.1e-5
+# round to the same integer. PyTorch's per-byte forward starts with ~1e-7
+# error but the KV cache compounds it across many steps; the no-training
+# trace showed grid=1/16384 wasn't coarse enough after ~40 byte positions.
+# 1/1024 ≈ 1e-3 absorbs accumulated cache errors with minimal ratio cost
+# (each grid step is ~0.1% relative probability change).
+LOGIT_GRID: float = 1.0 / 1024.0
 
 
 def _quantize_logits(logits: np.ndarray) -> np.ndarray:
