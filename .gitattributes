@@ -1,0 +1,6 @@
+# Always use LF for corpus files — cross-platform byte-identical benchmarks
+benchmarks/corpus/* text eol=lf
+# Same for kolmo source — keep diffs clean
+*.py text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
