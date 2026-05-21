@@ -28,9 +28,7 @@ from kolmo._engine import (  # noqa: E402
 )
 
 
-CORPUS_DIR = Path(
-    "/Users/kids/compression-experiment/compression-experiments/benchmarks/corpus"
-)
+CORPUS_DIR = HERE / "corpus"
 SHORT_FILES = [
     "prose_modern.txt",
     "wiki_factual.txt",

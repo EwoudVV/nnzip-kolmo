@@ -1,0 +1,27 @@
+{
+  "users": [
+    {"id": 1, "name": "Alice Johnson", "email": "alice@example.com", "role": "admin", "active": true, "created_at": "2024-01-15T08:30:00Z"},
+    {"id": 2, "name": "Bob Smith", "email": "bob@example.com", "role": "user", "active": true, "created_at": "2024-01-16T09:15:00Z"},
+    {"id": 3, "name": "Carol Davis", "email": "carol@example.com", "role": "user", "active": false, "created_at": "2024-01-17T10:45:00Z"},
+    {"id": 4, "name": "David Miller", "email": "david@example.com", "role": "moderator", "active": true, "created_at": "2024-01-18T11:20:00Z"},
+    {"id": 5, "name": "Eve Wilson", "email": "eve@example.com", "role": "user", "active": true, "created_at": "2024-01-19T12:10:00Z"},
+    {"id": 6, "name": "Frank Brown", "email": "frank@example.com", "role": "user", "active": true, "created_at": "2024-01-20T13:30:00Z"},
+    {"id": 7, "name": "Grace Lee", "email": "grace@example.com", "role": "admin", "active": true, "created_at": "2024-01-21T14:00:00Z"},
+    {"id": 8, "name": "Henry Taylor", "email": "henry@example.com", "role": "user", "active": false, "created_at": "2024-01-22T15:25:00Z"}
+  ],
+  "products": [
+    {"id": 101, "name": "Wireless Mouse", "price": 29.99, "stock": 142, "category": "electronics"},
+    {"id": 102, "name": "Mechanical Keyboard", "price": 89.99, "stock": 57, "category": "electronics"},
+    {"id": 103, "name": "USB-C Hub", "price": 34.99, "stock": 203, "category": "electronics"},
+    {"id": 104, "name": "Desk Lamp", "price": 45.50, "stock": 88, "category": "home"},
+    {"id": 105, "name": "Notebook", "price": 12.00, "stock": 412, "category": "office"},
+    {"id": 106, "name": "Pen Set", "price": 18.75, "stock": 267, "category": "office"}
+  ],
+  "settings": {
+    "theme": "dark",
+    "notifications": {"email": true, "push": false, "sms": false},
+    "timezone": "America/New_York",
+    "language": "en-US",
+    "pagination": {"page_size": 25, "max_pages": 100}
+  }
+}

@@ -20,9 +20,7 @@ sys.stdout.reconfigure(line_buffering=True)
 from kolmo import compress, decompress  # noqa: E402
 from kolmo._engine import COPY_WINDOW  # noqa: E402
 
-NNZIP_CORPUS = Path(
-    "/Users/kids/compression-experiment/compression-experiments/benchmarks/corpus"
-)
+NNZIP_CORPUS = HERE / "corpus"
 SOURCE_FILES = [
     "prose_modern.txt",
     "wiki_factual.txt",
