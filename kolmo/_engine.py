@@ -163,11 +163,33 @@ class OffsetModel:
         self.counts[offset - 1] += 1.0
 
 
+def _select_device() -> torch.device:
+    """Pick CUDA when available so per-byte forward/backward runs on GPU.
+
+    Determinism caveat: GPU ops are non-deterministic across machines, so
+    cross-machine round-trip will diverge. For Rung 1 (single-machine) this
+    is fine; Rung 2 is where we drop PyTorch entirely for bit-identical
+    cross-platform output.
+
+    Override with KOLMO_DEVICE=cpu to force CPU.
+    """
+    import os
+    forced = os.environ.get("KOLMO_DEVICE", "").lower()
+    if forced == "cpu":
+        return torch.device("cpu")
+    if forced == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
     """Build a model with deterministic init. Both compress and decompress
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
     model = KolmoTransformer()
+    model.to(_select_device())
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     _prime_model(model, optimizer)
@@ -207,10 +229,11 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
 
     Returns (probs over next byte as float64 numpy, kv_caches, pos_after).
     """
-    x = torch.tensor([history], dtype=torch.long)
+    device = next(model.parameters()).device
+    x = torch.tensor([history], dtype=torch.long, device=device)
     with torch.no_grad():
         logits, caches = model(x, kv_caches=None, pos_offset=0)
-    probs = torch.softmax(logits[0, -1], dim=-1).numpy().astype(np.float64)
+    probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy().astype(np.float64)
     return probs, caches, len(history)
 
 
@@ -222,11 +245,12 @@ def step_cache(
 ) -> tuple[np.ndarray, list, int]:
     """Feed one new byte using the cache. Returns (probs over next byte,
     updated caches, new pos_offset)."""
-    x = torch.tensor([[byte]], dtype=torch.long)
+    device = next(model.parameters()).device
+    x = torch.tensor([[byte]], dtype=torch.long, device=device)
     with torch.no_grad():
         logits, caches = model(x, kv_caches=caches, pos_offset=pos_offset)
     caches = _trim_caches(caches, CONTEXT)
-    probs = torch.softmax(logits[0, -1], dim=-1).numpy().astype(np.float64)
+    probs = torch.softmax(logits[0, -1], dim=-1).cpu().numpy().astype(np.float64)
     return probs, caches, pos_offset + 1
 
 
@@ -246,12 +270,13 @@ def train_block(
     m = len(block_bytes)
     n_hist = len(full) - m
 
-    x = torch.tensor([full], dtype=torch.long)
+    device = next(model.parameters()).device
+    x = torch.tensor([full], dtype=torch.long, device=device)
     logits, _ = model(x, kv_caches=None, pos_offset=0)
     # Predictions for block bytes come from logits at positions [n_hist-1 .. n_hist+m-2]
     block_logits = logits[0, n_hist - 1 : n_hist + m - 1]
 
-    targets = torch.tensor(block_bytes, dtype=torch.long)
+    targets = torch.tensor(block_bytes, dtype=torch.long, device=device)
     loss = F.cross_entropy(block_logits, targets)
     optimizer.zero_grad()
     loss.backward()
