@@ -34,7 +34,7 @@ TOTAL_FREQ: int = 1 << 16
 # trace showed grid=1/16384 wasn't coarse enough after ~40 byte positions.
 # 1/1024 ≈ 1e-3 absorbs accumulated cache errors with minimal ratio cost
 # (each grid step is ~0.1% relative probability change).
-LOGIT_GRID: float = 1.0 / 1024.0
+LOGIT_GRID: float = 1.0 / 64.0
 
 
 def _quantize_logits(logits: np.ndarray) -> np.ndarray:
