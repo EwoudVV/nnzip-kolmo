@@ -20,11 +20,14 @@ Rung 2 progress:
 |---|---|
 | Stable initializer | ✅ Mac and Windows produce identical initial weights |
 | PyTorch seed warmup | ❌ weights diverge after training on the built-in seed corpus |
-| NumPy forward pass | ❌ logits are close but not byte-identical across Mac and Windows |
+| NumPy forward pass | ❌ raw logits are close but not byte-identical across Mac and Windows |
+| Quantized NumPy logits | ✅ logits rounded to 1e-4 match on the tiny probe |
 
-This means NumPy is useful as a readable stepping stone, but it is not enough
-for prize-grade determinism. The final path needs controlled arithmetic
-(likely fixed-point for forward/backward/optimizer math).
+This means NumPy is useful as a readable stepping stone, but raw floating-point
+NumPy is not enough for prize-grade determinism. The promising intermediate
+path is quantized activations/logits plus deterministic integer probability
+conversion. If that fails, the final path is full fixed-point
+forward/backward/optimizer math.
 
 ## Scripts
 
