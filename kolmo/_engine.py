@@ -20,7 +20,7 @@ CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # bytes between optimizer steps
 BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
-COPY_WINDOW = 4096
+COPY_WINDOW = 8192
 COPY_MIN = 8
 COPY_MAX = 32
 _SEED_BASE = (
@@ -79,6 +79,26 @@ def length_probs(n: int) -> np.ndarray:
         return np.array([], dtype=np.float64)
     raw = 1.0 / np.arange(1, n + 1, dtype=np.float64)
     return raw / raw.sum()
+
+
+class LengthModel:
+    """Adaptive probability model over match lengths (encoded as offsets from
+    COPY_MIN, so the symbol range is [0, COPY_MAX - COPY_MIN]).
+
+    Length distribution is steep — most matches are at or near COPY_MIN. The
+    static 1/k prior is decent but not perfect for any particular corpus.
+    """
+
+    def __init__(self, n: int, prior_strength: float = 16.0):
+        prior = length_probs(n) * prior_strength
+        self.counts = prior.astype(np.float64)
+
+    def probs_for(self, max_n: int) -> np.ndarray:
+        p = self.counts[:max_n].copy()
+        return p / p.sum()
+
+    def observe(self, length_offset: int) -> None:
+        self.counts[length_offset] += 1.0
 
 
 class EventModel:
