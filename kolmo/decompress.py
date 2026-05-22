@@ -17,6 +17,7 @@ from kolmo._engine import (
     EventModel,
     LengthModel,
     OffsetModel,
+    append_copy_history,
     new_model_and_optimizer,
     step_cache,
     train_block,
@@ -69,7 +70,7 @@ def decompress(blob: bytes) -> bytes:
         train_pending_if_full()
         ensure_cache()
         probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
-        copy_history.append(byte)
+        append_copy_history(copy_history, byte)
         pending.append(byte)
 
     decoded_total = 0

@@ -568,7 +568,19 @@ def update_history(history: list[int], new_bytes: list[int]) -> list[int]:
     return history
 
 
-def find_copy(data: bytes, pos: int, known: bytes) -> tuple[int, int] | None:
+def append_copy_history(copy_history: bytearray, byte: int) -> None:
+    """Append one byte to copy history while bounding long-file memory.
+
+    Copy offsets are capped at COPY_WINDOW, so older bytes are never addressable
+    by the compressed stream. Trim in chunks rather than every byte to avoid
+    repeatedly shifting the bytearray front on long files.
+    """
+    copy_history.append(byte)
+    if len(copy_history) > 2 * COPY_WINDOW:
+        del copy_history[:-COPY_WINDOW]
+
+
+def find_copy(data: bytes, pos: int, known: bytes | bytearray) -> tuple[int, int] | None:
     """Find a simple non-overlapping LZ-style match in recent known bytes.
 
     Returns (offset, length), where offset=1 means "copy from the previous byte".

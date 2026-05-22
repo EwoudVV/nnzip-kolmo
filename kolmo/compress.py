@@ -19,6 +19,7 @@ from kolmo._engine import (
     EventModel,
     LengthModel,
     OffsetModel,
+    append_copy_history,
     find_copy,
     new_model_and_optimizer,
     step_cache,
@@ -70,12 +71,12 @@ def compress(data: bytes) -> bytes:
         train_pending_if_full()
         ensure_cache()
         probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
-        copy_history.append(byte)
+        append_copy_history(copy_history, byte)
         pending.append(byte)
 
     pos = 0
     while pos < len(data):
-        copy = find_copy(data, pos, bytes(copy_history))
+        copy = find_copy(data, pos, copy_history)
         if copy is not None:
             offset, length = copy
             encoder.encode(1, event_model.probs())
