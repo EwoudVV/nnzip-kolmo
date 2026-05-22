@@ -8,11 +8,18 @@ a full forward over the recent history with gradient tracking, but that's
 only done once per block.
 """
 
+import os
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
+from kolmo.fixed import dequantize
+from kolmo.fixed_model import extract_fixed_weights, fixed_forward
+from kolmo.fixed_optim import FixedAdamState
+from kolmo.fixed_train import fixed_train_block
 from kolmo.model import KolmoTransformer
 from kolmo.stable_init import stable_init_model
 
@@ -61,6 +68,24 @@ _SEED_EXTRA = (
 )
 SEED_CORPUS = _SEED_BASE + _SEED_EXTRA * 3
 EVENT_PROBS = np.array([1.0 - COPY_PROB, COPY_PROB], dtype=np.float64)
+
+
+@dataclass
+class FixedModelState:
+    """Fixed-point model state used when KOLMO_FIXED=1."""
+
+    weights: dict[str, np.ndarray]
+    optimizer_state: FixedAdamState | None = None
+    n_heads: int = 8
+    n_layers: int = 4
+
+
+def _use_fixed() -> bool:
+    return os.environ.get("KOLMO_FIXED", "").lower() in {"1", "true", "yes"}
+
+
+def _skip_prime() -> bool:
+    return os.environ.get("KOLMO_SKIP_PRIME", "").lower() in {"1", "true", "yes"}
 
 
 def offset_probs(n: int) -> np.ndarray:
@@ -175,7 +200,6 @@ def _select_device() -> torch.device:
 
     Override with KOLMO_DEVICE=cpu to force CPU.
     """
-    import os
     forced = os.environ.get("KOLMO_DEVICE", "").lower()
     if forced == "cpu":
         return torch.device("cpu")
@@ -186,22 +210,28 @@ def _select_device() -> torch.device:
     return torch.device("cpu")
 
 
-def new_model_and_optimizer() -> tuple[KolmoTransformer, torch.optim.Optimizer]:
+def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch.optim.Optimizer | None]:
     """Build a model with deterministic init. Both compress and decompress
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
     model = KolmoTransformer()
     stable_init_model(model, SEED)
+    if _use_fixed():
+        fixed_model = FixedModelState(extract_fixed_weights(model))
+        if not _skip_prime():
+            _prime_model(fixed_model, None)
+        return fixed_model, None
     model.to(_select_device())
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
-    _prime_model(model, optimizer)
+    if not _skip_prime():
+        _prime_model(model, optimizer)
     return model, optimizer
 
 
 def _prime_model(
-    model: KolmoTransformer,
-    optimizer: torch.optim.Optimizer,
+    model: KolmoTransformer | FixedModelState,
+    optimizer: torch.optim.Optimizer | None,
 ) -> None:
     """Train on a tiny built-in corpus before real data starts."""
     history = [BOS]
@@ -232,6 +262,11 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
 
     Returns (probs over next byte as float64 numpy, kv_caches, pos_after).
     """
+    if isinstance(model, FixedModelState):
+        probs = _fixed_probs_for_history(model, history, pos_offset=0)
+        cache = (list(history), 0, len(history))
+        return probs, cache, len(history)
+
     device = next(model.parameters()).device
     x = torch.tensor([history], dtype=torch.long, device=device)
     with torch.no_grad():
@@ -245,13 +280,23 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
 
 
 def step_cache(
-    model: KolmoTransformer,
+    model: KolmoTransformer | FixedModelState,
     byte: int,
     caches: list,
     pos_offset: int,
 ) -> tuple[np.ndarray, list, int]:
     """Feed one new byte using the cache. Returns (probs over next byte,
     updated caches, new pos_offset)."""
+    if isinstance(model, FixedModelState):
+        tokens, pos_start, next_pos = caches
+        tokens = list(tokens) + [byte]
+        probs = _fixed_probs_for_history(model, tokens, pos_offset=pos_start)
+        next_pos += 1
+        if len(tokens) > CONTEXT:
+            tokens = tokens[-CONTEXT:]
+            pos_start = next_pos - len(tokens)
+        return probs, (tokens, pos_start, next_pos), next_pos
+
     device = next(model.parameters()).device
     x = torch.tensor([[byte]], dtype=torch.long, device=device)
     with torch.no_grad():
@@ -264,8 +309,8 @@ def step_cache(
 
 
 def train_block(
-    model: KolmoTransformer,
-    optimizer: torch.optim.Optimizer,
+    model: KolmoTransformer | FixedModelState,
+    optimizer: torch.optim.Optimizer | None,
     history: list[int],
     block_bytes: list[int],
 ) -> None:
@@ -275,6 +320,21 @@ def train_block(
     Both compress and decompress call this with the same arguments at the
     same step, so weights stay in lockstep.
     """
+    if isinstance(model, FixedModelState):
+        model.optimizer_state = fixed_train_block(
+            model.weights,
+            model.optimizer_state,
+            history,
+            block_bytes,
+            n_heads=model.n_heads,
+            n_layers=model.n_layers,
+            context=CONTEXT,
+        )
+        return
+
+    if optimizer is None:
+        raise ValueError("PyTorch training requires an optimizer")
+
     full = (history + block_bytes)[-CONTEXT:]
     m = len(block_bytes)
     n_hist = len(full) - m
@@ -313,6 +373,24 @@ def train_block(
                 v = state.get(key)
                 if v is not None:
                     v.mul_(1.0 / _WEIGHT_GRID).round_().mul_(_WEIGHT_GRID)
+
+
+def _fixed_probs_for_history(
+    model: FixedModelState,
+    history: list[int],
+    pos_offset: int,
+) -> np.ndarray:
+    input_ids = np.array(history, dtype=np.int64)
+    logits_q = fixed_forward(
+        input_ids,
+        model.weights,
+        n_heads=model.n_heads,
+        n_layers=model.n_layers,
+        pos_offset=pos_offset,
+    )
+    last_logits = dequantize(logits_q[-1]).astype(np.float64)
+    freqs = logits_to_int_freqs(last_logits)
+    return freqs.astype(np.float64) / float(TOTAL_FREQ)
 
 
 def update_history(history: list[int], new_bytes: list[int]) -> list[int]:

@@ -37,6 +37,19 @@ def test_roundtrip_single_byte():
     assert decompress(blob) == data
 
 
+def test_fixed_point_roundtrip_single_byte_skip_prime(monkeypatch):
+    """Fixed-point engine path should be codec-symmetric.
+
+    Skipping the seed prime keeps this as a fast integration smoke; the fixed
+    training path itself is tested separately in test_fixed_train.py.
+    """
+    monkeypatch.setenv("KOLMO_FIXED", "1")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    data = b"A"
+    blob = compress(data)
+    assert decompress(blob) == data
+
+
 def test_roundtrip_repeated():
     data = b"abc" * 30  # 90 bytes, very predictable
     blob = compress(data)
