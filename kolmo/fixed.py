@@ -430,3 +430,31 @@ def linear_q15(
             raise TypeError("linear_q15 bias must be int32")
         y = y + bias_q  # broadcasts over batch dims
     return y
+
+
+def cross_entropy_grad_q15(logits_q: np.ndarray, targets: np.ndarray) -> np.ndarray:
+    """Gradient of mean cross-entropy loss w.r.t. logits, in Q15.
+
+    For each token row: grad = (softmax(logits) - one_hot(target)) / T
+    where T is the number of rows/tokens. This matches PyTorch's default
+    `F.cross_entropy(..., reduction="mean")` gradient.
+
+    Returns an int32 Q15 array with the same shape as logits_q.
+    """
+    if logits_q.dtype != np.int32:
+        raise TypeError("cross_entropy_grad_q15 expects int32 logits")
+    if logits_q.ndim != 2:
+        raise ValueError("cross_entropy_grad_q15 expects a 2-D logits array")
+    targets = np.asarray(targets, dtype=np.int64)
+    if targets.shape != (logits_q.shape[0],):
+        raise ValueError("targets shape must match logits rows")
+
+    grad = softmax_q15(logits_q).astype(np.int64)
+    rows = np.arange(logits_q.shape[0])
+    grad[rows, targets] -= SCALE
+
+    # Mean reduction over token rows, with symmetric rounding.
+    t = logits_q.shape[0]
+    signs = np.where(grad >= 0, 1, -1)
+    rounded = (np.abs(grad) + (t // 2)) // t
+    return (signs * rounded).astype(np.int32)

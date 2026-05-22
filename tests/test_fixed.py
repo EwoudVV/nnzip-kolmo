@@ -254,6 +254,38 @@ def test_linear_q15_matches_float():
     assert np.max(np.abs(got - expected)) < 0.01
 
 
+def test_cross_entropy_grad_q15_matches_torch():
+    """Output gradient should track PyTorch cross-entropy autograd."""
+    import torch
+    import torch.nn.functional as F
+
+    rng = np.random.default_rng(13)
+    logits = rng.normal(size=(5, 256)).astype(np.float64)
+    targets = np.array([1, 42, 100, 7, 255], dtype=np.int64)
+
+    logits_t = torch.tensor(logits, dtype=torch.float64, requires_grad=True)
+    loss = F.cross_entropy(logits_t, torch.tensor(targets, dtype=torch.long))
+    loss.backward()
+    expected = logits_t.grad.detach().numpy()
+
+    got = fixed.dequantize(
+        fixed.cross_entropy_grad_q15(fixed.quantize(logits), targets)
+    )
+
+    assert np.max(np.abs(got - expected)) < 0.001
+
+
+def test_cross_entropy_grad_q15_rows_sum_to_zero():
+    """For softmax cross-entropy, each row's logit gradient sums to zero."""
+    rng = np.random.default_rng(14)
+    logits_q = fixed.quantize(rng.normal(size=(7, 32)).astype(np.float64))
+    targets = np.array([0, 1, 2, 3, 4, 5, 6], dtype=np.int64)
+    grad = fixed.cross_entropy_grad_q15(logits_q, targets)
+    # Integer rounding means row sums can be off by a few Q15 units, but not
+    # by anything meaningful.
+    assert np.max(np.abs(grad.sum(axis=-1))) <= 2
+
+
 def test_exp_q15_softmax_typical_range():
     """exp is most-used after softmax max-subtract — inputs in [-30, 0].
 
