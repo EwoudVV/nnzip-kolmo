@@ -50,6 +50,20 @@ def test_fixed_point_roundtrip_single_byte_skip_prime(monkeypatch):
     assert decompress(blob) == data
 
 
+def test_fixed_point_roundtrip_exercises_kv_cache(monkeypatch):
+    """Round-trip a payload long enough to exercise warm + step + training
+    iterations on the fixed-point path. This is the integration check that
+    the KV cache and training-step invalidation stay in lockstep between
+    compress and decompress.
+    """
+    monkeypatch.setenv("KOLMO_FIXED", "1")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    data = b"the cache must stay in lockstep across compress and decompress."
+    blob = compress(data)
+    assert blob.startswith(MAGIC)
+    assert decompress(blob) == data
+
+
 def test_roundtrip_repeated():
     data = b"abc" * 30  # 90 bytes, very predictable
     blob = compress(data)

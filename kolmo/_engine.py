@@ -17,7 +17,8 @@ import torch.nn.functional as F
 
 from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
 from kolmo.fixed import dequantize
-from kolmo.fixed_model import extract_fixed_weights, fixed_forward
+from kolmo.fixed_kv_cache import fixed_step, fixed_warm, trim_caches
+from kolmo.fixed_model import extract_fixed_weights
 from kolmo.fixed_optim import FixedAdamState
 from kolmo.fixed_train import fixed_train_block
 from kolmo.model import KolmoTransformer
@@ -263,9 +264,20 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
     Returns (probs over next byte as float64 numpy, kv_caches, pos_after).
     """
     if isinstance(model, FixedModelState):
-        probs = _fixed_probs_for_history(model, history, pos_offset=0)
-        cache = (list(history), 0, len(history))
-        return probs, cache, len(history)
+        last_logits_q, caches = fixed_warm(
+            np.array(history, dtype=np.int64),
+            model.weights,
+            n_heads=model.n_heads,
+            n_layers=model.n_layers,
+            pos_offset=0,
+        )
+        # If the prime/seed history is already longer than CONTEXT, the
+        # warmed cache exceeds the window — trim now so subsequent steps
+        # operate on the same window the PyTorch path would.
+        if caches and caches[0]["k"].shape[1] > CONTEXT:
+            caches = trim_caches(caches, CONTEXT)
+        probs = _probs_from_q15_logits(last_logits_q)
+        return probs, caches, len(history)
 
     device = next(model.parameters()).device
     x = torch.tensor([history], dtype=torch.long, device=device)
@@ -288,14 +300,18 @@ def step_cache(
     """Feed one new byte using the cache. Returns (probs over next byte,
     updated caches, new pos_offset)."""
     if isinstance(model, FixedModelState):
-        tokens, pos_start, next_pos = caches
-        tokens = list(tokens) + [byte]
-        probs = _fixed_probs_for_history(model, tokens, pos_offset=pos_start)
-        next_pos += 1
-        if len(tokens) > CONTEXT:
-            tokens = tokens[-CONTEXT:]
-            pos_start = next_pos - len(tokens)
-        return probs, (tokens, pos_start, next_pos), next_pos
+        last_logits_q, caches = fixed_step(
+            byte,
+            caches,
+            model.weights,
+            n_heads=model.n_heads,
+            n_layers=model.n_layers,
+            pos_offset=pos_offset,
+        )
+        if caches and caches[0]["k"].shape[1] > CONTEXT:
+            caches = trim_caches(caches, CONTEXT)
+        probs = _probs_from_q15_logits(last_logits_q)
+        return probs, caches, pos_offset + 1
 
     device = next(model.parameters()).device
     x = torch.tensor([[byte]], dtype=torch.long, device=device)
@@ -306,6 +322,14 @@ def step_cache(
     freqs = logits_to_int_freqs(last_logits)
     probs = freqs.astype(np.float64) / float(TOTAL_FREQ)
     return probs, caches, pos_offset + 1
+
+
+def _probs_from_q15_logits(last_logits_q: np.ndarray) -> np.ndarray:
+    """Dequantize Q15 logits and quantize them through the deterministic
+    int-frequency grid so the resulting probs match the PyTorch path."""
+    last_logits = dequantize(last_logits_q).astype(np.float64)
+    freqs = logits_to_int_freqs(last_logits)
+    return freqs.astype(np.float64) / float(TOTAL_FREQ)
 
 
 def train_block(
@@ -373,24 +397,6 @@ def train_block(
                 v = state.get(key)
                 if v is not None:
                     v.mul_(1.0 / _WEIGHT_GRID).round_().mul_(_WEIGHT_GRID)
-
-
-def _fixed_probs_for_history(
-    model: FixedModelState,
-    history: list[int],
-    pos_offset: int,
-) -> np.ndarray:
-    input_ids = np.array(history, dtype=np.int64)
-    logits_q = fixed_forward(
-        input_ids,
-        model.weights,
-        n_heads=model.n_heads,
-        n_layers=model.n_layers,
-        pos_offset=pos_offset,
-    )
-    last_logits = dequantize(logits_q[-1]).astype(np.float64)
-    freqs = logits_to_int_freqs(last_logits)
-    return freqs.astype(np.float64) / float(TOTAL_FREQ)
 
 
 def update_history(history: list[int], new_bytes: list[int]) -> list[int]:
