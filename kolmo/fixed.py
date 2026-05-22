@@ -357,6 +357,7 @@ _ERF_A5_Q15 = int(round(1.061405429 * SCALE))  # 34772
 
 # Pre-computed 1/sqrt(2) in Q15 for GELU input scaling.
 _INV_SQRT2_Q15 = int(round(0.7071067811865476 * SCALE))  # 23170
+_INV_SQRT_2PI_Q15 = int(round(0.3989422804014327 * SCALE))  # 13073
 
 
 def erf_q15(x_q: np.ndarray) -> np.ndarray:
@@ -408,6 +409,34 @@ def gelu_q15(x_q: np.ndarray) -> np.ndarray:
     # 0.5 * x * (1 + erf) — use mul, then divide by 2 via right-shift with rounding.
     prod = mul(x_q, one_plus_erf)
     return ((prod + np.int32(1)) >> 1).astype(np.int32)
+
+
+def gelu_backward_q15(x_q: np.ndarray, grad_y_q: np.ndarray) -> np.ndarray:
+    """Backward pass for exact GELU.
+
+    GELU(x) = 0.5*x*(1 + erf(x/sqrt(2)))
+    d/dx GELU(x) = 0.5*(1 + erf(x/sqrt(2))) + x*exp(-x²/2)/sqrt(2π)
+
+    Returns grad_y * gelu'(x), in Q15.
+    """
+    if x_q.dtype != np.int32 or grad_y_q.dtype != np.int32:
+        raise TypeError("gelu_backward_q15 expects int32 inputs")
+
+    one = np.full_like(x_q, np.int32(SCALE))
+    half = np.full_like(x_q, np.int32(SCALE // 2))
+    inv_sqrt2 = np.full_like(x_q, np.int32(_INV_SQRT2_Q15))
+    inv_sqrt_2pi = np.full_like(x_q, np.int32(_INV_SQRT_2PI_Q15))
+
+    erf_part = erf_q15(mul(x_q, inv_sqrt2))
+    left = mul(half, add(one, erf_part))
+
+    x_sq = mul(x_q, x_q)
+    neg_half_x_sq = -mul(x_sq, half)
+    exp_part = exp_q15(neg_half_x_sq.astype(np.int32))
+    right = mul(mul(x_q, exp_part), inv_sqrt_2pi)
+
+    deriv = add(left, right)
+    return mul(grad_y_q, deriv)
 
 
 def linear_q15(

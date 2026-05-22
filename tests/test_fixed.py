@@ -243,6 +243,26 @@ def test_gelu_q15_deterministic():
     assert np.array_equal(out1, out2)
 
 
+def test_gelu_backward_q15_matches_torch():
+    """GELU backward tracks PyTorch autograd."""
+    import torch
+    import torch.nn.functional as F
+
+    x = np.linspace(-3.0, 3.0, 61).astype(np.float64)
+    grad_y = np.linspace(-0.2, 0.2, 61).astype(np.float64)
+
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    y = F.gelu(x_t)
+    y.backward(torch.tensor(grad_y, dtype=torch.float64))
+    expected = x_t.grad.detach().numpy()
+
+    got = fixed.dequantize(
+        fixed.gelu_backward_q15(fixed.quantize(x), fixed.quantize(grad_y))
+    )
+
+    assert np.max(np.abs(got - expected)) < 0.002
+
+
 def test_linear_q15_matches_float():
     """Linear y = x @ W.T + b matches float."""
     rng = np.random.default_rng(12)
