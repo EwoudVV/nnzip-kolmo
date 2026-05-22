@@ -201,6 +201,78 @@ def _block_q15(
     return fixed.add(x_q, h)
 
 
+def _block_backward_q15(
+    x_q: np.ndarray,
+    weights: dict[str, np.ndarray],
+    grad_y_q: np.ndarray,
+    n_heads: int,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Backward pass for one pre-norm transformer block.
+
+    Forward:
+        h1 = ln1(x)
+        x_res = x + attention(h1)
+        h2 = ln2(x_res)
+        y = x_res + ffn(h2)
+
+    Returns `(grad_x, grad_weights)`. Weight keys match `weights`.
+    """
+    h1 = fixed.layernorm_q15(x_q, weights["ln1.weight"], weights["ln1.bias"])
+    attn_out = _attention_q15(
+        h1,
+        weights["attn.qkv.weight"],
+        weights["attn.proj.weight"],
+        n_heads,
+    )
+    x_res = fixed.add(x_q, attn_out)
+    h2 = fixed.layernorm_q15(x_res, weights["ln2.weight"], weights["ln2.bias"])
+
+    # y = x_res + ffn(h2)
+    grad_h2, grad_ffn0_w, grad_ffn0_b, grad_ffn2_w, grad_ffn2_b = fixed.ffn_backward_q15(
+        h2,
+        weights["ffn.0.weight"],
+        weights["ffn.0.bias"],
+        weights["ffn.2.weight"],
+        weights["ffn.2.bias"],
+        grad_y_q,
+    )
+    grad_x_res_from_ln2, grad_ln2_w, grad_ln2_b = fixed.layernorm_backward_q15(
+        x_res,
+        weights["ln2.weight"],
+        grad_h2,
+    )
+    grad_x_res = fixed.add(grad_y_q, grad_x_res_from_ln2)
+
+    # x_res = x + attention(ln1(x))
+    grad_h1, grad_qkv_w, grad_proj_w = _attention_backward_q15(
+        h1,
+        weights["attn.qkv.weight"],
+        weights["attn.proj.weight"],
+        grad_x_res,
+        n_heads,
+    )
+    grad_x_from_ln1, grad_ln1_w, grad_ln1_b = fixed.layernorm_backward_q15(
+        x_q,
+        weights["ln1.weight"],
+        grad_h1,
+    )
+    grad_x = fixed.add(grad_x_res, grad_x_from_ln1)
+
+    grads = {
+        "ln1.weight": grad_ln1_w,
+        "ln1.bias": grad_ln1_b,
+        "attn.qkv.weight": grad_qkv_w,
+        "attn.proj.weight": grad_proj_w,
+        "ln2.weight": grad_ln2_w,
+        "ln2.bias": grad_ln2_b,
+        "ffn.0.weight": grad_ffn0_w,
+        "ffn.0.bias": grad_ffn0_b,
+        "ffn.2.weight": grad_ffn2_w,
+        "ffn.2.bias": grad_ffn2_b,
+    }
+    return grad_x, grads
+
+
 def fixed_forward(
     input_ids: np.ndarray,
     weights: dict[str, np.ndarray],

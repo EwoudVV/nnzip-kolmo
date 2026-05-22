@@ -4,8 +4,13 @@ import numpy as np
 import torch
 
 from kolmo.fixed import dequantize, quantize
-from kolmo.fixed_model import _attention_backward_q15, extract_fixed_weights, fixed_forward
-from kolmo.model import KolmoTransformer
+from kolmo.fixed_model import (
+    _attention_backward_q15,
+    _block_backward_q15,
+    extract_fixed_weights,
+    fixed_forward,
+)
+from kolmo.model import KolmoTransformer, TransformerBlock
 from kolmo.stable_init import stable_init_model
 
 
@@ -104,3 +109,68 @@ def test_attention_backward_q15_matches_torch():
     assert np.max(np.abs(dequantize(grad_x) - x_t.grad.numpy())) < 0.004
     assert np.max(np.abs(dequantize(grad_qkv_w) - qkv_w_t.grad.numpy())) < 0.004
     assert np.max(np.abs(dequantize(grad_proj_w) - proj_w_t.grad.numpy())) < 0.004
+
+
+def test_block_backward_q15_matches_torch():
+    """A full transformer block backward should track PyTorch autograd."""
+    rng = np.random.default_rng(20)
+    T = 5
+    D = 16
+    n_heads = 4
+
+    block = TransformerBlock(D, n_heads).double()
+    arrays = {
+        "ln1.weight": rng.normal(size=D).astype(np.float64) * 0.1 + 1.0,
+        "ln1.bias": rng.normal(size=D).astype(np.float64) * 0.02,
+        "attn.qkv.weight": rng.normal(size=(3 * D, D)).astype(np.float64) * 0.08,
+        "attn.proj.weight": rng.normal(size=(D, D)).astype(np.float64) * 0.08,
+        "ln2.weight": rng.normal(size=D).astype(np.float64) * 0.1 + 1.0,
+        "ln2.bias": rng.normal(size=D).astype(np.float64) * 0.02,
+        "ffn.0.weight": rng.normal(size=(4 * D, D)).astype(np.float64) * 0.08,
+        "ffn.0.bias": rng.normal(size=4 * D).astype(np.float64) * 0.02,
+        "ffn.2.weight": rng.normal(size=(D, 4 * D)).astype(np.float64) * 0.08,
+        "ffn.2.bias": rng.normal(size=D).astype(np.float64) * 0.02,
+    }
+    with torch.no_grad():
+        block.ln1.weight.copy_(torch.tensor(arrays["ln1.weight"], dtype=torch.float64))
+        block.ln1.bias.copy_(torch.tensor(arrays["ln1.bias"], dtype=torch.float64))
+        block.attn.qkv.weight.copy_(torch.tensor(arrays["attn.qkv.weight"], dtype=torch.float64))
+        block.attn.proj.weight.copy_(torch.tensor(arrays["attn.proj.weight"], dtype=torch.float64))
+        block.ln2.weight.copy_(torch.tensor(arrays["ln2.weight"], dtype=torch.float64))
+        block.ln2.bias.copy_(torch.tensor(arrays["ln2.bias"], dtype=torch.float64))
+        block.ffn[0].weight.copy_(torch.tensor(arrays["ffn.0.weight"], dtype=torch.float64))
+        block.ffn[0].bias.copy_(torch.tensor(arrays["ffn.0.bias"], dtype=torch.float64))
+        block.ffn[2].weight.copy_(torch.tensor(arrays["ffn.2.weight"], dtype=torch.float64))
+        block.ffn[2].bias.copy_(torch.tensor(arrays["ffn.2.bias"], dtype=torch.float64))
+
+    x = rng.normal(size=(T, D)).astype(np.float64) * 0.25
+    grad_y = rng.normal(size=(T, D)).astype(np.float64) * 0.01
+
+    x_t = torch.tensor(x[None, :, :], dtype=torch.float64, requires_grad=True)
+    y, _ = block(x_t)
+    y.backward(torch.tensor(grad_y[None, :, :], dtype=torch.float64))
+
+    fixed_weights = {name: quantize(value) for name, value in arrays.items()}
+    grad_x, grads = _block_backward_q15(
+        quantize(x),
+        fixed_weights,
+        quantize(grad_y),
+        n_heads=n_heads,
+    )
+
+    expected_grads = {
+        "ln1.weight": block.ln1.weight.grad.numpy(),
+        "ln1.bias": block.ln1.bias.grad.numpy(),
+        "attn.qkv.weight": block.attn.qkv.weight.grad.numpy(),
+        "attn.proj.weight": block.attn.proj.weight.grad.numpy(),
+        "ln2.weight": block.ln2.weight.grad.numpy(),
+        "ln2.bias": block.ln2.bias.grad.numpy(),
+        "ffn.0.weight": block.ffn[0].weight.grad.numpy(),
+        "ffn.0.bias": block.ffn[0].bias.grad.numpy(),
+        "ffn.2.weight": block.ffn[2].weight.grad.numpy(),
+        "ffn.2.bias": block.ffn[2].bias.grad.numpy(),
+    }
+
+    assert np.max(np.abs(dequantize(grad_x) - x_t.grad.numpy()[0])) < 0.012
+    for name, expected in expected_grads.items():
+        assert np.max(np.abs(dequantize(grads[name]) - expected)) < 0.012, name
