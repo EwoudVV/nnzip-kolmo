@@ -273,6 +273,103 @@ def _block_backward_q15(
     return grad_x, grads
 
 
+def _scatter_add_rows_q15(
+    shape: tuple[int, ...],
+    indices: np.ndarray,
+    grad_rows_q: np.ndarray,
+) -> np.ndarray:
+    """Scatter-add row gradients into an embedding matrix shape."""
+    out = np.zeros(shape, dtype=np.int64)
+    for idx, grad in zip(indices.tolist(), grad_rows_q, strict=True):
+        out[idx] += grad.astype(np.int64)
+    return np.clip(out, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
+
+
+def fixed_backward(
+    input_ids: np.ndarray,
+    target_positions: np.ndarray,
+    targets: np.ndarray,
+    weights: dict[str, np.ndarray],
+    n_heads: int = 8,
+    n_layers: int = 4,
+    pos_offset: int = 0,
+) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Full fixed-point forward + backward for a cross-entropy training slice.
+
+    `input_ids` is the full context sequence. `target_positions` selects which
+    logit rows participate in the loss, and `targets` gives the byte target
+    for each selected row. This mirrors PyTorch's `cross_entropy` over a
+    subset of sequence positions.
+
+    Returns `(logits, grads)` where logits are Q15 and grads has one entry per
+    model parameter.
+    """
+    if input_ids.ndim != 1:
+        raise ValueError("fixed_backward expects a 1-D input_ids array")
+    target_positions = np.asarray(target_positions, dtype=np.int64)
+    targets = np.asarray(targets, dtype=np.int64)
+    if target_positions.shape != targets.shape:
+        raise ValueError("target_positions and targets must have the same shape")
+
+    T = len(input_ids)
+    positions = np.arange(pos_offset, pos_offset + T, dtype=np.int64)
+
+    h = fixed.add(
+        weights["token_emb.weight"][input_ids],
+        weights["pos_emb.weight"][positions],
+    )
+    block_inputs = []
+    for layer in range(n_layers):
+        block_inputs.append(h)
+        h = _block_q15(h, _block_weights(weights, layer), n_heads)
+
+    h_before_ln_f = h
+    h_norm = fixed.layernorm_q15(h, weights["ln_f.weight"], weights["ln_f.bias"])
+    logits = fixed.linear_q15(h_norm, weights["head.weight"])
+
+    grad_logits = np.zeros_like(logits)
+    grad_logits[target_positions] = fixed.cross_entropy_grad_q15(
+        logits[target_positions],
+        targets,
+    )
+
+    grads: dict[str, np.ndarray] = {}
+    grad_h_norm, grads["head.weight"], _ = fixed.linear_backward_q15(
+        h_norm,
+        weights["head.weight"],
+        grad_logits,
+        has_bias=False,
+    )
+    grad_h, grads["ln_f.weight"], grads["ln_f.bias"] = fixed.layernorm_backward_q15(
+        h_before_ln_f,
+        weights["ln_f.weight"],
+        grad_h_norm,
+    )
+
+    for layer in reversed(range(n_layers)):
+        grad_h, block_grads = _block_backward_q15(
+            block_inputs[layer],
+            _block_weights(weights, layer),
+            grad_h,
+            n_heads,
+        )
+        prefix = f"blocks.{layer}."
+        for name, grad in block_grads.items():
+            grads[prefix + name] = grad
+
+    grads["token_emb.weight"] = _scatter_add_rows_q15(
+        weights["token_emb.weight"].shape,
+        input_ids,
+        grad_h,
+    )
+    grads["pos_emb.weight"] = _scatter_add_rows_q15(
+        weights["pos_emb.weight"].shape,
+        positions,
+        grad_h,
+    )
+    return logits, grads
+
+
 def fixed_forward(
     input_ids: np.ndarray,
     weights: dict[str, np.ndarray],

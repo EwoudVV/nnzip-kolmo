@@ -8,6 +8,7 @@ from kolmo.fixed_model import (
     _attention_backward_q15,
     _block_backward_q15,
     extract_fixed_weights,
+    fixed_backward,
     fixed_forward,
 )
 from kolmo.model import KolmoTransformer, TransformerBlock
@@ -174,3 +175,68 @@ def test_block_backward_q15_matches_torch():
     assert np.max(np.abs(dequantize(grad_x) - x_t.grad.numpy()[0])) < 0.012
     for name, expected in expected_grads.items():
         assert np.max(np.abs(dequantize(grads[name]) - expected)) < 0.012, name
+
+
+def test_fixed_backward_matches_torch_on_tiny_transformer():
+    """Full model backward should track PyTorch autograd on a tiny model."""
+    rng = np.random.default_rng(21)
+    D = 16
+    n_heads = 4
+    n_layers = 1
+    max_context = 32
+    model = KolmoTransformer(
+        d_model=D,
+        n_heads=n_heads,
+        n_layers=n_layers,
+        max_context=max_context,
+    ).double()
+
+    arrays = {}
+    for name, param in model.named_parameters():
+        shape = tuple(param.shape)
+        if name.endswith("ln1.weight") or name.endswith("ln2.weight") or name == "ln_f.weight":
+            arr = rng.normal(size=shape).astype(np.float64) * 0.1 + 1.0
+        elif name.endswith(".bias") or name == "ln_f.bias":
+            arr = rng.normal(size=shape).astype(np.float64) * 0.02
+        elif name.endswith("emb.weight"):
+            arr = rng.normal(size=shape).astype(np.float64) * 0.05
+        else:
+            arr = rng.normal(size=shape).astype(np.float64) * 0.05
+        arrays[name] = arr
+
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            param.copy_(torch.tensor(arrays[name], dtype=torch.float64))
+
+    input_ids = np.array([1, 2, 3, 4, 5, 6], dtype=np.int64)
+    target_positions = np.array([0, 1, 2, 3, 4], dtype=np.int64)
+    targets = np.array([2, 3, 4, 5, 6], dtype=np.int64)
+
+    x_t = torch.tensor(input_ids[None, :], dtype=torch.long)
+    logits_t, _ = model(x_t)
+    selected = logits_t[0, target_positions]
+    loss = torch.nn.functional.cross_entropy(
+        selected,
+        torch.tensor(targets, dtype=torch.long),
+    )
+    loss.backward()
+
+    weights = {name: quantize(value) for name, value in arrays.items()}
+    logits_q, grads = fixed_backward(
+        input_ids,
+        target_positions,
+        targets,
+        weights,
+        n_heads=n_heads,
+        n_layers=n_layers,
+    )
+
+    assert logits_q.shape == (len(input_ids), 256)
+    # Check all parameters, but allow the full stack a little more room than
+    # the single-op tests because quantization error compounds through the
+    # whole model.
+    for name, param in model.named_parameters():
+        expected = param.grad.detach().numpy()
+        got = dequantize(grads[name])
+        assert got.shape == expected.shape
+        assert np.max(np.abs(got - expected)) < 0.03, name
