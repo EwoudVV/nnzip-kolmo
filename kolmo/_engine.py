@@ -550,30 +550,14 @@ def train_block(
     loss = F.cross_entropy(block_logits, targets)
     optimizer.zero_grad()
     loss.backward()
-    # Round gradients to a deterministic grid. Cross-machine PyTorch produces
-    # gradients that differ at the ULP level (~1e-7); the grid is much coarser
-    # so both machines round to the same value, and Adam updates identically.
-    # 1/8192 is fine enough to preserve gradient signal (~1e-4 resolution) but
-    # coarse enough to absorb any conceivable float drift from backward.
-    _GRAD_GRID = 1.0 / 8192.0
-    _WEIGHT_GRID = 1.0 / 16384.0
-    with torch.no_grad():
-        for p in model.parameters():
-            if p.grad is not None:
-                p.grad.mul_(1.0 / _GRAD_GRID).round_().mul_(_GRAD_GRID)
     optimizer.step()
-    # Second-pass rounding on weights + Adam state. Adam's internal
-    # sqrt/add/div ops have ULP-level cross-machine variance even when
-    # the inputs (grads) match exactly. Round-to-grid here makes the
-    # post-step state byte-identical across machines.
-    with torch.no_grad():
-        for p in model.parameters():
-            p.data.mul_(1.0 / _WEIGHT_GRID).round_().mul_(_WEIGHT_GRID)
-        for state in optimizer.state.values():
-            for key in ("exp_avg", "exp_avg_sq"):
-                v = state.get(key)
-                if v is not None:
-                    v.mul_(1.0 / _WEIGHT_GRID).round_().mul_(_WEIGHT_GRID)
+    # Historical note: this used to round gradients to 1/8192 and Adam state
+    # to 1/16384 to make cross-machine PyTorch produce identical updates. The
+    # rounding rounded `exp_avg_sq` (squared gradients, typically O(1e-7)) all
+    # the way to zero, which made `m / (sqrt(v) + eps)` blow up by 1e8 and
+    # weights exploded after step 2. We don't need it any more: cross-machine
+    # determinism now lives in the Q15 fixed-point engine (KOLMO_FIXED=1).
+    # Within-machine CPU PyTorch is deterministic without intervention.
 
 
 def update_history(history: list[int], new_bytes: list[int]) -> list[int]:
