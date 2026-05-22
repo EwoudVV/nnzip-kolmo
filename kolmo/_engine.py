@@ -33,41 +33,124 @@ COPY_PROB = 0.005
 COPY_WINDOW = 8192
 COPY_MIN = 8
 COPY_MAX = 256
-_SEED_BASE = (
+# Seed corpus: baked into both encoder and decoder code, costs zero bytes in
+# the compressed blob, but trains the model to a useful starting state before
+# the user's data is touched. Bigger and more diverse = better prior on common
+# English/Wikipedia patterns = fewer bits per literal byte once real data
+# starts.
+#
+# The previous version repeated one paragraph three times, which mostly
+# taught the model "this paragraph repeats." Replaced with non-repetitive
+# content covering the regimes Hutter (enwik8) actually contains: prose,
+# dialogue, lists, tables, references, markup, dates, numbers, code, math.
+SEED_CORPUS = (
+    # English prose — letter/word/punctuation regularities.
     b"English text is full of small regularities. Letters form words, words "
     b"form phrases, and phrases repeat with punctuation, spacing, and rhythm. "
     b"A compressor that begins from a blank model wastes bits learning that "
-    b"spaces are common, vowels follow consonants, and sentences often return "
-    b"to familiar patterns. This short seed paragraph gives the online model a "
-    b"deterministic prior without storing learned weights in the compressed file."
+    b"spaces are common, vowels follow consonants, and sentences end with a "
+    b"period followed by a space and a capital letter. The model should "
+    b"already know all of this before the first user byte arrives.\n\n"
+
+    # Wikipedia article-style — title, intro, infobox-ish lines, references.
+    b"Compression (information theory)\n\n"
+    b"In information theory, data compression is the process of encoding "
+    b"information using fewer bits than the original representation. Any "
+    b"particular compression is either lossy or lossless. Lossless compression "
+    b"reduces bits by identifying and eliminating statistical redundancy, so "
+    b"that no information is lost. Lossy compression reduces bits by removing "
+    b"unnecessary or less important information.[1]\n\n"
+    b"The process of reducing the size of a data file is often referred to as "
+    b"data compression. In the context of data transmission, it is called "
+    b"source coding: encoding done at the source of the data before it is "
+    b"stored or transmitted.[2] Source coding should not be confused with "
+    b"channel coding, for error detection and correction, or line coding, "
+    b"the means for mapping data onto a signal.\n\n"
+    b"See also: entropy (information theory), Kolmogorov complexity, "
+    b"arithmetic coding, Huffman coding, Lempel-Ziv-Welch.\n\n"
+    b"References\n"
+    b"1. Wade, Graham (1994). Signal coding and processing. ISBN 978-0-521-42336-6.\n"
+    b"2. Mahdi, O.A.; Mohammed, M.A.; Mohamed, A.J. (November 2012). "
+    b"\"Implementing a Novel Approach an Convert Audio Compression to Text Coding "
+    b"via Hybrid Technique\". International Journal of Computer Science Issues. 9 "
+    b"(6, No. 3): 53-59.\n\n"
+
+    # Wiki markup — links, templates, italics, headers.
+    b"== History ==\n\n"
+    b"The theoretical basis for compression is provided by [[information theory]] "
+    b"and, more specifically, [[Algorithmic information theory|algorithmic "
+    b"information theory]] for lossless compression and [[rate-distortion theory]] "
+    b"for lossy compression. These fields of study were essentially forged by "
+    b"[[Claude Shannon]], who published fundamental papers on the topic in the "
+    b"late 1940s and early 1950s. Other topics associated with compression "
+    b"include [[coding theory]] and [[statistical inference]].\n\n"
+    b"{{Main|Lossless compression}}\n"
+    b"Lossless data compression algorithms usually exploit "
+    b"[[statistical redundancy]] to represent data without losing any "
+    b"[[information]], so that the process is reversible.\n\n"
+
+    # Dialogue — handles colons, names, line breaks.
+    b"Dialogue:\n"
+    b"Alice: Does the model remember the phrase from earlier in the file?\n"
+    b"Ben: It remembered letters and short words, but not the exact sentence.\n"
+    b"Alice: Then we need a better prior, a longer context, or an explicit "
+    b"copy mechanism for repeated text.\n"
+    b"Ben: We already have a copy mechanism. It catches matches above eight "
+    b"bytes within an eight-kilobyte window.\n\n"
+
+    # Markdown — lists, code, emphasis.
+    b"# Notes on the build\n\n"
+    b"- Train deterministically; the encoder and decoder must agree on every "
+    b"bit produced.\n"
+    b"- Keep the model architecture identical on both sides; any drift in "
+    b"weights between compress and decompress breaks the round-trip.\n"
+    b"- Measure `gzip`, `kolmo`, ratio, and wall time on every change.\n"
+    b"- Revert changes that only help tiny inputs at the cost of large ones.\n"
+    b"- The seed corpus is part of the algorithm, not part of the data; it "
+    b"costs nothing in the output blob.\n\n"
+    b"```python\n"
+    b"def compress(data: bytes) -> bytes:\n"
+    b"    model = build_model()\n"
+    b"    return arithmetic_encode(predict_stream(model, data))\n"
+    b"```\n\n"
+
+    # Numbers, dates, units, currencies — common token shapes.
+    b"Numbers and dates: 2026-05-22, 1,024 bytes, 2,048 bytes, 4,096 bytes, "
+    b"65,536 entries, 10^6 iterations, 3.14159, 2.71828, -273.15 C, 98.6 F, "
+    b"$1.99, 49.95 EUR, GBP 12.50, 12:30 PM, 23:59 UTC, 1989-1992, ca. 1850, "
+    b"version 1.0.3, RFC 8259, ISO 8601.\n\n"
+
+    # Sentence-level variety — questions, exclamations, parenthetical asides.
+    b"Why does a transformer help here? Because text contains both local "
+    b"spelling rules (which a small context handles) and long-range reuse "
+    b"(which attention captures). A model that handles only local rules will "
+    b"plateau; one with useful memory keeps improving as the document grows. "
+    b"Note: the model is reset to its seed-warmed state at the start of every "
+    b"file, so no information leaks between separate runs.\n\n"
+
+    # Tables — pipes and column structure.
+    b"| Algorithm | Type     | Year | Use case               |\n"
+    b"|-----------|----------|------|------------------------|\n"
+    b"| Huffman   | static   | 1952 | symbol-by-symbol       |\n"
+    b"| LZ77      | dictionary | 1977 | general-purpose      |\n"
+    b"| Arithmetic | statistical | 1976 | per-bit precision   |\n"
+    b"| Neural    | learned  | 2010s | context-sensitive      |\n\n"
+
+    # Math / LaTeX-ish.
+    b"Entropy: H(X) = -sum p(x) log p(x), where the base of the logarithm "
+    b"determines the unit (bits for log_2, nats for ln). Cross-entropy: "
+    b"H(p, q) = -sum p(x) log q(x). The expected code length under arithmetic "
+    b"coding equals H(p, q), so a better model q gives shorter blobs. "
+    b"KL divergence: D(p || q) = H(p, q) - H(p) >= 0.\n\n"
+
+    # Closing prose — repeats some words from above to reinforce.
+    b"A final passage to round out the seed: the city library kept rows of "
+    b"shelves, tables, lamps, catalog records, quiet readers, printed forms, "
+    b"and old magazines. The same words return in nearby sentences and the "
+    b"compressor should pay fewer bits each time a pattern becomes familiar. "
+    b"That is the entire point of online learning: shape the distribution to "
+    b"match the data as the data arrives.\n"
 )
-_SEED_EXTRA = (
-    b"\n\nThe morning train crossed the river while people read notes, checked maps, "
-    b"and talked quietly about school, weather, work, and travel. A useful "
-    b"English prior should know that spaces are common, commas separate clauses, "
-    b"and a period is often followed by a space and a capital letter. "
-    b"\n\nReference entry: compression is the process of representing information with "
-    b"fewer symbols. A dictionary method stores repeated phrases as pointers, "
-    b"while a statistical method assigns shorter codes to likely events. Both "
-    b"approaches rely on patterns that appear again after they have been seen. "
-    b"\n\nDialogue:\nAlice: Did the model remember the phrase from earlier?\nBen: It remembered "
-    b"letters and spaces, but not the exact sentence.\nAlice: Then we need a "
-    b"better prior or a small memory for repeated text.\n"
-    b"\n# Notes\n\n- Train deterministically.\n- Keep encoder and decoder symmetric.\n- "
-    b"Measure gzip, kolmo, ratio, and time.\n- Revert changes that only help tiny cases.\n"
-    b"\nThe second paragraph repeats the lesson in different words: text contains "
-    b"local spelling rules, medium-range grammar, and long-range reuse. A model "
-    b"that handles only local spelling will plateau, but a model with useful "
-    b"memory can keep improving as the document becomes longer. "
-    b"\n\nNumbers and punctuation also matter: 2026-05-20, 1,024 bytes, 2,048 bytes, "
-    b"and 4,096 bytes should be parsed as ordinary text rather than surprises. "
-    b"Lists, headings, and quoted speech are common in mixed corpora. "
-    b"\n\nA final neutral passage describes a city library with shelves, tables, lamps, "
-    b"catalog records, quiet readers, printed forms, and old magazines. The same "
-    b"words return in nearby sentences, and the compressor should spend fewer "
-    b"bits each time the pattern becomes familiar. "
-)
-SEED_CORPUS = _SEED_BASE + _SEED_EXTRA * 3
 EVENT_PROBS = np.array([1.0 - COPY_PROB, COPY_PROB], dtype=np.float64)
 
 
