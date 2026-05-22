@@ -16,11 +16,52 @@ from kolmo import fixed
 
 
 def extract_fixed_weights(model) -> dict[str, np.ndarray]:
-    """Quantize a PyTorch model's parameters into Q15 numpy arrays."""
-    return {
-        name: fixed.quantize(param.detach().cpu().numpy().astype(np.float64))
-        for name, param in model.named_parameters()
-    }
+    """Quantize a PyTorch model's parameters into Q15 numpy arrays.
+
+    Weight-tied parameters are handled here: `nn.Module.named_parameters()`
+    deduplicates by Parameter id, so a tied pair (e.g. token_emb.weight ===
+    head.weight) only shows up under one name. We then walk every
+    `(name, attribute)` of the model and re-add any aliased keys that
+    `named_parameters()` skipped, pointing them at the same array.
+    """
+    seen_ids: dict[int, str] = {}
+    weights: dict[str, np.ndarray] = {}
+    for name, param in model.named_parameters():
+        seen_ids[id(param)] = name
+        weights[name] = fixed.quantize(
+            param.detach().cpu().numpy().astype(np.float64)
+        )
+
+    # Look for additional names that point at parameters we already extracted.
+    # `named_parameters(remove_duplicate=False)` yields every tensor reference,
+    # not just the canonical one, so duplicates show up explicitly.
+    for name, param in model.named_parameters(remove_duplicate=False):
+        canonical = seen_ids.get(id(param))
+        if canonical is not None and name not in weights:
+            weights[name] = weights[canonical]
+    return weights
+
+
+def tied_param_pairs(model) -> list[tuple[str, str]]:
+    """Return `[(canonical, alias)]` pairs for every parameter referenced under
+    more than one name.
+
+    Canonical = the name `named_parameters()` (with dedup) yields.
+    Alias = any other name that points at the same `Parameter`.
+
+    Used by the fixed-point training path to sum gradients across tied names
+    before the optimizer step.
+    """
+    canonical_by_id: dict[int, str] = {}
+    for name, param in model.named_parameters():
+        canonical_by_id[id(param)] = name
+
+    pairs: list[tuple[str, str]] = []
+    for name, param in model.named_parameters(remove_duplicate=False):
+        canonical = canonical_by_id[id(param)]
+        if name != canonical:
+            pairs.append((canonical, name))
+    return pairs
 
 
 def _block_weights(weights: dict[str, np.ndarray], layer: int) -> dict[str, np.ndarray]:

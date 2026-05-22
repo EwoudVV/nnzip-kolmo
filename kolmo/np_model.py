@@ -139,8 +139,20 @@ def kolmo_forward(
 
 
 def extract_weights(model) -> dict:
-    """Pull weights from a PyTorch KolmoTransformer into a name->ndarray dict."""
-    return {
-        name: param.detach().cpu().numpy().astype(np.float32)
-        for name, param in model.named_parameters()
-    }
+    """Pull weights from a PyTorch KolmoTransformer into a name->ndarray dict.
+
+    Handles weight-tied parameters: `named_parameters()` deduplicates by
+    Parameter id, so a tied pair (e.g. token_emb.weight === head.weight)
+    only yields one name. We then re-add every aliased name pointing at the
+    same underlying array.
+    """
+    seen_ids: dict[int, str] = {}
+    weights: dict[str, np.ndarray] = {}
+    for name, param in model.named_parameters():
+        seen_ids[id(param)] = name
+        weights[name] = param.detach().cpu().numpy().astype(np.float32)
+    for name, param in model.named_parameters(remove_duplicate=False):
+        canonical = seen_ids.get(id(param))
+        if canonical is not None and name not in weights:
+            weights[name] = weights[canonical]
+    return weights

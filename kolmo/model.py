@@ -94,11 +94,13 @@ class KolmoTransformer(nn.Module):
         n_heads: int = 8,
         n_layers: int = 4,
         max_context: int = 16384,
+        tie_weights: bool = True,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_context = max_context
+        self.tie_weights = tie_weights
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_context, d_model)
@@ -107,6 +109,13 @@ class KolmoTransformer(nn.Module):
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
+        if tie_weights:
+            # token_emb maps id -> d_model row; head maps d_model -> logit over
+            # ids. Both use a (vocab_size, d_model) matrix. Sharing one matrix
+            # means a gradient flowing back from the head also improves the
+            # embedding (and vice versa), and cuts ~65K parameters from a
+            # ~2M-param model. Standard trick from modern LMs.
+            self.head.weight = self.token_emb.weight
 
     def forward(
         self,

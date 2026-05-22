@@ -4,6 +4,7 @@ and KV-cache equivalence with a single full forward."""
 import torch
 
 from kolmo import KolmoTransformer
+from kolmo.stable_init import stable_init_model
 
 
 def test_forward_returns_logits_with_expected_shape():
@@ -48,6 +49,9 @@ def test_kv_cache_matches_full_forward():
     correctness condition for the cache implementation."""
     torch.manual_seed(7)
     model = KolmoTransformer(max_context=64)
+    stable_init_model(model, seed=42)  # stable scale; default torch init for
+    # nn.Embedding is N(0,1), which with weight tying makes head outputs ~28x
+    # bigger than the linear-init scale and amplifies ULP-level float drift.
     model.eval()
 
     x_full = torch.randint(0, 256, (1, 8))
@@ -71,6 +75,7 @@ def test_kv_cache_one_token_at_a_time():
     forward — this is the actual usage pattern in decompress."""
     torch.manual_seed(7)
     model = KolmoTransformer(max_context=64)
+    stable_init_model(model, seed=42)
     model.eval()
 
     x_full = torch.randint(0, 256, (1, 6))

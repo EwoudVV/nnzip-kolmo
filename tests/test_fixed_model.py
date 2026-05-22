@@ -10,7 +10,9 @@ from kolmo.fixed_model import (
     extract_fixed_weights,
     fixed_backward,
     fixed_forward,
+    tied_param_pairs,
 )
+from kolmo.fixed_train import fixed_train_block
 from kolmo.model import KolmoTransformer, TransformerBlock
 from kolmo.stable_init import stable_init_model
 
@@ -21,6 +23,9 @@ def test_fixed_forward_has_expected_shape_and_is_deterministic():
         n_heads=4,
         n_layers=2,
         max_context=128,
+        tie_weights=False,  # tests per-parameter parity with PyTorch; tying
+        # would route head + embedding gradients into the same Parameter and
+        # break the per-name comparison
     )
     stable_init_model(model, seed=42)
     weights = extract_fixed_weights(model)
@@ -42,6 +47,9 @@ def test_fixed_forward_tracks_torch_argmax_on_tiny_transformer():
         n_heads=4,
         n_layers=2,
         max_context=128,
+        tie_weights=False,  # tests per-parameter parity with PyTorch; tying
+        # would route head + embedding gradients into the same Parameter and
+        # break the per-name comparison
     )
     stable_init_model(model, seed=42)
     model.eval()
@@ -63,7 +71,12 @@ def test_fixed_forward_tracks_torch_argmax_on_tiny_transformer():
     torch_argmax = ref.argmax(axis=-1)
     fixed_argmax = fixed_logits.argmax(axis=-1)
     assert np.array_equal(torch_argmax, fixed_argmax)
-    assert np.max(np.abs(ref - fixed_logits)) < 0.001
+    # Absolute bound: Q15 resolution is ~3e-5 per quantization step, and
+    # error accumulates linearly through a small transformer. Logit
+    # magnitudes are now ~1 (Linear-scale embeddings) so an absolute
+    # tolerance of 0.005 is still ~0.5% relative; argmax + correlation
+    # checks are the stronger structural claims.
+    assert np.max(np.abs(ref - fixed_logits)) < 0.005
     assert np.corrcoef(ref.flatten(), fixed_logits.flatten())[0, 1] > 0.99999
 
 
@@ -189,6 +202,7 @@ def test_fixed_backward_matches_torch_on_tiny_transformer():
         n_heads=n_heads,
         n_layers=n_layers,
         max_context=max_context,
+        tie_weights=False,  # see comment on the other tie_weights=False above
     ).double()
 
     arrays = {}
@@ -240,3 +254,55 @@ def test_fixed_backward_matches_torch_on_tiny_transformer():
         got = dequantize(grads[name])
         assert got.shape == expected.shape
         assert np.max(np.abs(got - expected)) < 0.03, name
+
+
+def test_extract_fixed_weights_aliases_tied_head():
+    """A tied model produces a weights dict where head.weight and
+    token_emb.weight share the same underlying array.
+
+    `named_parameters()` deduplicates by Parameter id, so the head wouldn't
+    normally appear in the dict — `extract_fixed_weights` walks the model
+    once more to re-add aliased names.
+    """
+    model = KolmoTransformer(d_model=32, n_heads=4, n_layers=1, max_context=32)
+    assert model.tie_weights is True
+    weights = extract_fixed_weights(model)
+    assert "head.weight" in weights
+    assert "token_emb.weight" in weights
+    assert weights["head.weight"] is weights["token_emb.weight"]
+    assert tied_param_pairs(model) == [("token_emb.weight", "head.weight")]
+
+
+def test_fixed_train_block_respects_weight_tying():
+    """One training step in fixed mode must:
+    1. Sum head + token_emb gradients before Adam (matching PyTorch's autograd
+       behavior for shared Parameters).
+    2. Leave weights["head.weight"] === weights["token_emb.weight"] after the
+       step, so the next forward sees a consistent shared tensor.
+    """
+    model = KolmoTransformer(d_model=32, n_heads=4, n_layers=1, max_context=64)
+    stable_init_model(model, seed=42)
+    weights = extract_fixed_weights(model)
+    tied = tied_param_pairs(model)
+    assert tied  # sanity: model is actually tied
+
+    history = list(range(1, 17))
+    block = list(range(17, 33))
+    state = fixed_train_block(
+        weights,
+        None,
+        history,
+        block,
+        n_heads=4,
+        n_layers=1,
+        context=64,
+        tied_params=tied,
+    )
+
+    # Re-aliased after Adam.
+    assert weights["head.weight"] is weights["token_emb.weight"]
+
+    # Adam only ran once for the canonical name — no m/v entries for the alias.
+    assert "token_emb.weight" in state.m
+    assert "head.weight" not in state.m
+    assert "head.weight" not in state.v

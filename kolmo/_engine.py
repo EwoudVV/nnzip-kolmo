@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
 from kolmo.fixed import dequantize
 from kolmo.fixed_kv_cache import fixed_step, fixed_warm, trim_caches
-from kolmo.fixed_model import extract_fixed_weights
+from kolmo.fixed_model import extract_fixed_weights, tied_param_pairs
 from kolmo.fixed_optim import FixedAdamState
 from kolmo.fixed_train import fixed_train_block
 from kolmo.model import KolmoTransformer
@@ -162,6 +162,13 @@ class FixedModelState:
     optimizer_state: FixedAdamState | None = None
     n_heads: int = 8
     n_layers: int = 4
+    # Pairs of (canonical, alias) parameter names that share underlying
+    # weights — used to sum gradients before Adam and re-alias after.
+    tied_params: list[tuple[str, str]] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.tied_params is None:
+            self.tied_params = []
 
 
 def _use_fixed() -> bool:
@@ -301,7 +308,10 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
     model = KolmoTransformer()
     stable_init_model(model, SEED)
     if _use_fixed():
-        fixed_model = FixedModelState(extract_fixed_weights(model))
+        fixed_model = FixedModelState(
+            weights=extract_fixed_weights(model),
+            tied_params=tied_param_pairs(model),
+        )
         if not _skip_prime():
             _prime_model(fixed_model, None)
         return fixed_model, None
@@ -436,6 +446,7 @@ def train_block(
             n_heads=model.n_heads,
             n_layers=model.n_layers,
             context=CONTEXT,
+            tied_params=model.tied_params,
         )
         return
 

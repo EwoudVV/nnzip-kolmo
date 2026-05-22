@@ -64,9 +64,16 @@ def stable_init_model(model: torch.nn.Module, seed: int) -> None:
             shape = tuple(param.shape)
 
             if name.endswith("emb.weight"):
-                # Uniform with variance 1, like a deterministic replacement
-                # for Embedding's default N(0, 1).
-                arr = _uniform_symmetric(name, shape, math.sqrt(3.0), seed)
+                # Use the Linear init scale (1/sqrt(d_model)) rather than
+                # nn.Embedding's default variance-1. The model ties token_emb
+                # with the output head, so the same matrix has to serve both
+                # as residual-stream embedding AND as final logit projection;
+                # a variance-1 init would make logits ~28x larger than a
+                # Linear init, breaking quantization error budgets and
+                # blowing up early-train softmax confidence. Matches GPT-2.
+                d_model = shape[1]
+                bound = 1.0 / math.sqrt(d_model)
+                arr = _uniform_symmetric(name, shape, bound, seed)
             elif name.endswith(".weight") and param.ndim == 2:
                 bound = 1.0 / math.sqrt(shape[1])
                 arr = _uniform_symmetric(name, shape, bound, seed)
