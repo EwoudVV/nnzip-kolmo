@@ -181,6 +181,79 @@ def test_exp_q15_deterministic():
     assert np.array_equal(out1, out2)
 
 
+def test_softmax_q15_matches_float():
+    """Softmax in Q15 agrees with float softmax to within ~1%."""
+    rng = np.random.default_rng(8)
+    logits = rng.normal(size=(4, 256)).astype(np.float64) * 2.0  # vocab-sized rows
+    expected = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    expected = expected / expected.sum(axis=-1, keepdims=True)
+    got = fixed.dequantize(fixed.softmax_q15(fixed.quantize(logits)))
+    # Each row should sum to ~1.0
+    assert np.all(np.abs(got.sum(axis=-1) - 1.0) < 0.001)
+    # Element-wise relative error should be small for non-tiny probabilities
+    significant = expected > 0.001
+    err = np.abs(got[significant] - expected[significant]) / expected[significant]
+    assert np.max(err) < 0.02
+
+
+def test_softmax_q15_deterministic():
+    """Same inputs give bit-identical outputs."""
+    rng = np.random.default_rng(9)
+    x_q = fixed.quantize(rng.normal(size=(4, 256)))
+    out1 = fixed.softmax_q15(x_q)
+    out2 = fixed.softmax_q15(x_q)
+    assert np.array_equal(out1, out2)
+
+
+def test_layernorm_q15_matches_float():
+    """LayerNorm in Q15 matches PyTorch's nn.LayerNorm within ~0.5%."""
+    rng = np.random.default_rng(10)
+    x = rng.normal(size=(8, 64)).astype(np.float64)
+    weight = rng.normal(size=64).astype(np.float64) * 0.5 + 1.0  # near 1
+    bias = rng.normal(size=64).astype(np.float64) * 0.1
+
+    mean = x.mean(axis=-1, keepdims=True)
+    var = ((x - mean) ** 2).mean(axis=-1, keepdims=True)
+    expected = (x - mean) / np.sqrt(var + 1e-5) * weight + bias
+
+    got = fixed.dequantize(fixed.layernorm_q15(
+        fixed.quantize(x), fixed.quantize(weight), fixed.quantize(bias)
+    ))
+    # Q15 LayerNorm has compounded error from mean, sqrt, div, mul, add.
+    # Allow ~0.5% absolute error.
+    assert np.max(np.abs(got - expected)) < 0.02
+
+
+def test_gelu_q15_matches_float():
+    """GELU in Q15 vs torch.nn.GELU within ~1%."""
+    import math
+    x = np.linspace(-3.0, 3.0, 61).astype(np.float64)
+    # PyTorch's exact GELU uses erf:
+    expected = 0.5 * x * (1.0 + np.array([math.erf(v / math.sqrt(2.0)) for v in x]))
+    got = fixed.dequantize(fixed.gelu_q15(fixed.quantize(x)))
+    # GELU stays in roughly [-0.2, 3.0]. Allow ~1% absolute error.
+    assert np.max(np.abs(got - expected)) < 0.05
+
+
+def test_gelu_q15_deterministic():
+    rng = np.random.default_rng(11)
+    x_q = fixed.quantize(rng.uniform(-4, 4, size=256))
+    out1 = fixed.gelu_q15(x_q)
+    out2 = fixed.gelu_q15(x_q)
+    assert np.array_equal(out1, out2)
+
+
+def test_linear_q15_matches_float():
+    """Linear y = x @ W.T + b matches float."""
+    rng = np.random.default_rng(12)
+    x = rng.normal(size=(4, 32)).astype(np.float64)
+    w = rng.normal(size=(16, 32)).astype(np.float64) * 0.1
+    b = rng.normal(size=16).astype(np.float64) * 0.1
+    expected = x @ w.T + b
+    got = fixed.dequantize(fixed.linear_q15(fixed.quantize(x), fixed.quantize(w), fixed.quantize(b)))
+    assert np.max(np.abs(got - expected)) < 0.01
+
+
 def test_exp_q15_softmax_typical_range():
     """exp is most-used after softmax max-subtract — inputs in [-30, 0].
 

@@ -266,3 +266,167 @@ def exp_q15(x_q: np.ndarray) -> np.ndarray:
         ),
     )
     return np.clip(result, 0, max_int32).astype(np.int32)
+
+
+# ---------------------------------------------------------------------------
+# Composite ops: softmax, layernorm, GELU, linear.
+# These build on the primitives above (matmul, add, mul, exp, sqrt, div).
+# All inputs and outputs are int32 in Q15 unless noted. Every op is
+# bit-deterministic across machines because the underlying primitives are.
+# ---------------------------------------------------------------------------
+
+
+def softmax_q15(x_q: np.ndarray) -> np.ndarray:
+    """Numerically-stable softmax over the last axis, in Q15.
+
+    Steps (all in int32):
+      1. subtract per-row max so exp argument is <= 0 (no overflow)
+      2. exp_q15 of the shifted values (each in (0, 1] when represented in Q15)
+      3. sum each row (int64 accumulator since 256 values * 32768 = 8.4M)
+      4. divide each entry by the row sum, returning Q15 probabilities
+    """
+    if x_q.dtype != np.int32:
+        raise TypeError("softmax_q15 expects int32")
+    # Subtract row max — keeps exp argument <= 0.
+    row_max = x_q.max(axis=-1, keepdims=True)
+    shifted = (x_q - row_max).astype(np.int32)
+    e = exp_q15(shifted)
+    # Sum each row in int64 to prevent overflow on large alphabets.
+    row_sum = e.astype(np.int64).sum(axis=-1, keepdims=True)
+    # Guard against all-zero rows (shouldn't happen since max contributes 1.0).
+    row_sum = np.maximum(row_sum, 1)
+    # Per-entry: result_q15 = (e * SCALE) / row_sum. e is already Q15, multiply
+    # by SCALE (left-shift 15) then divide → Q15 result.
+    numerator = e.astype(np.int64) << SCALE_BITS
+    result = (numerator + row_sum // 2) // row_sum  # round-to-nearest
+    return result.astype(np.int32)
+
+
+def layernorm_q15(
+    x_q: np.ndarray,
+    weight_q: np.ndarray,
+    bias_q: np.ndarray,
+    eps_q: int = 1,
+) -> np.ndarray:
+    """LayerNorm over the last axis, in Q15.
+
+    Computes: (x - mean) / sqrt(var + eps) * weight + bias
+    All operations in integer math. eps_q is the epsilon in Q15 units
+    (default 1 ≈ 3e-5, matches PyTorch's default 1e-5).
+    """
+    if x_q.dtype != np.int32 or weight_q.dtype != np.int32 or bias_q.dtype != np.int32:
+        raise TypeError("layernorm_q15 expects int32 inputs")
+
+    D = x_q.shape[-1]
+    # Mean: sum then integer-divide by D. Use int64 to avoid overflow on
+    # large rows.
+    summed = x_q.astype(np.int64).sum(axis=-1, keepdims=True)
+    mean = (summed + (D // 2)) // D  # round-to-nearest
+    centered = x_q - mean.astype(np.int32)
+
+    # Variance: mean of squared centered values. centered is Q15; squaring
+    # gives Q30. We divide by D in Q30, then take sqrt to get back to Q15.
+    sq = centered.astype(np.int64) ** 2  # Q30
+    var_q30 = (sq.sum(axis=-1, keepdims=True) + (D // 2)) // D
+    # Add epsilon (in Q15 → shift to Q30 by left-shift 15).
+    var_with_eps_q30 = var_q30 + (np.int64(eps_q) << SCALE_BITS)
+    # sqrt(var_q30) ≈ sqrt(var) * 2^15 = Q15. (Because sqrt(x * 2^30) = sqrt(x) * 2^15.)
+    # Use isqrt_vec on the int64 array directly.
+    stddev_q15 = isqrt_vec(var_with_eps_q30).astype(np.int32)
+    stddev_q15 = np.maximum(stddev_q15, 1)  # avoid div-by-zero
+
+    # Normalize: (x - mean) / stddev, then * weight + bias. All in Q15.
+    # Use div_q15 element-wise (but stddev_q15 broadcasts).
+    # We do this in chunks because div_q15 expects same-shape inputs.
+    centered_shape = centered.shape
+    stddev_broadcast = np.broadcast_to(stddev_q15, centered_shape).copy()
+    normed = div_q15(centered, stddev_broadcast)
+    scaled = mul(normed, np.broadcast_to(weight_q, centered_shape).copy())
+    return add(scaled, np.broadcast_to(bias_q, centered_shape).copy())
+
+
+# Polynomial coefficients for erf approximation (Abramowitz & Stegun 7.1.26).
+# 1 - (a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵) * exp(-x²) where t = 1/(1 + p*x).
+# Stored as Q15 constants — exactly the same bytes on every machine.
+_ERF_P_Q15 = int(round(0.3275911 * SCALE))  # 10737
+_ERF_A1_Q15 = int(round(0.254829592 * SCALE))  # 8347
+_ERF_A2_Q15 = int(round(-0.284496736 * SCALE))  # -9322
+_ERF_A3_Q15 = int(round(1.421413741 * SCALE))  # 46577
+_ERF_A4_Q15 = int(round(-1.453152027 * SCALE))  # -47617
+_ERF_A5_Q15 = int(round(1.061405429 * SCALE))  # 34772
+
+# Pre-computed 1/sqrt(2) in Q15 for GELU input scaling.
+_INV_SQRT2_Q15 = int(round(0.7071067811865476 * SCALE))  # 23170
+
+
+def erf_q15(x_q: np.ndarray) -> np.ndarray:
+    """erf(x) in Q15 via Abramowitz & Stegun 7.1.26 polynomial.
+
+    Output is in (-1, 1) so always fits in Q15 with room. Uses absolute
+    value, then negates if input was negative.
+    """
+    if x_q.dtype != np.int32:
+        raise TypeError("erf_q15 expects int32")
+    sign = np.where(x_q < 0, -1, 1).astype(np.int32)
+    abs_x = np.abs(x_q).astype(np.int32)
+    # t = 1 / (1 + p * |x|)
+    one_q15 = np.int32(SCALE)
+    px = mul(abs_x, np.full_like(abs_x, _ERF_P_Q15))
+    one_plus_px = add(np.full_like(abs_x, one_q15), px)
+    t = div_q15(np.full_like(abs_x, one_q15), one_plus_px)
+
+    # Polynomial: a1*t + a2*t² + a3*t³ + a4*t⁴ + a5*t⁵, Horner form.
+    poly = np.full_like(t, _ERF_A5_Q15)
+    poly = add(mul(poly, t), np.full_like(t, _ERF_A4_Q15))
+    poly = add(mul(poly, t), np.full_like(t, _ERF_A3_Q15))
+    poly = add(mul(poly, t), np.full_like(t, _ERF_A2_Q15))
+    poly = add(mul(poly, t), np.full_like(t, _ERF_A1_Q15))
+    poly = mul(poly, t)
+
+    # exp(-x²): square x then negate then exp.
+    x_sq = mul(abs_x, abs_x)
+    exp_neg_x_sq = exp_q15((-x_sq).astype(np.int32))
+
+    # 1 - poly * exp(-x²)
+    inner = mul(poly, exp_neg_x_sq)
+    result = sub(np.full_like(abs_x, one_q15), inner)
+    return (sign * result).astype(np.int32)
+
+
+def gelu_q15(x_q: np.ndarray) -> np.ndarray:
+    """GELU(x) = 0.5 * x * (1 + erf(x / sqrt(2))), in Q15.
+
+    Matches torch.nn.GELU (exact, not the tanh approximation).
+    """
+    if x_q.dtype != np.int32:
+        raise TypeError("gelu_q15 expects int32")
+    # Scale input by 1/sqrt(2)
+    scaled = mul(x_q, np.full_like(x_q, _INV_SQRT2_Q15))
+    erf_val = erf_q15(scaled)
+    # 1 + erf
+    one_plus_erf = add(np.full_like(x_q, np.int32(SCALE)), erf_val)
+    # 0.5 * x * (1 + erf) — use mul, then divide by 2 via right-shift with rounding.
+    prod = mul(x_q, one_plus_erf)
+    return ((prod + np.int32(1)) >> 1).astype(np.int32)
+
+
+def linear_q15(
+    x_q: np.ndarray,
+    weight_q: np.ndarray,
+    bias_q: np.ndarray | None = None,
+) -> np.ndarray:
+    """Linear layer: y = x @ weight.T + bias, in Q15.
+
+    x_q: (..., in_features). weight_q: (out_features, in_features). bias_q:
+    (out_features,) or None.
+
+    Returns (..., out_features) int32 in Q15.
+    """
+    if x_q.dtype != np.int32 or weight_q.dtype != np.int32:
+        raise TypeError("linear_q15 expects int32 inputs")
+    y = matmul(x_q, weight_q.T)
+    if bias_q is not None:
+        if bias_q.dtype != np.int32:
+            raise TypeError("linear_q15 bias must be int32")
+        y = y + bias_q  # broadcasts over batch dims
+    return y
