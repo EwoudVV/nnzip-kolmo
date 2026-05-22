@@ -73,6 +73,112 @@ def _attention_q15(
     return fixed.linear_q15(out, proj_w_q)
 
 
+def _attention_forward_parts_q15(
+    x_q: np.ndarray,
+    qkv_w_q: np.ndarray,
+    n_heads: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return packed attention intermediates needed for backward.
+
+    Returns `(qkv_flat, q, k, v, attn)` where q/k/v/attn are head-major:
+    q/k/v have shape (H, T, d_head), attn has shape (H, T, T).
+    """
+    T, D = x_q.shape
+    d_head = D // n_heads
+
+    qkv_flat = fixed.linear_q15(x_q, qkv_w_q)
+    qkv = qkv_flat.reshape(T, 3, n_heads, d_head)
+    q = qkv[:, 0].transpose(1, 0, 2)
+    k = qkv[:, 1].transpose(1, 0, 2)
+    v = qkv[:, 2].transpose(1, 0, 2)
+
+    scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
+    mask = _causal_mask_q15(T)
+    very_negative = np.int32(-30 * fixed.SCALE)
+    attn = []
+    for h in range(n_heads):
+        scores = fixed.matmul(q[h], k[h].T)
+        scores = fixed.mul(scores, np.full_like(scores, scale_q))
+        scores = np.where(mask, very_negative, scores).astype(np.int32)
+        attn.append(fixed.softmax_q15(scores))
+    return qkv_flat, q, k, v, np.stack(attn, axis=0)
+
+
+def _attention_backward_q15(
+    x_q: np.ndarray,
+    qkv_w_q: np.ndarray,
+    proj_w_q: np.ndarray,
+    grad_y_q: np.ndarray,
+    n_heads: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Backward pass for full-sequence causal self-attention.
+
+    Forward graph:
+        q, k, v = linear(x, qkv_w).split()
+        attn = softmax(mask((q @ k.T) / sqrt(d_head)))
+        heads = attn @ v
+        y = linear(concat(heads), proj_w)
+
+    Returns `(grad_x, grad_qkv_w, grad_proj_w)`, all Q15.
+    """
+    if x_q.dtype != np.int32 or qkv_w_q.dtype != np.int32 or proj_w_q.dtype != np.int32:
+        raise TypeError("_attention_backward_q15 expects int32 inputs")
+    if x_q.ndim != 2 or grad_y_q.ndim != 2:
+        raise ValueError("_attention_backward_q15 expects 2-D x and grad_y")
+
+    T, D = x_q.shape
+    d_head = D // n_heads
+    scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
+    mask = _causal_mask_q15(T)
+
+    _qkv_flat, q, k, v, attn = _attention_forward_parts_q15(x_q, qkv_w_q, n_heads)
+    heads = np.stack([fixed.matmul(attn[h], v[h]) for h in range(n_heads)], axis=1)
+    out = heads.reshape(T, D)
+
+    grad_out, grad_proj_w, _ = fixed.linear_backward_q15(
+        out,
+        proj_w_q,
+        grad_y_q,
+        has_bias=False,
+    )
+    grad_heads = grad_out.reshape(T, n_heads, d_head).transpose(1, 0, 2)
+
+    grad_q = np.zeros_like(q)
+    grad_k = np.zeros_like(k)
+    grad_v = np.zeros_like(v)
+
+    for h in range(n_heads):
+        # head_out = attn @ v
+        grad_attn = fixed.matmul(grad_heads[h], v[h].T)
+        grad_v[h] = fixed.matmul(attn[h].T, grad_heads[h])
+
+        # attn = softmax(masked_scores). Masked positions are constants, so
+        # their gradients do not flow back to q/k.
+        grad_scores_scaled = fixed.softmax_backward_q15(attn[h], grad_attn)
+        grad_scores_scaled = np.where(mask, 0, grad_scores_scaled).astype(np.int32)
+
+        # scores_scaled = scores * (1/sqrt(d_head)).
+        grad_scores = fixed.mul(grad_scores_scaled, np.full_like(grad_scores_scaled, scale_q))
+
+        # scores = q @ k.T
+        grad_q[h] = fixed.matmul(grad_scores, k[h])
+        grad_k[h] = fixed.matmul(grad_scores.T, q[h])
+
+    grad_qkv = np.zeros((T, 3, n_heads, d_head), dtype=np.int32)
+    grad_qkv[:, 0] = grad_q.transpose(1, 0, 2)
+    grad_qkv[:, 1] = grad_k.transpose(1, 0, 2)
+    grad_qkv[:, 2] = grad_v.transpose(1, 0, 2)
+    grad_qkv_flat = grad_qkv.reshape(T, 3 * D)
+
+    grad_x, grad_qkv_w, _ = fixed.linear_backward_q15(
+        x_q,
+        qkv_w_q,
+        grad_qkv_flat,
+        has_bias=False,
+    )
+    return grad_x, grad_qkv_w, grad_proj_w
+
+
 def _block_q15(
     x_q: np.ndarray,
     weights: dict[str, np.ndarray],

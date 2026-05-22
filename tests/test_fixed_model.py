@@ -3,8 +3,8 @@
 import numpy as np
 import torch
 
-from kolmo.fixed import dequantize
-from kolmo.fixed_model import extract_fixed_weights, fixed_forward
+from kolmo.fixed import dequantize, quantize
+from kolmo.fixed_model import _attention_backward_q15, extract_fixed_weights, fixed_forward
 from kolmo.model import KolmoTransformer
 from kolmo.stable_init import stable_init_model
 
@@ -59,3 +59,48 @@ def test_fixed_forward_tracks_torch_argmax_on_tiny_transformer():
     assert np.array_equal(torch_argmax, fixed_argmax)
     assert np.max(np.abs(ref - fixed_logits)) < 0.001
     assert np.corrcoef(ref.flatten(), fixed_logits.flatten())[0, 1] > 0.99999
+
+
+def test_attention_backward_q15_matches_torch():
+    """Fixed attention backward should track PyTorch autograd."""
+    import math
+    import torch.nn.functional as F
+
+    rng = np.random.default_rng(18)
+    T = 5
+    D = 16
+    n_heads = 4
+    d_head = D // n_heads
+
+    x = rng.normal(size=(T, D)).astype(np.float64) * 0.25
+    qkv_w = rng.normal(size=(3 * D, D)).astype(np.float64) * 0.12
+    proj_w = rng.normal(size=(D, D)).astype(np.float64) * 0.12
+    grad_y = rng.normal(size=(T, D)).astype(np.float64) * 0.015
+
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    qkv_w_t = torch.tensor(qkv_w, dtype=torch.float64, requires_grad=True)
+    proj_w_t = torch.tensor(proj_w, dtype=torch.float64, requires_grad=True)
+
+    qkv = (x_t @ qkv_w_t.T).view(T, 3, n_heads, d_head)
+    q = qkv[:, 0].permute(1, 0, 2)
+    k = qkv[:, 1].permute(1, 0, 2)
+    v = qkv[:, 2].permute(1, 0, 2)
+    scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(d_head))
+    mask = torch.triu(torch.ones((T, T), dtype=torch.bool), diagonal=1)
+    attn = F.softmax(scores.masked_fill(mask, float("-inf")), dim=-1)
+    heads = attn @ v
+    out = heads.permute(1, 0, 2).contiguous().view(T, D)
+    y = out @ proj_w_t.T
+    y.backward(torch.tensor(grad_y, dtype=torch.float64))
+
+    grad_x, grad_qkv_w, grad_proj_w = _attention_backward_q15(
+        quantize(x),
+        quantize(qkv_w),
+        quantize(proj_w),
+        quantize(grad_y),
+        n_heads=n_heads,
+    )
+
+    assert np.max(np.abs(dequantize(grad_x) - x_t.grad.numpy())) < 0.004
+    assert np.max(np.abs(dequantize(grad_qkv_w) - qkv_w_t.grad.numpy())) < 0.004
+    assert np.max(np.abs(dequantize(grad_proj_w) - proj_w_t.grad.numpy())) < 0.004
