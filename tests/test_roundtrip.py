@@ -6,6 +6,7 @@ online-training architecture works end-to-end.
 
 import pytest
 
+import importlib
 import kolmo._engine as engine
 from kolmo import compress, decompress
 from kolmo.compress import MAGIC
@@ -112,6 +113,36 @@ def test_roundtrip_default_seed_smoke(monkeypatch):
 def test_empty_input_rejected():
     with pytest.raises(ValueError):
         compress(b"")
+
+
+def test_compress_skips_final_useless_training_step(monkeypatch):
+    """Training after the last byte cannot affect any future prediction.
+
+    Keep full-block training lazy: a completed block is trained only when the
+    next byte/copy observation needs the updated model. This saves one
+    train_block call for every file whose last observed bytes are not followed
+    by another prediction, including exact BLOCK_SIZE multiples.
+    """
+    compress_mod = importlib.import_module("kolmo.compress")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    calls: list[list[int]] = []
+
+    def count_train(model, optimizer, history, pending):
+        calls.append(list(pending))
+
+    monkeypatch.setattr(compress_mod, "train_block", count_train)
+
+    calls.clear()
+    compress_mod.compress(bytes(range(engine.BLOCK_SIZE - 1)))
+    assert calls == []
+
+    calls.clear()
+    compress_mod.compress(bytes(range(engine.BLOCK_SIZE)))
+    assert calls == []
+
+    calls.clear()
+    compress_mod.compress(bytes(range(engine.BLOCK_SIZE + 1)))
+    assert calls == [list(range(engine.BLOCK_SIZE))]
 
 
 def test_invalid_magic_rejected():

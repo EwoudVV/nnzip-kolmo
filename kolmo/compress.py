@@ -48,24 +48,30 @@ def compress(data: bytes) -> bytes:
     caches = None
     pos_offset = 0
 
+    def train_pending_if_full():
+        nonlocal history, pending, probs, caches, pos_offset
+        if len(pending) != BLOCK_SIZE:
+            return
+        train_block(model, optimizer, history, pending)
+        history = update_history(history, pending)
+        pending = []
+        probs = None
+        caches = None
+        pos_offset = 0
+
     def ensure_cache():
         nonlocal probs, caches, pos_offset
+        train_pending_if_full()
         if probs is None:
             probs, caches, pos_offset = warm_cache(model, history)
 
     def observe_byte(byte: int):
-        nonlocal history, copy_history, pending, probs, caches, pos_offset
+        nonlocal copy_history, pending, probs, caches, pos_offset
+        train_pending_if_full()
         ensure_cache()
         probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
         copy_history.append(byte)
         pending.append(byte)
-        if len(pending) == BLOCK_SIZE:
-            train_block(model, optimizer, history, pending)
-            history = update_history(history, pending)
-            pending = []
-            probs = None
-            caches = None
-            pos_offset = 0
 
     pos = 0
     while pos < len(data):
@@ -95,9 +101,6 @@ def compress(data: bytes) -> bytes:
         encoder.encode(byte, probs)
         observe_byte(byte)
         pos += 1
-
-    if pending:
-        train_block(model, optimizer, history, pending)
 
     payload = encoder.finish()
     return MAGIC + struct.pack(">I", len(data)) + payload
