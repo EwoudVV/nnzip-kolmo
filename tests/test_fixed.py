@@ -301,6 +301,45 @@ def test_linear_backward_q15_matches_torch():
     assert np.max(np.abs(fixed.dequantize(grad_b) - b_t.grad.numpy())) < 0.001
 
 
+def test_ffn_backward_q15_matches_torch():
+    """Feed-forward-network backward should track PyTorch autograd."""
+    import torch
+    import torch.nn.functional as F
+
+    rng = np.random.default_rng(16)
+    x = rng.normal(size=(4, 32)).astype(np.float64) * 0.25
+    w1 = rng.normal(size=(64, 32)).astype(np.float64) * 0.12
+    b1 = rng.normal(size=64).astype(np.float64) * 0.05
+    w2 = rng.normal(size=(32, 64)).astype(np.float64) * 0.12
+    b2 = rng.normal(size=32).astype(np.float64) * 0.05
+    grad_y = rng.normal(size=(4, 32)).astype(np.float64) * 0.015
+
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    w1_t = torch.tensor(w1, dtype=torch.float64, requires_grad=True)
+    b1_t = torch.tensor(b1, dtype=torch.float64, requires_grad=True)
+    w2_t = torch.tensor(w2, dtype=torch.float64, requires_grad=True)
+    b2_t = torch.tensor(b2, dtype=torch.float64, requires_grad=True)
+
+    h1 = x_t @ w1_t.T + b1_t
+    y = F.gelu(h1) @ w2_t.T + b2_t
+    y.backward(torch.tensor(grad_y, dtype=torch.float64))
+
+    grad_x, grad_w1, grad_b1, grad_w2, grad_b2 = fixed.ffn_backward_q15(
+        fixed.quantize(x),
+        fixed.quantize(w1),
+        fixed.quantize(b1),
+        fixed.quantize(w2),
+        fixed.quantize(b2),
+        fixed.quantize(grad_y),
+    )
+
+    assert np.max(np.abs(fixed.dequantize(grad_x) - x_t.grad.numpy())) < 0.003
+    assert np.max(np.abs(fixed.dequantize(grad_w1) - w1_t.grad.numpy())) < 0.003
+    assert np.max(np.abs(fixed.dequantize(grad_b1) - b1_t.grad.numpy())) < 0.003
+    assert np.max(np.abs(fixed.dequantize(grad_w2) - w2_t.grad.numpy())) < 0.003
+    assert np.max(np.abs(fixed.dequantize(grad_b2) - b2_t.grad.numpy())) < 0.003
+
+
 def test_cross_entropy_grad_q15_matches_torch():
     """Output gradient should track PyTorch cross-entropy autograd."""
     import torch

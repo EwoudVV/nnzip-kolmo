@@ -494,6 +494,50 @@ def linear_backward_q15(
     return grad_x, grad_weight, grad_bias
 
 
+def ffn_backward_q15(
+    x_q: np.ndarray,
+    w1_q: np.ndarray,
+    b1_q: np.ndarray,
+    w2_q: np.ndarray,
+    b2_q: np.ndarray,
+    grad_y_q: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Backward pass for the transformer feed-forward network.
+
+    Forward:
+        h1 = x @ w1.T + b1
+        a = GELU(h1)
+        y = a @ w2.T + b2
+
+    Backward unwinds the graph in reverse:
+        grad_a, grad_w2, grad_b2 = linear2_backward(...)
+        grad_h1 = gelu_backward(h1, grad_a)
+        grad_x, grad_w1, grad_b1 = linear1_backward(...)
+
+    Returns `(grad_x, grad_w1, grad_b1, grad_w2, grad_b2)`, all Q15.
+    """
+    if (
+        x_q.dtype != np.int32
+        or w1_q.dtype != np.int32
+        or b1_q.dtype != np.int32
+        or w2_q.dtype != np.int32
+        or b2_q.dtype != np.int32
+        or grad_y_q.dtype != np.int32
+    ):
+        raise TypeError("ffn_backward_q15 expects int32 inputs")
+    if x_q.ndim != 2 or grad_y_q.ndim != 2:
+        raise ValueError("ffn_backward_q15 expects 2-D x and grad_y")
+
+    h1 = linear_q15(x_q, w1_q, b1_q)
+    a = gelu_q15(h1)
+
+    grad_a, grad_w2, grad_b2 = linear_backward_q15(a, w2_q, grad_y_q)
+    grad_h1 = gelu_backward_q15(h1, grad_a)
+    grad_x, grad_w1, grad_b1 = linear_backward_q15(x_q, w1_q, grad_h1)
+    assert grad_b1 is not None and grad_b2 is not None
+    return grad_x, grad_w1, grad_b1, grad_w2, grad_b2
+
+
 def fixed_matmul_2d(a_q: np.ndarray, b_q: np.ndarray) -> np.ndarray:
     """2-D Q15 matmul helper used by backward formulas.
 
