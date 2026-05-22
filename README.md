@@ -126,38 +126,20 @@ Compression ratio on a 246-byte English snippet, both modes without seed prime (
 
 With prime, the PyTorch mode pulls ahead on accuracy and the gap closes; the fixed mode pays a tiny ratio cost (< 1 pp on most regimes) for its determinism guarantee.
 
-## Compression ratio (Rung 1 numbers, PyTorch path, with seed prime)
+## Compression ratio (PyTorch path, with seed prime)
 
-These are from a ~2 M param model trained online with the full seed warmup.
+These are from a ~3.4 M param model trained online with the full seed warmup. Re-measured after the Rung 2 architecture changes (weight tying, smaller pos_emb, bigger more-diverse seed, removed PyTorch-mode Adam state rounding).
 
 **Mixed local corpus** (8.9 KB of prose / wiki / dialogue / markdown):
 
 | Size | gzip -9 | kolmo |
 |---:|---:|---:|
-| 1 KB | 55.3% | **46.9%** |
-| 2 KB | 50.0% | **44.9%** |
-| 4 KB | 47.8% | **44.3%** |
-| 8 KB | 45.7% | **43.9%** |
+| 1 KB | 55.3% | **50.0%** |
+| 2 KB | 50.0% | **47.9%** |
+| 4 KB | 47.8% | **46.6%** |
+| 8 KB | 45.7% | 46.0% |
 
-**Procedurally extended long corpus** (prose + generated paragraphs, tests long-file slope):
-
-| Size | gzip -9 | kolmo |
-|---:|---:|---:|
-| 8 KB | 45.7% | **43.9%** |
-| 16 KB | 35.5% | 35.6% |
-| 32 KB | 20.0% | **19.5%** |
-
-**Real-prose corpus** (20 KB cleaned *Pride and Prejudice* — text never tuned against):
-
-| Size | gzip -9 | kolmo |
-|---:|---:|---:|
-| 1 KB | 27.4% | **26.6%** |
-| 2 KB | 23.4% | 23.4% |
-| 4 KB | 23.6% | 24.0% |
-| 8 KB | 27.4% | 27.7% |
-| 16 KB | 34.5% | 35.1% |
-
-`kolmo` clearly beats `gzip -9` on mixed-vocabulary content and on long-file slope. On uniform real prose, it's competitive but doesn't dominate — gzip's optimized LZ77 is already near-optimal for narrow narrative voice. Beating it on enwik8 is what Rung 3 is for.
+`kolmo` beats `gzip -9` on the short / mixed-vocabulary regimes and ties around 8 KB. Pre-Rung-2 numbers (older architecture, no weight tying) were ~2 pp tighter — the new architecture lost a bit of raw ratio to gain cross-machine determinism. Closing that gap and pushing past gzip on uniform real prose is what Rung 3 is for.
 
 ## Development
 
