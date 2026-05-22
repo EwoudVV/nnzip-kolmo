@@ -109,6 +109,29 @@ def test_isqrt_vec_matches_math_isqrt():
     assert np.array_equal(got, expected)
 
 
+def test_isqrt_vec_matches_math_isqrt_large_range():
+    """Stress-test isqrt across the int64 range Adam's v moment can reach.
+
+    The fixed-point Adam optimizer accumulates squared gradients in Q46 with
+    guard bits, so the v values fed to isqrt can be anywhere from 0 up to
+    ~2^46. The optimized Newton seed must hit floor(sqrt(x)) exactly on every
+    value, including near-perfect-square boundaries where Newton can land on
+    +1 and need the correction.
+    """
+    import math
+    rng = np.random.default_rng(13)
+    # Random spread across the full range.
+    samples = rng.integers(0, 1 << 46, size=2048, dtype=np.int64)
+    # Boundary stress: x = k^2 - 1, x = k^2, x = k^2 + 1 for a handful of k.
+    k = rng.integers(1, 1 << 20, size=64, dtype=np.int64)
+    boundaries = np.concatenate([k * k - 1, k * k, k * k + 1])
+    values = np.concatenate([samples, boundaries])
+
+    expected = np.array([math.isqrt(int(v)) for v in values], dtype=np.int64)
+    got = fixed.isqrt_vec(values)
+    assert np.array_equal(got, expected)
+
+
 def test_sqrt_q15_matches_float_sqrt():
     """Q15 sqrt agrees with float sqrt within Q15 precision."""
     x = np.array([0.0, 0.25, 1.0, 4.0, 100.0, 0.001], dtype=np.float64)

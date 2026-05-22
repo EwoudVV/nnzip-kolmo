@@ -116,35 +116,59 @@ def sub(a_q: np.ndarray, b_q: np.ndarray) -> np.ndarray:
     return a_q - b_q
 
 
+def _bit_length_int64(x: np.ndarray) -> np.ndarray:
+    """Vectorized integer bit-length for non-negative int64 values.
+
+    Returns `floor(log2(x)) + 1` for x > 0, and 0 for x = 0. Pure integer
+    arithmetic — no floats anywhere, so it's bit-deterministic on every
+    platform. Implemented as a 6-step binary search over the 64 bits.
+    """
+    n = np.zeros_like(x, dtype=np.int64)
+    val = x.copy()
+    for shift in (32, 16, 8, 4, 2, 1):
+        mask = val >= (np.int64(1) << shift)
+        n = np.where(mask, n + shift, n)
+        val = np.where(mask, val >> shift, val)
+    # Add 1 for the leading bit itself (only if x > 0).
+    return n + np.where(x > 0, np.int64(1), np.int64(0))
+
+
 def isqrt_vec(x: np.ndarray) -> np.ndarray:
     """Integer square root of each element of x (int64), via Newton's method.
 
-    Returns floor(sqrt(x)) as int64. Used by sqrt_q15 to compute LayerNorm
-    denominator. Math.isqrt-equivalent but vectorized.
+    Returns floor(sqrt(x)) as int64. Used by sqrt_q15 (LayerNorm denominator)
+    and the fixed-point Adam optimizer. Math.isqrt-equivalent but vectorized.
 
-    Algorithm: classic Newton iteration s := (s + x/s) // 2, starting from
-    a power-of-2 upper bound. Converges in <= 30 iterations for any int64.
+    Algorithm: classic Newton iteration `s := (s + x // s) // 2`, seeded with
+    an upper-bound estimate `s0 = 1 << ceil(bit_length(x) / 2)`. That seed is
+    within a factor of ~sqrt(2) of the true sqrt for any x, so Newton
+    converges in ~6 iterations on every input — vs ~32 from s = 1. Eight
+    iterations leaves comfortable safety margin, then a `s*s > x` correction
+    snaps the oscillation +1 down to true floor.
+
+    Determinism note: integer Newton from any positive starting estimate
+    converges to the same unique fixed point. The seed affects how many
+    iterations you need, not what the final answer is — so even if a future
+    refactor swapped the seed for a (non-bit-deterministic) float estimate,
+    the output would still be bit-identical across machines. We use integer
+    arithmetic here anyway so the whole pipeline stays pure-integer.
     """
     x = np.asarray(x, dtype=np.int64)
     if np.any(x < 0):
         raise ValueError("isqrt_vec requires non-negative integers")
 
-    # Initial estimate: shift right by half the bit-width of x.
-    # For Q15 LayerNorm denominators, x is typically small enough that
-    # a few iterations suffice, but we run a fixed number for determinism.
-    s = np.where(x == 0, np.int64(0), np.int64(1))
-    # Bring s to roughly sqrt(x) magnitude. floor(log2(x))//2 leftshift.
-    # For typical values up to 2^31 (Q15 squared values), 16 iterations always
-    # converges. Use a deterministic fixed-iteration count.
-    for _ in range(32):
-        # Avoid division by zero by guarding x > 0.
-        # s_new = (s + x/s) // 2, but only for x > 0.
+    # Seed: 2^ceil(bit_length(x) / 2). Always >= sqrt(x), and at most
+    # ~sqrt(2)*sqrt(x). For x = 0 we override to 0 after the loop anyway.
+    bl = _bit_length_int64(x)
+    seed_shift = (bl + 1) >> 1  # ceil(bl / 2)
+    s = np.where(x > 0, np.int64(1) << seed_shift, np.int64(0))
+
+    for _ in range(8):
         with np.errstate(divide="ignore", invalid="ignore"):
             quotient = np.where(s > 0, x // np.maximum(s, 1), x)
             s = np.where(x > 0, (s + quotient) // 2, np.int64(0))
-    # After convergence, the iteration may oscillate by 1 between two values;
-    # the smaller one is floor(sqrt(x)).
-    # Final correction: while s*s > x, decrement.
+
+    # Correction: Newton can land at floor(sqrt(x)) or floor(sqrt(x)) + 1.
     too_big = s * s > x
     s = np.where(too_big, s - 1, s)
     return s
