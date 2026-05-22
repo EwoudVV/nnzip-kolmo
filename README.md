@@ -6,16 +6,18 @@ This is the same architecture that the current Hutter Prize contenders use, in c
 
 **Name:** the file format is named after [Andrey Kolmogorov](https://en.wikipedia.org/wiki/Andrey_Kolmogorov). The compressed payload is, in spirit, the shortest program known to us that reproduces the input — which is exactly what Kolmogorov complexity asks for.
 
-## Status: Rung 1 — PyTorch prototype
+## Status: Rung 2 — cross-machine deterministic
 
 | Rung | Goal | Status |
 |---:|---|---|
-| 1 | PyTorch online-training prototype, single machine | **in progress** |
-| 2 | Bit-deterministic on a single machine (drop PyTorch) | — |
+| 1 | PyTorch online-training prototype, single machine | ✅ done |
+| 2 | Bit-deterministic on a single machine (drop PyTorch) | ✅ done — `KOLMO_FIXED=1` |
 | 3 | Beat nnzip's compression ratio on long files | — |
-| 4 | Cross-platform fixed-point math (Mac/Linux/x86/ARM identical) | — |
+| 4 | Cross-platform fixed-point math (Mac/Linux/x86/ARM identical) | ✅ done (folded into Rung 2 via Q15 integer engine; CI verifies on every push) |
 | 5 | Match SOTA on enwik9 (~0.85 bpb) | — |
 | 6 | Submit to Marcus Hutter and win the actual prize | — |
+
+Rung 2 collapsed Rung 4 into itself: the same Q15 fixed-point engine that drops PyTorch's nondeterminism also gives byte-identical output across Mac/Linux/x86/ARM, because integer addition is associative regardless of SIMD width or thread count. See [`benchmarks/determinism/README.md`](benchmarks/determinism/README.md) for the acceptance test and CI workflow.
 
 Three benchmarks tell different parts of the story.
 
