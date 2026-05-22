@@ -19,7 +19,6 @@ from kolmo._engine import (
     EventModel,
     LengthModel,
     OffsetModel,
-    _use_fixed,
     find_copy,
     new_model_and_optimizer,
     step_cache,
@@ -29,14 +28,7 @@ from kolmo._engine import (
 )
 from kolmo.codec import RangeEncoder
 
-MAGIC = b"KMO3"
-MODE_PYTORCH = 0
-MODE_FIXED = 1
-HEADER_SIZE = 9
-
-
-def _mode_byte() -> int:
-    return MODE_FIXED if _use_fixed() else MODE_PYTORCH
+MAGIC = b"KMO2"
 
 
 def compress(data: bytes) -> bytes:
@@ -108,4 +100,4 @@ def compress(data: bytes) -> bytes:
         train_block(model, optimizer, history, pending)
 
     payload = encoder.finish()
-    return MAGIC + struct.pack(">BI", _mode_byte(), len(data)) + payload
+    return MAGIC + struct.pack(">I", len(data)) + payload

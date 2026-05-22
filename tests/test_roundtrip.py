@@ -8,7 +8,7 @@ import pytest
 
 import kolmo._engine as engine
 from kolmo import compress, decompress
-from kolmo.compress import HEADER_SIZE, MAGIC, MODE_FIXED, MODE_PYTORCH
+from kolmo.compress import MAGIC
 
 DEFAULT_SEED_CORPUS = engine.SEED_CORPUS
 FAST_SEED_CORPUS = DEFAULT_SEED_CORPUS[:256]
@@ -28,8 +28,6 @@ def test_roundtrip_short():
     data = b"hello world"
     blob = compress(data)
     assert blob.startswith(MAGIC)
-    assert blob[4] == MODE_PYTORCH
-    assert len(blob) >= HEADER_SIZE
     assert decompress(blob) == data
 
 
@@ -49,7 +47,6 @@ def test_fixed_point_roundtrip_single_byte_skip_prime(monkeypatch):
     monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
     data = b"A"
     blob = compress(data)
-    assert blob[4] == MODE_FIXED
     assert decompress(blob) == data
 
 
@@ -120,30 +117,3 @@ def test_empty_input_rejected():
 def test_invalid_magic_rejected():
     with pytest.raises(ValueError, match="kolmo"):
         decompress(b"NOPE" + b"\x00" * 4)
-
-
-def test_fixed_blob_requires_fixed_mode(monkeypatch):
-    """A fixed-mode blob should fail fast under PyTorch mode.
-
-    The arithmetic payloads are backend-specific: PyTorch and fixed Q15 compute
-    different distributions, so trying to decode under the wrong backend should
-    produce a clear mode error instead of wandering into an opaque codec error.
-    """
-    monkeypatch.setenv("KOLMO_FIXED", "1")
-    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
-    blob = compress(b"A")
-
-    monkeypatch.delenv("KOLMO_FIXED", raising=False)
-    with pytest.raises(ValueError, match="KOLMO_FIXED=1"):
-        decompress(blob)
-
-
-def test_pytorch_blob_rejects_fixed_mode(monkeypatch):
-    """A PyTorch-mode blob should fail fast under fixed mode."""
-    monkeypatch.delenv("KOLMO_FIXED", raising=False)
-    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
-    blob = compress(b"A")
-
-    monkeypatch.setenv("KOLMO_FIXED", "1")
-    with pytest.raises(ValueError, match="PyTorch mode"):
-        decompress(blob)
