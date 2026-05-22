@@ -43,6 +43,8 @@ jobs:
             tests/test_fixed_model.py \
             tests/test_fixed_optim.py \
             tests/test_fixed_train.py \
+            tests/test_fixed_kv_cache.py \
+            tests/test_seed_cache.py \
             -q
 
       - name: Write determinism transcript

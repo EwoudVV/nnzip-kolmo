@@ -313,7 +313,10 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
             tied_params=tied_param_pairs(model),
         )
         if not _skip_prime():
+            if _load_primed_state(fixed_model, model):
+                return fixed_model, None
             _prime_model(fixed_model, None)
+            _save_primed_state(fixed_model, model)
         return fixed_model, None
     model.to(_select_device())
     model.train()
@@ -333,6 +336,86 @@ def _prime_model(
         block = list(SEED_CORPUS[pos : pos + BLOCK_SIZE])
         train_block(model, optimizer, history, block)
         history = update_history(history, block)
+
+
+def _seed_cache_config(model: KolmoTransformer) -> dict:
+    """The bits of model architecture that affect the primed state."""
+    return {
+        "vocab_size": model.vocab_size,
+        "d_model": model.d_model,
+        "n_heads": model.blocks[0].attn.n_heads,
+        "n_layers": len(model.blocks),
+        "max_context": model.max_context,
+        "tie_weights": model.tie_weights,
+        "lr": LR,
+        "context": CONTEXT,
+        "bos": BOS,
+    }
+
+
+def _load_primed_state(
+    fixed_model: FixedModelState,
+    pytorch_model: KolmoTransformer,
+) -> bool:
+    """Try to load the primed state from disk. Returns True on hit."""
+    from kolmo.seed_cache import (
+        cache_disabled,
+        cache_path_for,
+        compute_config_hash,
+        load_state,
+    )
+
+    if cache_disabled():
+        return False
+    config_hash = compute_config_hash(
+        seed_corpus=SEED_CORPUS,
+        model_config=_seed_cache_config(pytorch_model),
+        init_seed=SEED,
+        block_size=BLOCK_SIZE,
+    )
+    path = cache_path_for(config_hash)
+    if not path.exists():
+        return False
+    weights, state, tied = load_state(path)
+    fixed_model.weights = weights
+    fixed_model.optimizer_state = state
+    fixed_model.tied_params = tied
+    return True
+
+
+def _save_primed_state(
+    fixed_model: FixedModelState,
+    pytorch_model: KolmoTransformer,
+) -> None:
+    """Save the primed state to disk. Quiet on failure — the cache is an
+    optimization, not a correctness requirement."""
+    from kolmo.seed_cache import (
+        cache_disabled,
+        cache_path_for,
+        compute_config_hash,
+        save_state,
+    )
+
+    if cache_disabled() or fixed_model.optimizer_state is None:
+        return
+    config_hash = compute_config_hash(
+        seed_corpus=SEED_CORPUS,
+        model_config=_seed_cache_config(pytorch_model),
+        init_seed=SEED,
+        block_size=BLOCK_SIZE,
+    )
+    path = cache_path_for(config_hash)
+    try:
+        save_state(
+            path,
+            fixed_model.weights,
+            fixed_model.optimizer_state,
+            fixed_model.tied_params,
+        )
+    except OSError:
+        # Disk full, permission denied, etc. — we already primed in memory,
+        # so the current run succeeds; subsequent runs will just re-prime.
+        pass
 
 
 def _trim_caches(caches: list, max_len: int) -> list:
