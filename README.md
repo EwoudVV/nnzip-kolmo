@@ -26,13 +26,13 @@ Rungs 2 and 4 collapsed into one fix: a Q15 fixed-point integer engine (forward,
 | Backend | Trigger | Speed | Cross-machine | Use when |
 |---|---|---|---|---|
 | PyTorch float32 | default | ~14 ms/byte (inner loop) | ❌ Mac ≠ Windows ≠ CUDA | iterating locally, training experiments |
-| Q15 fixed-point | `KOLMO_FIXED=1` | ~335 ms/byte (inner loop) | ✅ identical everywhere | making a blob that must round-trip somewhere else |
+| Q15 fixed-point | `KOLMO_FIXED=1` | ~285 ms/byte (inner loop) | ✅ identical everywhere | making a blob that must round-trip somewhere else |
 
 The two backends produce *different* blobs even on the same input (they're computing different probabilities under the hood) — but each backend is internally consistent, so a PyTorch-mode blob decompresses with a PyTorch-mode kolmo, and a fixed-mode blob with a fixed-mode kolmo. The blob can't be told apart by file format; the same `MAGIC` header is used.
 
 ### Why the fixed-point mode is slower
 
-The 24× gap is honest cost of doing transformer math in pure-Python numpy int64 instead of vectorized BLAS float32. Closing the gap further needs a C extension (Cython, numba, or a hand-written kernel) — not a redesign, just engineering. The current pure-numpy version is fast enough to test, slow enough to make a real Hutter run impractical without that next push.
+The 20× gap is honest cost of doing transformer math in pure-Python numpy int64 instead of vectorized BLAS float32. Closing the gap further needs a C extension (Cython, numba, or a hand-written kernel) — not a redesign, just engineering. The current pure-numpy version is fast enough to test, slow enough to make a real Hutter run impractical without that next push.
 
 ### Pre-computed seed cache
 
@@ -93,22 +93,29 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 
 ## Speed (May 2026)
 
-Numbers from the Mac dev machine, ~2 M param model (d_model=256, n_heads=8, n_layers=4):
+Numbers from the Mac dev machine. ~3.4 M param model (d_model=256, n_heads=8, n_layers=4, max_context=512, tied head/embedding):
 
 | Phase | PyTorch | Fixed |
 |---|---|---|
-| Inner-loop compress per byte | ~14 ms | ~335 ms |
-| Inner-loop decompress per byte | ~9 ms | ~320 ms |
-| Seed warmup (cache miss) | ~5 s | ~3 min |
-| Seed warmup (cache hit) | not cached | ~2 s |
-| Round-trip on 62-byte payload (skip prime) | ~1 s | ~17 s |
+| Inner-loop compress per byte | ~14 ms | ~285 ms |
+| Inner-loop decompress per byte | ~9 ms | ~285 ms |
+| Seed warmup (cache miss, full corpus) | ~5 s | ~2 min |
+| Seed warmup (cache miss, tiny test corpus) | <1 s | ~6.5 s |
+| Seed warmup (cache hit) | not cached | ~0.9 s |
+| Round-trip on 62-byte payload (skip prime) | ~1 s | ~13 s |
 
-The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance in pure-numpy int64. Where the time goes (from cProfile):
+The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance in pure-numpy int64. Where the time goes (from cProfile on the 12.6s round-trip):
 
-- `matmul`: ~7 s of a 17 s round-trip — the floor, just numpy int64 matmul
-- `isqrt_vec` (Newton iteration for the sqrt-of-variance in LayerNorm and Adam's `sqrt(v)`): used to be 17 s before two optimization passes; now ~5 s
-- `fixed_adam_step`: ~8 s, mostly per-tensor numpy ops
-- Everything else: ~1 s
+- `matmul`: ~6.8 s — the floor, just numpy int64 matmul
+- `fixed_adam_step`: ~3.9 s, mostly per-tensor numpy ops
+- `isqrt_vec`: ~2.4 s (Newton sqrt used by LayerNorm and Adam's `sqrt(v)`)
+- Everything else: ~0.5 s
+
+Speed has improved ~3× over the course of Rung 2 work via:
+- Fixed-point KV cache (was recomputing the full forward per byte): −10 s
+- `isqrt_vec` bit-length seed + ufunc dispatch for small arrays: −13 s
+- `max_context` 16384 → 512 (pos_emb was 99% dead weight in Adam): −5 s
+- Pre-computed seed cache: 3 min → 1 s startup amortized
 
 Compression ratio on a 246-byte English snippet, both modes without seed prime (a deliberately unfair regime that exposes how each mode handles random-init):
 
