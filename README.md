@@ -28,7 +28,7 @@ Rungs 2 and 4 collapsed into one fix: a Q15 fixed-point integer engine (forward,
 | PyTorch float32 | default | ~14 ms/byte (inner loop) | ❌ Mac ≠ Windows ≠ CUDA | iterating locally, training experiments |
 | Q15 fixed-point | `KOLMO_FIXED=1` | ~285 ms/byte (inner loop) | ✅ identical everywhere | making a blob that must round-trip somewhere else |
 
-The two backends produce *different* blobs even on the same input (they're computing different probabilities under the hood) — but each backend is internally consistent, so a PyTorch-mode blob decompresses with a PyTorch-mode kolmo, and a fixed-mode blob with a fixed-mode kolmo. The blob can't be told apart by file format; the same `MAGIC` header is used.
+The two backends produce *different* blobs even on the same input (they're computing different probabilities under the hood) — but each backend is internally consistent, so a PyTorch-mode blob decompresses with a PyTorch-mode kolmo, and a fixed-mode blob with a fixed-mode kolmo. The `KMO3` header stores a one-byte backend marker, so trying to decode under the wrong mode fails fast with a clear error (`set KOLMO_FIXED=1` / `unset KOLMO_FIXED`) instead of drifting into an opaque arithmetic-coder failure.
 
 ### Why the fixed-point mode is slower
 
@@ -60,7 +60,7 @@ The cache invalidates automatically when any of (seed corpus, model architecture
    - Append the byte to the running history.
 4. Every 16 bytes (`BLOCK_SIZE`), do **one backward pass + Adam step** so the model adapts to the file it's currently compressing.
 5. If the next 8+ bytes happen to match recent history, encode a small `(offset, length)` copy event instead of running each byte through the neural model — a classic LZ-style fallback for structural repetition that the model would waste bits on.
-6. The compressed file contains *only* the arithmetic-coded bitstream + a 4-byte magic + a length header. No model weights.
+6. The compressed file contains *only* a 4-byte magic, a 1-byte backend marker, a length header, and the arithmetic-coded bitstream. No model weights.
 7. Decompression mirrors the loop exactly: same starting weights, same warmup, same training schedule, same byte-by-byte probability distributions. Both sides walk identical trajectories.
 
 The whole system collapses if step 1 or step 7 ever diverge, even by one bit. That's what makes cross-platform determinism the central engineering problem.

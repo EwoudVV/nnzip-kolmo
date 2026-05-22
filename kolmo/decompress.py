@@ -17,6 +17,7 @@ from kolmo._engine import (
     EventModel,
     LengthModel,
     OffsetModel,
+    _use_fixed,
     new_model_and_optimizer,
     step_cache,
     train_block,
@@ -24,14 +25,28 @@ from kolmo._engine import (
     warm_cache,
 )
 from kolmo.codec import RangeDecoder
-from kolmo.compress import MAGIC
+from kolmo.compress import HEADER_SIZE, MAGIC, MODE_FIXED, MODE_PYTORCH
 
 
 def decompress(blob: bytes) -> bytes:
-    if len(blob) < 8 or blob[:4] != MAGIC:
+    if len(blob) < HEADER_SIZE or blob[:4] != MAGIC:
         raise ValueError(f"not a kolmo blob (expected magic {MAGIC!r})")
-    n_bytes = struct.unpack(">I", blob[4:8])[0]
-    payload = blob[8:]
+    mode, n_bytes = struct.unpack(">BI", blob[4:HEADER_SIZE])
+    if mode not in (MODE_PYTORCH, MODE_FIXED):
+        raise ValueError(f"unknown kolmo backend mode byte: {mode}")
+    want_fixed = mode == MODE_FIXED
+    have_fixed = _use_fixed()
+    if want_fixed != have_fixed:
+        if want_fixed:
+            raise ValueError(
+                "this kolmo blob was compressed in fixed-point mode; "
+                "set KOLMO_FIXED=1 to decompress it"
+            )
+        raise ValueError(
+            "this kolmo blob was compressed in PyTorch mode; "
+            "unset KOLMO_FIXED to decompress it"
+        )
+    payload = blob[HEADER_SIZE:]
 
     model, optimizer = new_model_and_optimizer()
     decoder = RangeDecoder(payload)
