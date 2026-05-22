@@ -23,7 +23,6 @@ from kolmo._engine import (  # noqa: E402
     COPY_WINDOW,
     RollingCopyMatcher,
     length_probs,
-    offset_probs,
 )
 
 

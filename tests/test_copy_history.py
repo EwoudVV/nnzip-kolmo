@@ -10,6 +10,7 @@ bytearray instead of copying the whole file prefix at every position.
 from kolmo._engine import (
     COPY_MIN,
     COPY_WINDOW,
+    OffsetModel,
     RollingCopyMatcher,
     append_copy_history,
     find_copy,
@@ -77,3 +78,52 @@ def test_rolling_copy_matcher_index_stays_bounded():
 
     indexed = sum(len(candidates) for candidates in matcher._index.values())
     assert indexed <= COPY_WINDOW
+
+
+def test_offset_model_buckets_cover_legal_offsets():
+    model = OffsetModel(65536)
+    assert len(model.probs_for(1)) == 1
+    assert len(model.probs_for(8)) == 4
+    assert len(model.probs_for(65536)) == 17
+
+    assert model.bucket_for(1) == 0
+    assert model.bucket_for(2) == 1
+    assert model.bucket_for(3) == 1
+    assert model.bucket_for(8) == 3
+    assert model.bucket_for(65536) == 16
+
+    assert model.bucket_bounds(0, 100) == (1, 1)
+    assert model.bucket_bounds(3, 100) == (8, 15)
+    assert model.bucket_bounds(6, 100) == (64, 100)
+
+
+def test_offset_model_observe_updates_bucket_not_exact_slot():
+    model = OffsetModel(65536)
+    bucket_before = model.counts.copy()
+    residual_before = [counts.copy() for counts in model.residual_counts]
+
+    model.observe(9)
+    bucket = model.bucket_for(9)
+    assert model.counts[bucket] == bucket_before[bucket] + 1.0
+    for i, (got, old) in enumerate(zip(model.counts, bucket_before)):
+        if i != bucket:
+            assert got == old
+
+    lo, _ = model.bucket_bounds(bucket, model.window)
+    residual = 9 - lo
+    assert model.residual_counts[bucket][residual] == (
+        residual_before[bucket][residual] + 1.0
+    )
+    for i, (got, old) in enumerate(
+        zip(model.residual_counts[bucket], residual_before[bucket])
+    ):
+        if i != residual:
+            assert got == old
+
+
+def test_offset_model_residual_probs_are_clipped_to_max_offset():
+    model = OffsetModel(65536)
+    # Bucket 6 normally covers offsets 64..127, but max_offset=100 clips it.
+    probs = model.residual_probs_for(6, 100)
+    assert len(probs) == 37
+    assert abs(float(probs.sum()) - 1.0) < 1e-12

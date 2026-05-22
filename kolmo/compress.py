@@ -84,7 +84,18 @@ def compress(data: bytes) -> bytes:
             event_model.observe(1)
             max_offset = min(COPY_WINDOW, len(copy_history))
             max_len = min(COPY_MAX, len(data) - pos) - COPY_MIN + 1
-            encoder.encode(offset - 1, offset_model.probs_for(max_offset))
+            offset_bucket = offset_model.bucket_for(offset)
+            encoder.encode(offset_bucket, offset_model.probs_for(max_offset))
+            offset_lo, offset_hi = offset_model.bucket_bounds(
+                offset_bucket,
+                max_offset,
+            )
+            offset_width = offset_hi - offset_lo + 1
+            if offset_width > 1:
+                encoder.encode(
+                    offset - offset_lo,
+                    offset_model.residual_probs_for(offset_bucket, max_offset),
+                )
             if max_len > 1:
                 encoder.encode(length - COPY_MIN, length_model.probs_for(max_len))
             offset_model.observe(offset)

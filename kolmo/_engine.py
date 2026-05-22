@@ -252,35 +252,88 @@ class EventModel:
 
 
 class OffsetModel:
-    """Adaptive probability model for copy offsets.
+    """Adaptive probability model for copy offset log-buckets.
 
     Both compress and decompress hold an instance and call `observe` after
     every copy event, in the same order with the same offsets — so the
     distribution evolves bit-identically on both sides.
 
-    The model maintains Laplace-smoothed counts over the offset range 1..N.
-    Counts start at the static 1/sqrt(k) prior (scaled so its total mass is
-    `prior_strength`), so very early events have a sensible distribution
-    before any are observed. As events accumulate, the empirical distribution
-    increasingly dominates.
+    Encoding an exact offset in a 64 KB window as one categorical symbol is
+    expensive: every copy event builds a 65,536-way model, and rare long
+    offsets pay for a giant alphabet. Instead, encode:
+
+      1. bucket = floor(log2(offset)) with adaptive bucket probabilities
+      2. residual = offset - 2^bucket with adaptive within-bucket counts
+
+    This is gzip-style distance coding. The initial bucket prior is derived
+    from the old 1/sqrt(offset) prior by summing that mass into buckets, so
+    the first-copy behavior remains sensible while the alphabet shrinks from
+    65,536 symbols to at most 17 for the first stage. Residual priors are also
+    initialized from 1/sqrt(offset), so the initial factorized probability is
+    close to the old exact-offset prior while still allowing common exact
+    offsets to become cheap.
     """
 
-    def __init__(self, window: int, prior_strength: float = 128.0):
+    def __init__(
+        self,
+        window: int,
+        prior_strength: float = 128.0,
+        residual_prior_strength: float = 16.0,
+    ):
         self.window = window
-        # Initialize with 1/sqrt(k) prior scaled to total mass = prior_strength.
-        prior = offset_probs(window) * prior_strength
+        offsets = np.arange(1, window + 1, dtype=np.int64)
+        buckets = np.array([self.bucket_for(int(o)) for o in offsets], dtype=np.int64)
+        raw = 1.0 / np.sqrt(offsets.astype(np.float64))
+        prior = np.bincount(buckets, weights=raw, minlength=window.bit_length())
+        prior = prior / prior.sum() * prior_strength
         self.counts = prior.astype(np.float64)
+        self.residual_counts: list[np.ndarray] = []
+        for bucket in range(window.bit_length()):
+            lo, hi = self.bucket_bounds(bucket, window)
+            bucket_offsets = np.arange(lo, hi + 1, dtype=np.float64)
+            residual_prior = 1.0 / np.sqrt(bucket_offsets)
+            residual_prior = (
+                residual_prior
+                / residual_prior.sum()
+                * residual_prior_strength
+            )
+            self.residual_counts.append(residual_prior.astype(np.float64))
 
     def probs_for(self, max_offset: int) -> np.ndarray:
-        """Return normalized probabilities over offsets 1..max_offset
-        (returned as array of length max_offset)."""
-        p = self.counts[:max_offset].copy()
+        """Return normalized probabilities over legal offset buckets."""
+        if max_offset <= 0:
+            return np.array([], dtype=np.float64)
+        p = self.counts[: max_offset.bit_length()].copy()
+        return p / p.sum()
+
+    @staticmethod
+    def bucket_for(offset: int) -> int:
+        if offset <= 0:
+            raise ValueError("copy offset must be positive")
+        return offset.bit_length() - 1
+
+    @staticmethod
+    def bucket_bounds(bucket: int, max_offset: int) -> tuple[int, int]:
+        if bucket < 0:
+            raise ValueError("bucket must be non-negative")
+        lo = 1 << bucket
+        hi = min((1 << (bucket + 1)) - 1, max_offset)
+        if lo > hi:
+            raise ValueError("bucket is not legal for max_offset")
+        return lo, hi
+
+    def residual_probs_for(self, bucket: int, max_offset: int) -> np.ndarray:
+        lo, hi = self.bucket_bounds(bucket, max_offset)
+        width = hi - lo + 1
+        p = self.residual_counts[bucket][:width].copy()
         return p / p.sum()
 
     def observe(self, offset: int) -> None:
-        """Record a 1:1 offset observation. offset is 1-indexed (offset=1 is
-        the immediately previous byte)."""
-        self.counts[offset - 1] += 1.0
+        """Record an offset observation by bucket and residual."""
+        bucket = self.bucket_for(offset)
+        lo, _ = self.bucket_bounds(bucket, self.window)
+        self.counts[bucket] += 1.0
+        self.residual_counts[bucket][offset - lo] += 1.0
 
 
 def _select_device() -> torch.device:
