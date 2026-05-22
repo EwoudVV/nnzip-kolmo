@@ -25,5 +25,8 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7"]
 
+[project.scripts]
+kolmo = "kolmo.__main__:main"
+
 [tool.setuptools]
 packages = ["kolmo"]
