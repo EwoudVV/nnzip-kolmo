@@ -1,71 +1,81 @@
 # Determinism testing
 
 Tools for verifying cross-machine bit-identity. This is the Rung 2 acceptance
-test — when kolmo produces the same bytes on Mac and Windows for the same
-input, we have a deterministic compressor.
+test — when kolmo produces the same bytes on Mac and Windows (and Linux) for
+the same input, we have a deterministic compressor.
 
-## Current state (Rung 1)
+## Current state — Rung 2
 
-| Test | Mac CPU | Windows CPU | Windows CUDA |
-|---|---|---|---|
-| Within-machine | ✅ | ✅ | ✅ |
-| Match Mac CPU | — | ❌ | ❌ |
+The PyTorch path can't get there alone. Per-machine SIMD differences inside
+matmul/softmax produce ~1-ULP intermediate values even when the input weights
+are byte-identical, and over hundreds of training steps that drift compounds
+past any gradient-rounding grid we tried.
 
-The original fault line was **CPU architecture** (Apple Silicon vs x86), not
-the device. PyTorch CPU and CUDA matched on Windows, but Mac CPU differed.
+The fix was Path 2 (fixed-point arithmetic): swap the entire forward + backward
++ optimizer for Q15 integer math. Integer addition is associative, so
+multi-threaded reductions produce the same answer regardless of SIMD width.
+The work landed across `kolmo/fixed.py`, `kolmo/fixed_model.py`,
+`kolmo/fixed_optim.py`, `kolmo/fixed_train.py`, and `kolmo/fixed_kv_cache.py`,
+gated behind `KOLMO_FIXED=1`.
 
-Rung 2 progress:
-
-| Probe | Result |
+| Probe | Status |
 |---|---|
-| Stable initializer | ✅ Mac and Windows produce identical initial weights |
-| NumPy forward pass | ❌ raw logits close (~1e-7 max diff) but not byte-identical |
-| Quantized NumPy logits at 1e-4 grid | ✅ logits match on tiny model |
-| Quantized PyTorch logits at 1e-4 grid | ❌ accumulated KV-cache drift exceeds grid by token ~40 |
-| Quantized PyTorch logits at **1/64 grid** | ✅ holds for full inference path |
-| **No-training compress** with 1/64 grid | ✅ Mac and Windows produce identical compressed bytes |
-| Single-step training with grad+weight rounding | ✅ identical weights after one step |
-| Multi-step seed warmup | ❌ state diverges over ~348 steps |
-| Full compress (with training) | ❌ cross-decompress fails |
+| Stable initializer (cross-machine) | ✅ |
+| Q15 integer matmul | ✅ (`hash_q15_matmul.py`) |
+| Q15 transformer forward | ✅ (`hash_fixed_forward.py`) |
+| Q15 manual backward — matches PyTorch autograd within 0.001 | ✅ |
+| Q15 Adam optimizer with Q31/Q46 guard bits | ✅ |
+| Multi-block fixed-point training trajectory | ✅ (`hash_fixed_training.py`) |
+| Fixed-mode KV cache (warm + step) | ✅ bit-identical to `fixed_forward` |
+| End-to-end fixed-mode compress blob | ✅ (`hash_fixed_compress.py`) |
+| Cross-OS verification on every commit | ✅ (`.github/workflows/determinism.yml`) |
 
-**Today's wins:**
+GitHub Actions runs all four hashes (`hash_q15_matmul`, `hash_fixed_forward`,
+`hash_fixed_training`, `hash_fixed_compress`) on macos-latest, windows-latest,
+and ubuntu-latest. The `compare-determinism` job fails the workflow if any
+runner's transcript doesn't match the others. That's the cross-machine
+acceptance test, automated.
 
-1. **Deterministic inference path.** `kolmo/det_probs.py` converts logits to integer frequencies on a 1/64 grid. The grid is much coarser than PyTorch's accumulated float drift, so Mac and Windows round to identical integer counts. The arithmetic coder then runs on pure integer math (`Categorical(probs, perfect=True)`), giving bit-identical encoding. Verified end-to-end with a no-training compress probe.
-2. **Deterministic single-step training.** `train_block` rounds gradients to 1/8192 and weights+Adam-state to 1/16384 after each step. Starting from identical state, both machines produce identical post-step state.
+## Cost of bulletproof
 
-**What still diverges:**
+| Metric | PyTorch path | Fixed-point path |
+|---|---|---|
+| Cross-machine bit-identity | ❌ | ✅ |
+| Inference per byte (post KV-cache) | ~0.04s | ~0.2s |
+| Training step (per block) | ~0.05s | ~2s |
+| Compression ratio on warmed model | baseline | within ~0.01 of baseline |
+| Compression ratio with random init | poor (overconfident misses) | better (Q15 clamps confidence) |
 
-Multi-step training. Even though each step is internally deterministic given identical input state, PyTorch's forward pass has SIMD-width-dependent float ops that produce ~1-ULP differences in intermediate values (logits, softmax, attention) even when the model weights themselves are byte-identical. Over hundreds of training steps, the rare cases where this ULP drift lands near a gradient-rounding boundary cause divergence to compound.
-
-**Next path:** replace the PyTorch forward in `train_block` with a fully-deterministic implementation. Two options:
-
-1. **NumPy forward with single-thread BLAS.** `kolmo/np_model.py` already exists and matches PyTorch within float precision; pin BLAS to one thread and verify cross-machine bit-identity at the intermediate-value level (not just logits).
-2. **Fixed-point forward.** Represent weights as int32 with a known scale factor; reimplement matmul/layernorm/attention in integer math. Bulletproof but several days of work.
-
-Path 1 is the cheaper first attempt.
+The fixed path is ~40× slower than PyTorch — most of that is the Python
+overhead of numpy int64 ops without a JIT. Going faster needs C extensions,
+which would add a build step.
 
 ## Scripts
 
-- `hash_compress.py` — compress a fixed input, print sha256. Run on multiple machines, compare hashes.
-- `hash_model_state.py` — hash PyTorch default init, stable init, and post-seed-warmup weights.
-- `hash_numpy_forward.py` — hash a pure-NumPy forward pass from stable weights.
+- `hash_q15_matmul.py` — hash an int matmul. Foundation claim for fixed-point.
+- `hash_fixed_forward.py` — hash int32 logits from a Q15 transformer forward.
+- `hash_fixed_training.py` — hash weights + Adam state after a few training blocks.
+- `hash_fixed_compress.py` — hash a `KOLMO_FIXED=1` compress blob end-to-end.
+- `hash_compress.py` — hash a PyTorch-path compress blob (will not match cross-OS).
 - `make_blob.py PATH` — save a compressed blob to PATH.
 - `try_decompress.py PATH` — try to decompress, report whether output matches expected.
 
-## Acceptance test
+The older probes (`hash_after_warmup`, `hash_model_state`, `hash_no_training`,
+`hash_numpy_forward`, `hash_pytorch_freqs`, `hash_int_freqs`, `measure_train_drift`)
+were diagnostic artifacts from finding the original fault line — kept for the
+historical record.
 
-When Rung 2 is done, this round-trip should succeed:
+## Manual acceptance test
+
+CI handles this on every push, but the manual version is still:
 
 ```
 # On machine A:
-python benchmarks/determinism/make_blob.py blob.kmo
+KOLMO_FIXED=1 python benchmarks/determinism/make_blob.py blob.kmo
 
 # Copy blob.kmo to machine B (any architecture, any OS).
 
 # On machine B:
-python benchmarks/determinism/try_decompress.py blob.kmo
+KOLMO_FIXED=1 python benchmarks/determinism/try_decompress.py blob.kmo
 # Should print: ROUND-TRIP OK
 ```
-
-Today it prints `DECOMPRESS RAN but output DIFFERS` because PyTorch float
-math diverges between machines.
