@@ -93,7 +93,13 @@ class KolmoTransformer(nn.Module):
         d_model: int = 256,
         n_heads: int = 8,
         n_layers: int = 4,
-        max_context: int = 16384,
+        max_context: int = 512,
+        # CONTEXT=256 (sliding-window cap) + BLOCK_SIZE=16 (max new tokens
+        # per step before training resets pos_offset to 0) means the highest
+        # absolute position ever indexed is ~272. 512 is 2x headroom. The
+        # old default of 16384 made pos_emb a 4.2M-param tensor where 99%
+        # of rows were dead weight — Adam still spent 30% of its time
+        # updating them every step.
         tie_weights: bool = True,
     ):
         super().__init__()
