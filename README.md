@@ -102,9 +102,9 @@ Numbers from the Mac dev machine. ~3.4 M param model (d_model=256, n_heads=8, n_
 | Seed warmup (cache miss, full corpus) | ~5 s | ~2 min |
 | Seed warmup (cache miss, tiny test corpus) | <1 s | ~6.5 s |
 | Seed warmup (cache hit) | not cached | ~0.9 s |
-| Round-trip on 62-byte payload (skip prime) | ~1 s | ~13 s |
+| Round-trip on 62-byte payload (skip prime) | ~1 s | ~10 s |
 
-The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance in pure-numpy int64. Where the time goes (from cProfile on the 12.6s round-trip):
+The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance in pure-numpy int64. Where the time goes (from cProfile on the 9.7s round-trip):
 
 - `matmul`: ~6.8 s — the floor, just numpy int64 matmul
 - `fixed_adam_step`: ~3.9 s, mostly per-tensor numpy ops
@@ -115,6 +115,7 @@ Speed has improved ~3× over the course of Rung 2 work via:
 - Fixed-point KV cache (was recomputing the full forward per byte): −10 s
 - `isqrt_vec` bit-length seed + ufunc dispatch for small arrays: −13 s
 - `max_context` 16384 → 512 (pos_emb was 99% dead weight in Adam): −5 s
+- Lazy block training (skip the final train step when no future byte can benefit): −3 s
 - Pre-computed seed cache: 3 min → 1 s startup amortized
 
 Compression ratio on a 246-byte English snippet, both modes without seed prime (a deliberately unfair regime that exposes how each mode handles random-init):
