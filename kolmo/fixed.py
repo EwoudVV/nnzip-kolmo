@@ -38,6 +38,21 @@ SCALE: int = 1 << SCALE_BITS  # 32768
 ROUND_OFFSET: int = 1 << (SCALE_BITS - 1)  # add this before shifting → round, not floor
 
 
+def _round_div_int64(values: np.ndarray, divisor: int) -> np.ndarray:
+    """Round signed int64 values divided by a positive integer."""
+    if divisor <= 0:
+        raise ValueError("divisor must be positive")
+    values = np.asarray(values, dtype=np.int64)
+    signs = np.where(values >= 0, 1, -1)
+    rounded = (np.abs(values) + (divisor // 2)) // divisor
+    return signs * rounded
+
+
+def _q30_to_q15(values: np.ndarray) -> np.ndarray:
+    """Round signed Q30 int64 values back to Q15 int64."""
+    return _round_div_int64(np.asarray(values, dtype=np.int64), SCALE)
+
+
 def quantize(x: np.ndarray) -> np.ndarray:
     """Convert a float array to its Q15 int32 representation.
 
@@ -367,6 +382,90 @@ def layernorm_q15(
     normed = div_q15(centered, stddev_broadcast)
     scaled = mul(normed, np.broadcast_to(weight_q, centered_shape).copy())
     return add(scaled, np.broadcast_to(bias_q, centered_shape).copy())
+
+
+def _layernorm_parts_q15(
+    x_q: np.ndarray,
+    eps_q: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return `(normed, rstd)` for LayerNorm, both Q15.
+
+    `normed` has the same shape as x. `rstd` has shape (..., 1) and
+    broadcasts over the last axis.
+    """
+    D = x_q.shape[-1]
+    summed = x_q.astype(np.int64).sum(axis=-1, keepdims=True)
+    mean = _round_div_int64(summed, D).astype(np.int32)
+    centered = x_q - mean
+
+    sq = centered.astype(np.int64) ** 2
+    var_q30 = _round_div_int64(sq.sum(axis=-1, keepdims=True), D)
+    var_with_eps_q30 = var_q30 + (np.int64(eps_q) << SCALE_BITS)
+    stddev_q15 = isqrt_vec(var_with_eps_q30).astype(np.int32)
+    stddev_q15 = np.maximum(stddev_q15, 1)
+    rstd_q15 = reciprocal_q15(stddev_q15)
+
+    stddev_broadcast = np.broadcast_to(stddev_q15, centered.shape).copy()
+    normed = div_q15(centered, stddev_broadcast)
+    return normed, rstd_q15
+
+
+def layernorm_backward_q15(
+    x_q: np.ndarray,
+    weight_q: np.ndarray,
+    grad_y_q: np.ndarray,
+    eps_q: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Backward pass for `layernorm_q15`.
+
+    Forward:
+        norm = (x - mean) * rstd
+        y = norm * weight + bias
+
+    Backward:
+        grad_weight = sum(grad_y * norm)
+        grad_bias = sum(grad_y)
+        grad_x = rstd/N * (N*g - sum(g) - norm*sum(g*norm))
+        where g = grad_y * weight.
+
+    Returns `(grad_x, grad_weight, grad_bias)`, all Q15.
+    """
+    if x_q.dtype != np.int32 or weight_q.dtype != np.int32 or grad_y_q.dtype != np.int32:
+        raise TypeError("layernorm_backward_q15 expects int32 inputs")
+    if x_q.shape != grad_y_q.shape:
+        raise ValueError("x_q and grad_y_q must have the same shape")
+
+    D = x_q.shape[-1]
+    normed, rstd_q15 = _layernorm_parts_q15(x_q, eps_q=eps_q)
+    weight_b = np.broadcast_to(weight_q, x_q.shape).copy()
+    grad_norm = mul(grad_y_q, weight_b)
+
+    grad_bias = np.clip(
+        grad_y_q.astype(np.int64).sum(axis=0),
+        np.iinfo(np.int32).min,
+        np.iinfo(np.int32).max,
+    ).astype(np.int32)
+    grad_weight = np.clip(
+        _q30_to_q15((grad_y_q.astype(np.int64) * normed.astype(np.int64)).sum(axis=0)),
+        np.iinfo(np.int32).min,
+        np.iinfo(np.int32).max,
+    ).astype(np.int32)
+
+    sum_grad = grad_norm.astype(np.int64).sum(axis=-1, keepdims=True).astype(np.int32)
+    sum_grad_norm = _q30_to_q15(
+        (grad_norm.astype(np.int64) * normed.astype(np.int64)).sum(
+            axis=-1,
+            keepdims=True,
+        )
+    ).astype(np.int32)
+    term = (
+        D * grad_norm.astype(np.int64)
+        - sum_grad.astype(np.int64)
+        - mul(normed, np.broadcast_to(sum_grad_norm, x_q.shape).copy()).astype(np.int64)
+    )
+    scaled = mul(term.astype(np.int32), np.broadcast_to(rstd_q15, x_q.shape).copy())
+    grad_x = _round_div_int64(scaled.astype(np.int64), D).astype(np.int32)
+    return grad_x, grad_weight, grad_bias
 
 
 # Polynomial coefficients for erf approximation (Abramowitz & Stegun 7.1.26).

@@ -248,6 +248,33 @@ def test_layernorm_q15_matches_float():
     assert np.max(np.abs(got - expected)) < 0.02
 
 
+def test_layernorm_backward_q15_matches_torch():
+    """LayerNorm backward should track PyTorch autograd."""
+    import torch
+
+    rng = np.random.default_rng(19)
+    x = rng.normal(size=(5, 32)).astype(np.float64) * 0.5
+    weight = rng.normal(size=32).astype(np.float64) * 0.2 + 1.0
+    bias = rng.normal(size=32).astype(np.float64) * 0.05
+    grad_y = rng.normal(size=(5, 32)).astype(np.float64) * 0.015
+
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    weight_t = torch.tensor(weight, dtype=torch.float64, requires_grad=True)
+    bias_t = torch.tensor(bias, dtype=torch.float64, requires_grad=True)
+    y = torch.nn.functional.layer_norm(x_t, (32,), weight_t, bias_t, eps=1e-5)
+    y.backward(torch.tensor(grad_y, dtype=torch.float64))
+
+    grad_x, grad_weight, grad_bias = fixed.layernorm_backward_q15(
+        fixed.quantize(x),
+        fixed.quantize(weight),
+        fixed.quantize(grad_y),
+    )
+
+    assert np.max(np.abs(fixed.dequantize(grad_x) - x_t.grad.numpy())) < 0.006
+    assert np.max(np.abs(fixed.dequantize(grad_weight) - weight_t.grad.numpy())) < 0.006
+    assert np.max(np.abs(fixed.dequantize(grad_bias) - bias_t.grad.numpy())) < 0.006
+
+
 def test_gelu_q15_matches_float():
     """GELU in Q15 vs torch.nn.GELU within ~1%."""
     import math
