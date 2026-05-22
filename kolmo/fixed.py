@@ -302,6 +302,30 @@ def softmax_q15(x_q: np.ndarray) -> np.ndarray:
     return result.astype(np.int32)
 
 
+def softmax_backward_q15(probs_q: np.ndarray, grad_probs_q: np.ndarray) -> np.ndarray:
+    """Backward pass for softmax, in Q15.
+
+    Given `p = softmax(x)` and upstream gradient `g = dL/dp`, the Jacobian
+    simplifies to:
+
+        dL/dx_i = p_i * (g_i - sum_j(g_j * p_j))
+
+    `probs_q` should normally be the exact output of `softmax_q15(logits_q)`.
+    Returns `dL/dlogits`, in Q15.
+    """
+    if probs_q.dtype != np.int32 or grad_probs_q.dtype != np.int32:
+        raise TypeError("softmax_backward_q15 expects int32 inputs")
+    if probs_q.shape != grad_probs_q.shape:
+        raise ValueError("probs_q and grad_probs_q must have the same shape")
+
+    products_q30 = probs_q.astype(np.int64) * grad_probs_q.astype(np.int64)
+    dot_q15 = ((products_q30.sum(axis=-1, keepdims=True) + ROUND_OFFSET) >> SCALE_BITS).astype(
+        np.int32
+    )
+    centered = grad_probs_q - dot_q15
+    return mul(probs_q, centered)
+
+
 def layernorm_q15(
     x_q: np.ndarray,
     weight_q: np.ndarray,

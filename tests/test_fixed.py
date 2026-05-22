@@ -205,6 +205,30 @@ def test_softmax_q15_deterministic():
     assert np.array_equal(out1, out2)
 
 
+def test_softmax_backward_q15_matches_torch():
+    """Softmax backward should track PyTorch autograd."""
+    import torch
+    import torch.nn.functional as F
+
+    rng = np.random.default_rng(17)
+    logits = rng.normal(size=(5, 32)).astype(np.float64)
+    grad_probs = rng.normal(size=(5, 32)).astype(np.float64) * 0.03
+
+    logits_t = torch.tensor(logits, dtype=torch.float64, requires_grad=True)
+    probs_t = F.softmax(logits_t, dim=-1)
+    probs_t.backward(torch.tensor(grad_probs, dtype=torch.float64))
+    expected = logits_t.grad.detach().numpy()
+
+    probs_q = fixed.softmax_q15(fixed.quantize(logits))
+    got = fixed.dequantize(
+        fixed.softmax_backward_q15(probs_q, fixed.quantize(grad_probs))
+    )
+
+    assert np.max(np.abs(got - expected)) < 0.001
+    # Softmax-logit gradients sum to zero per row.
+    assert np.max(np.abs(got.sum(axis=-1))) < 0.001
+
+
 def test_layernorm_q15_matches_float():
     """LayerNorm in Q15 matches PyTorch's nn.LayerNorm within ~0.5%."""
     rng = np.random.default_rng(10)
