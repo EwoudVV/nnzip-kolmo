@@ -64,6 +64,22 @@ def test_fixed_point_roundtrip_exercises_kv_cache(monkeypatch):
     assert decompress(blob) == data
 
 
+def test_fixed_point_roundtrip_with_seed_prime(monkeypatch):
+    """Smoke-test the seed-warmup path in fixed mode.
+
+    Other fixed-mode tests use KOLMO_SKIP_PRIME=1 because the full seed
+    corpus takes ~3 minutes to prime in fixed-point. Shrink the corpus to
+    one block's worth so the prime runs in seconds but still exercises the
+    `_prime_model -> train_block` codepath, which is otherwise only hit by
+    PyTorch tests.
+    """
+    monkeypatch.setattr(engine, "SEED_CORPUS", b"prime me deterministically.")
+    monkeypatch.setenv("KOLMO_FIXED", "1")
+    data = b"hi"
+    blob = compress(data)
+    assert decompress(blob) == data
+
+
 def test_roundtrip_repeated():
     data = b"abc" * 30  # 90 bytes, very predictable
     blob = compress(data)
