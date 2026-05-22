@@ -254,6 +254,33 @@ def test_linear_q15_matches_float():
     assert np.max(np.abs(got - expected)) < 0.01
 
 
+def test_linear_backward_q15_matches_torch():
+    """Linear backward should track PyTorch autograd."""
+    import torch
+
+    rng = np.random.default_rng(15)
+    x = rng.normal(size=(5, 32)).astype(np.float64) * 0.3
+    w = rng.normal(size=(16, 32)).astype(np.float64) * 0.2
+    b = rng.normal(size=16).astype(np.float64) * 0.1
+    grad_y = rng.normal(size=(5, 16)).astype(np.float64) * 0.02
+
+    x_t = torch.tensor(x, dtype=torch.float64, requires_grad=True)
+    w_t = torch.tensor(w, dtype=torch.float64, requires_grad=True)
+    b_t = torch.tensor(b, dtype=torch.float64, requires_grad=True)
+    y = x_t @ w_t.T + b_t
+    y.backward(torch.tensor(grad_y, dtype=torch.float64))
+
+    grad_x, grad_w, grad_b = fixed.linear_backward_q15(
+        fixed.quantize(x),
+        fixed.quantize(w),
+        fixed.quantize(grad_y),
+    )
+
+    assert np.max(np.abs(fixed.dequantize(grad_x) - x_t.grad.numpy())) < 0.001
+    assert np.max(np.abs(fixed.dequantize(grad_w) - w_t.grad.numpy())) < 0.001
+    assert np.max(np.abs(fixed.dequantize(grad_b) - b_t.grad.numpy())) < 0.001
+
+
 def test_cross_entropy_grad_q15_matches_torch():
     """Output gradient should track PyTorch cross-entropy autograd."""
     import torch

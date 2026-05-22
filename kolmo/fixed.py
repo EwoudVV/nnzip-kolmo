@@ -432,6 +432,50 @@ def linear_q15(
     return y
 
 
+def linear_backward_q15(
+    x_q: np.ndarray,
+    weight_q: np.ndarray,
+    grad_y_q: np.ndarray,
+    has_bias: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Backward pass for `linear_q15`.
+
+    Forward is `y = x @ weight.T + bias`.
+
+    Returns `(grad_x, grad_weight, grad_bias)`, all in Q15. `grad_bias` is
+    None when has_bias=False.
+    """
+    if x_q.dtype != np.int32 or weight_q.dtype != np.int32 or grad_y_q.dtype != np.int32:
+        raise TypeError("linear_backward_q15 expects int32 inputs")
+    if x_q.ndim != 2 or grad_y_q.ndim != 2:
+        raise ValueError("linear_backward_q15 currently expects 2-D x and grad_y")
+
+    grad_x = fixed_matmul_2d(grad_y_q, weight_q)
+    grad_weight = fixed_matmul_2d(grad_y_q.T, x_q)
+    grad_bias = None
+    if has_bias:
+        # grad_y is already in Q15 and already includes mean-reduction scale.
+        # Sum over batch/time rows. Use int64 accumulator, then clamp to int32.
+        summed = grad_y_q.astype(np.int64).sum(axis=0)
+        grad_bias = np.clip(
+            summed,
+            np.iinfo(np.int32).min,
+            np.iinfo(np.int32).max,
+        ).astype(np.int32)
+    return grad_x, grad_weight, grad_bias
+
+
+def fixed_matmul_2d(a_q: np.ndarray, b_q: np.ndarray) -> np.ndarray:
+    """2-D Q15 matmul helper used by backward formulas.
+
+    This is just `matmul`, but the explicit name makes gradient equations read
+    like linear algebra while keeping shape constraints clear.
+    """
+    if a_q.ndim != 2 or b_q.ndim != 2:
+        raise ValueError("fixed_matmul_2d expects 2-D inputs")
+    return matmul(a_q, b_q)
+
+
 def cross_entropy_grad_q15(logits_q: np.ndarray, targets: np.ndarray) -> np.ndarray:
     """Gradient of mean cross-entropy loss w.r.t. logits, in Q15.
 
