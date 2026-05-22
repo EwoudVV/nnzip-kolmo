@@ -116,6 +116,23 @@ def sub(a_q: np.ndarray, b_q: np.ndarray) -> np.ndarray:
     return a_q - b_q
 
 
+# Per-element Python isqrt via numpy ufunc. Faster than vectorized Newton on
+# small arrays because it skips the per-iteration numpy overhead — the limit
+# becomes Python's bigint isqrt (C-level, ~50ns per call) rather than numpy's
+# vectorized div + where (~50us per iteration regardless of array size).
+# Stays bit-deterministic: math.isqrt is defined to return floor(sqrt(n))
+# exactly on any conforming Python.
+import math  # noqa: E402
+
+_isqrt_ufunc = np.frompyfunc(math.isqrt, 1, 1)
+
+# Empirical crossover from /tmp/bench_isqrt.py: below ~2K elements the ufunc
+# is faster; above that, vectorized Newton wins. Most kolmo isqrt calls are
+# LayerNorm rows (d_model = 256 to 4*d_model = 1024), so the ufunc path
+# handles the common case.
+_ISQRT_UFUNC_THRESHOLD = 2048
+
+
 def _bit_length_int64(x: np.ndarray) -> np.ndarray:
     """Vectorized integer bit-length for non-negative int64 values.
 
@@ -156,6 +173,11 @@ def isqrt_vec(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=np.int64)
     if np.any(x < 0):
         raise ValueError("isqrt_vec requires non-negative integers")
+
+    # Small arrays: per-element math.isqrt via ufunc is faster than vectorized
+    # Newton because numpy's per-iteration overhead dominates at small sizes.
+    if x.size < _ISQRT_UFUNC_THRESHOLD:
+        return _isqrt_ufunc(x).astype(np.int64)
 
     # Seed: 2^ceil(bit_length(x) / 2). Always >= sqrt(x), and at most
     # ~sqrt(2)*sqrt(x). For x = 0 we override to 0 after the loop anyway.
