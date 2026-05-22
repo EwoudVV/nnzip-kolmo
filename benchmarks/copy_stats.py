@@ -20,9 +20,8 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 
 from kolmo._engine import (  # noqa: E402
-    COPY_MIN,
     COPY_WINDOW,
-    find_copy,
+    RollingCopyMatcher,
     length_probs,
     offset_probs,
 )
@@ -93,30 +92,20 @@ def build_long_corpus() -> bytes:
 
 
 def gather_events(data: bytes, window: int) -> list[tuple[int, int]]:
-    """Replay find_copy over data, simulating a given window. Returns (offset,
-    length) events."""
-    import kolmo._engine as engine
-
-    old_window = engine.COPY_WINDOW
-    engine.COPY_WINDOW = window
-    try:
-        history = bytearray()
-        events = []
-        pos = 0
-        while pos < len(data):
-            copy = find_copy(data, pos, bytes(history))
-            if copy is None:
-                history.append(data[pos])
-                pos += 1
-                continue
-            offset, length = copy
-            events.append((offset, length))
-            chunk = data[pos : pos + length]
-            history.extend(chunk)
-            pos += length
-        return events
-    finally:
-        engine.COPY_WINDOW = old_window
+    """Replay the compressor's rolling matcher, returning (offset, length)
+    events."""
+    matcher = RollingCopyMatcher(data, window=window)
+    events = []
+    pos = 0
+    while pos < len(data):
+        copy = matcher.find(pos)
+        if copy is None:
+            pos += 1
+            continue
+        offset, length = copy
+        events.append((offset, length))
+        pos += length
+    return events
 
 
 def offset_bin(offset: int) -> str:
@@ -156,7 +145,7 @@ def main() -> None:
 
     print(f"short corpus: {len(short):,}B   long corpus: {len(long_corp):,}B")
 
-    for window in [4096, 8192, 16384]:
+    for window in [8192, 16384, 65536]:
         print(f"\n=== window={window}B ===")
         for n in [4096, 8192]:
             if n <= len(short):

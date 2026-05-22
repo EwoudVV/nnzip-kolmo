@@ -9,6 +9,7 @@ only done once per block.
 """
 
 import os
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -30,9 +31,10 @@ CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # bytes between optimizer steps
 BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
-COPY_WINDOW = 8192
+COPY_WINDOW = 65536
 COPY_MIN = 8
 COPY_MAX = 256
+COPY_CANDIDATES = 64
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
@@ -96,7 +98,7 @@ SEED_CORPUS = (
     b"Alice: Then we need a better prior, a longer context, or an explicit "
     b"copy mechanism for repeated text.\n"
     b"Ben: We already have a copy mechanism. It catches matches above eight "
-    b"bytes within an eight-kilobyte window.\n\n"
+    b"bytes within a sixty-four-kilobyte window.\n\n"
 
     # Markdown — lists, code, emphasis.
     b"# Notes on the build\n\n"
@@ -609,3 +611,101 @@ def find_copy(data: bytes, pos: int, known: bytes | bytearray) -> tuple[int, int
     if best_len < COPY_MIN:
         return None
     return best_offset, best_len
+
+
+class RollingCopyMatcher:
+    """Fast LZ-style matcher for the compressor.
+
+    The old compressor called `find_copy(data, pos, copy_history)` at every
+    position, and `find_copy` searched the current window with repeated
+    `rfind` calls. That is fine for tiny files but too expensive for big ones.
+
+    This matcher indexes COPY_MIN-byte keys by absolute position as soon as
+    those bytes are known. At probe time it only checks positions with the same
+    8-byte key, newest first, and caps the candidate chain. This is the same
+    broad shape as practical LZ compressors: hash lookup first, byte compare
+    only for plausible candidates.
+    """
+
+    def __init__(
+        self,
+        data: bytes,
+        *,
+        window: int = COPY_WINDOW,
+        max_candidates: int = COPY_CANDIDATES,
+    ) -> None:
+        self.data = data
+        self.window = window
+        self.max_candidates = max_candidates
+        self._index: defaultdict[bytes, deque[int]] = defaultdict(deque)
+        self._indexed_positions: deque[tuple[int, bytes]] = deque()
+        self._next_index_pos = 0
+
+    def _index_known_prefix(self, pos: int) -> None:
+        """Index every COPY_MIN-byte key fully known before `pos`."""
+        limit = min(pos - COPY_MIN + 1, len(self.data) - COPY_MIN + 1)
+        while self._next_index_pos < limit:
+            start = self._next_index_pos
+            key = self.data[start : start + COPY_MIN]
+            self._index[key].append(start)
+            self._indexed_positions.append((start, key))
+            self._next_index_pos += 1
+
+    def _prune_old(self, pos: int) -> None:
+        min_start = pos - self.window
+        while self._indexed_positions and self._indexed_positions[0][0] < min_start:
+            old_start, key = self._indexed_positions.popleft()
+            candidates = self._index.get(key)
+            if not candidates:
+                continue
+            if candidates[0] == old_start:
+                candidates.popleft()
+            if not candidates:
+                del self._index[key]
+
+    def find(self, pos: int) -> tuple[int, int] | None:
+        remaining = len(self.data) - pos
+        if remaining < COPY_MIN:
+            return None
+
+        self._index_known_prefix(pos)
+        self._prune_old(pos)
+        key = self.data[pos : pos + COPY_MIN]
+        candidates = self._index.get(key)
+        if not candidates:
+            return None
+
+        min_start = pos - self.window
+        while candidates and candidates[0] < min_start:
+            candidates.popleft()
+        if not candidates:
+            return None
+
+        best_offset = 0
+        best_len = 0
+        checked = 0
+        for start in reversed(candidates):
+            offset = pos - start
+            if offset <= 0 or offset > self.window:
+                continue
+            # Non-overlapping copy: the copied span can't read bytes that are
+            # being produced by this same copy event.
+            max_len = min(COPY_MAX, remaining, offset)
+            length = COPY_MIN
+            while (
+                length < max_len
+                and self.data[start + length] == self.data[pos + length]
+            ):
+                length += 1
+            if length > best_len:
+                best_offset = offset
+                best_len = length
+                if best_len == COPY_MAX:
+                    break
+            checked += 1
+            if checked >= self.max_candidates:
+                break
+
+        if best_len < COPY_MIN:
+            return None
+        return best_offset, best_len

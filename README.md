@@ -88,7 +88,7 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 - **Stable initialization** (`stable_init.py`): a custom SplitMix64 PRNG fills weights so two different PyTorch versions / OSes get the same starting bytes. PyTorch's `manual_seed` is reproducible per-platform but not across platforms; this is.
 - **Weight tying**: the `(vocab, d_model)` token embedding and the `(d_model, vocab)` output head share one matrix. Standard modern-LM trick; ~65 K parameters dropped from a ~2 M total, and gradients from either side improve the shared tensor.
 - **Sliding-window KV cache** (PyTorch and fixed mode both): per-byte inference cost drops from O(T²) to O(T) where T is the context length. The fixed-mode cache is bit-identical to running `fixed_forward` over the same history — proven by a test that compares warm + step against full forward at the bit level.
-- **Adaptive copy / event / length models**: small Bayesian distributions for the LZ-style copy mechanism. Both sides update them in lockstep so the distributions stay synced without storing state in the blob.
+- **Rolling-hash copy matcher + adaptive copy models**: the compressor indexes 8-byte keys in a bounded 64 KB window, then encodes `(offset, length)` copy events with adaptive offset / length / event-flag distributions. The decoder only needs to replay the encoded copies; both sides update the adaptive distributions in lockstep.
 - **Deterministic-quantized probabilities** (`det_probs.py`): logits are snapped to a 1/64 grid and converted to integer frequencies on a `2^16` total before they touch the arithmetic coder. This isolates the coder from any residual float drift in PyTorch mode.
 
 ## Speed (May 2026)
