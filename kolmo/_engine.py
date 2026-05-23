@@ -53,7 +53,12 @@ BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
 COPY_WINDOW = 65536
 COPY_MIN = 8
-COPY_MAX = 256
+# COPY_MAX=256 was capping ~75% of copy bytes at the ceiling on 16KB English
+# (27 of 29 saturated copies in the structural-repetition regime). Bumping to
+# 1024 lets long Wikipedia-style template / citation / header blocks collapse
+# into a single copy event instead of N adjacent 256-length copies, each
+# paying its own event flag + offset + length header.
+COPY_MAX = 1024
 COPY_CANDIDATES = 64
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
