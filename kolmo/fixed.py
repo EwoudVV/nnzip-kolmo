@@ -71,20 +71,48 @@ def dequantize(x_q: np.ndarray) -> np.ndarray:
     return x_q.astype(np.float64) / SCALE
 
 
+# Safe magnitude bound for float64 matmul (see matmul() docstring).
+# 2**21 = 2097152 ≈ 64 * SCALE — values up to Q15(64.0) keep all matmul
+# accumulations exactly representable in float64's 53-bit mantissa.
+_FLOAT_MATMUL_SAFE_MAX = 1 << 21
+
+
 def matmul(a_q: np.ndarray, b_q: np.ndarray) -> np.ndarray:
     """Q15 matmul: a_q @ b_q, returning Q15.
 
     a_q is (..., M, K) int32 in Q15. b_q is (..., K, N) int32 in Q15.
     Result is (..., M, N) int32 in Q15.
 
-    Uses int64 accumulators to avoid overflow. NumPy's @ operator handles
-    int64 matmul via BLAS — that's deterministic for integers regardless of
-    threading because integer addition is associative.
+    Uses float64 BLAS when inputs are safely bounded, falling back to int64
+    otherwise. The float64 path is ~10-100x faster (vectorized BLAS) and is
+    bit-identical to the int64 path under one condition: every product +
+    every accumulated sum must fit exactly in float64's 53-bit mantissa.
+
+    For inputs bounded by |x| <= 2**21 and inner dim k <= 2**11 (8192),
+    each product is <= 2**42 and each sum is <= 2**42 * 2**11 = 2**53.
+    Exact representation means no rounding happens during accumulation,
+    so reordering (SIMD, threading, BLAS implementation) does not change
+    the result. Cross-machine determinism is preserved.
+
+    Above the safe bound, fall back to the int64 path which is deterministic
+    by virtue of integer addition being associative.
     """
     if a_q.dtype != np.int32 or b_q.dtype != np.int32:
         raise TypeError(f"matmul expects int32 inputs, got {a_q.dtype}, {b_q.dtype}")
-    acc = a_q.astype(np.int64) @ b_q.astype(np.int64)
-    # Round-to-nearest before shift (instead of floor):
+    # Tiny inputs: BLAS overhead loses; just int64.
+    if a_q.size < 128 or b_q.size < 128:
+        acc = a_q.astype(np.int64) @ b_q.astype(np.int64)
+    else:
+        a_max = int(np.abs(a_q).max(initial=0))
+        b_max = int(np.abs(b_q).max(initial=0))
+        k = a_q.shape[-1]
+        # Worst-case sum bound: k * a_max * b_max. Must fit in 2**53.
+        if a_max <= _FLOAT_MATMUL_SAFE_MAX and b_max <= _FLOAT_MATMUL_SAFE_MAX and \
+           k * a_max * b_max <= (1 << 53):
+            prod_f = a_q.astype(np.float64) @ b_q.astype(np.float64)
+            acc = prod_f.astype(np.int64)
+        else:
+            acc = a_q.astype(np.int64) @ b_q.astype(np.int64)
     rounded = (acc + ROUND_OFFSET) >> SCALE_BITS
     return rounded.astype(np.int32)
 
