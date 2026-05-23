@@ -80,3 +80,109 @@ def test_isqrt_pure_numpy_fallback_matches_numba(monkeypatch):
     fallback_out = fixed.isqrt_vec(xs)
 
     assert np.array_equal(numba_out, fallback_out)
+
+
+def test_numba_round_div_matches_pure_numpy_fallback(monkeypatch):
+    """_round_div_int64 is easy to get subtly wrong for negatives because
+    Python floor division goes toward -inf. Verify the numba hot path
+    preserves the pure reference exactly across several divisors.
+    """
+    from kolmo import _kernels, fixed
+
+    if not _kernels.HAS_NUMBA:
+        pytest.skip("numba not installed")
+
+    rng = np.random.default_rng(17)
+    values = rng.integers(
+        -(1 << 44),
+        1 << 44,
+        size=4096,
+        dtype=np.int64,
+    )
+    # Add hand-picked values around zero and half-divisor boundaries.
+    values = np.concatenate([
+        values,
+        np.array([-100, -99, -51, -50, -49, -5, -4, -3, -2, -1, 0,
+                  1, 2, 3, 4, 5, 49, 50, 51, 99, 100], dtype=np.int64),
+    ])
+
+    for divisor in (1, 2, 3, 10, 32768, 99991):
+        numba_out = _kernels._round_div_int64_numba(
+            np.ascontiguousarray(values),
+            np.int64(divisor),
+        )
+        monkeypatch.setattr(_kernels, "HAS_NUMBA", False)
+        fallback_out = fixed._round_div_int64(values, divisor)
+        monkeypatch.setattr(_kernels, "HAS_NUMBA", True)
+        assert np.array_equal(numba_out, fallback_out)
+
+
+def test_numba_exp_q15_matches_pure_numpy_fallback(monkeypatch):
+    """The Q15 exp kernel is used inside softmax/GELU, so exact byte
+    identity matters. Compare numba against the pure-numpy reference over
+    the practical range softmax sees after subtracting max logits.
+    """
+    from kolmo import _kernels, fixed
+
+    if not _kernels.HAS_NUMBA:
+        pytest.skip("numba not installed")
+
+    rng = np.random.default_rng(19)
+    random_values = rng.integers(
+        -30 * fixed.SCALE,
+        10 * fixed.SCALE,
+        size=8192,
+        dtype=np.int32,
+    )
+    boundary_values = np.array([
+        -40 * fixed.SCALE,
+        -31 * fixed.SCALE,
+        -30 * fixed.SCALE,
+        -10 * fixed.SCALE,
+        -fixed.LN2_Q15 - 1,
+        -fixed.LN2_Q15,
+        -fixed.LN2_Q15 + 1,
+        -1,
+        0,
+        1,
+        fixed.LN2_Q15 - 1,
+        fixed.LN2_Q15,
+        fixed.LN2_Q15 + 1,
+        4 * fixed.SCALE,
+        10 * fixed.SCALE,
+    ], dtype=np.int32)
+    values = np.concatenate([random_values, boundary_values])
+
+    numba_out = _kernels._exp_q15_numba(
+        np.ascontiguousarray(values),
+        np.int64(fixed.LN2_Q15),
+        fixed._INV_FACT_Q15,
+        np.int64(fixed.SCALE_BITS),
+    )
+    monkeypatch.setattr(_kernels, "HAS_NUMBA", False)
+    fallback_out = fixed.exp_q15(values)
+    monkeypatch.setattr(_kernels, "HAS_NUMBA", True)
+
+    assert np.array_equal(numba_out, fallback_out)
+
+
+def test_exp_and_round_div_dispatch_match_fallback(monkeypatch):
+    """Top-level fixed.py helpers should produce the same values whether
+    they dispatch to numba or fall back to numpy.
+    """
+    from kolmo import _kernels, fixed
+
+    rng = np.random.default_rng(23)
+    values = rng.integers(-20 * fixed.SCALE, 5 * fixed.SCALE, size=1024,
+                          dtype=np.int32)
+    div_values = rng.integers(-(1 << 40), 1 << 40, size=1024, dtype=np.int64)
+
+    exp_numba = fixed.exp_q15(values)
+    div_numba = fixed._round_div_int64(div_values, 32768)
+
+    monkeypatch.setattr(_kernels, "HAS_NUMBA", False)
+    exp_fallback = fixed.exp_q15(values)
+    div_fallback = fixed._round_div_int64(div_values, 32768)
+
+    assert np.array_equal(exp_numba, exp_fallback)
+    assert np.array_equal(div_numba, div_fallback)

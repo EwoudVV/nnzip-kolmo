@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from kolmo import _kernels
+
 # Q15 scale: shifting an integer left by SCALE_BITS converts it to fixed-point;
 # shifting right brings it back. We choose 15 so int32 holds values up to
 # 2^16 = 65536 in magnitude with 2^-15 ≈ 3e-5 resolution.
@@ -51,6 +53,13 @@ def _round_div_int64(values: np.ndarray, divisor: int) -> np.ndarray:
     if divisor <= 0:
         raise ValueError("divisor must be positive")
     values = np.asarray(values, dtype=np.int64)
+
+    if _kernels.HAS_NUMBA:
+        return _kernels._round_div_int64_numba(
+            np.ascontiguousarray(values),
+            np.int64(divisor),
+        )
+
     signs = np.where(values >= 0, 1, -1)
     rounded = (np.abs(values) + (divisor // 2)) // divisor
     return signs * rounded
@@ -213,9 +222,8 @@ def isqrt_vec(x: np.ndarray) -> np.ndarray:
     # Fast path: numba-JIT'd integer Newton. 3-7x faster than the vectorized
     # numpy version across all sizes. Bit-identical output (pure int64 math).
     # Falls back to the pure-numpy path below if numba isn't available.
-    from kolmo._kernels import HAS_NUMBA, _isqrt_vec_numba  # avoid circular imports
-    if HAS_NUMBA:
-        return _isqrt_vec_numba(np.ascontiguousarray(x))
+    if _kernels.HAS_NUMBA:
+        return _kernels._isqrt_vec_numba(np.ascontiguousarray(x))
 
     # Small arrays: per-element math.isqrt via ufunc is faster than vectorized
     # Newton because numpy's per-iteration overhead dominates at small sizes.
@@ -321,6 +329,14 @@ def exp_q15(x_q: np.ndarray) -> np.ndarray:
     """
     if x_q.dtype != np.int32:
         raise TypeError("exp_q15 expects int32")
+
+    if _kernels.HAS_NUMBA:
+        return _kernels._exp_q15_numba(
+            np.ascontiguousarray(x_q),
+            np.int64(LN2_Q15),
+            _INV_FACT_Q15,
+            np.int64(SCALE_BITS),
+        )
 
     x = x_q.astype(np.int64)
 
