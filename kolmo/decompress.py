@@ -9,7 +9,6 @@ the model and train every BLOCK_SIZE bytes.
 import struct
 
 from kolmo._engine import (
-    BLOCK_SIZE,
     BOS,
     COPY_MAX,
     COPY_MIN,
@@ -21,6 +20,7 @@ from kolmo._engine import (
     new_model_and_optimizer,
     step_cache,
     train_block,
+    training_block_size_at,
     update_history,
     warm_cache,
 )
@@ -43,6 +43,7 @@ def decompress(blob: bytes) -> bytes:
     history = [BOS]
     copy_history = bytearray()
     pending: list[int] = []
+    bytes_trained_through = 0
     output = bytearray()
     probs = None
     caches = None
@@ -50,10 +51,13 @@ def decompress(blob: bytes) -> bytes:
 
     def train_pending_if_full():
         nonlocal history, pending, probs, caches, pos_offset
-        if len(pending) != BLOCK_SIZE:
+        nonlocal bytes_trained_through
+        threshold = training_block_size_at(bytes_trained_through)
+        if len(pending) < threshold:
             return
         train_block(model, optimizer, history, pending)
         history = update_history(history, pending)
+        bytes_trained_through += len(pending)
         pending = []
         probs = None
         caches = None

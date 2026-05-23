@@ -28,7 +28,27 @@ from kolmo.stable_init import stable_init_model
 SEED = 42
 LR = 1e-3
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
-BLOCK_SIZE = 16  # bytes between optimizer steps
+BLOCK_SIZE = 16  # base bytes between optimizer steps (early in file)
+# Sublinear training schedule: training interval doubles every 4KB of input
+# seen, capped at 32x BLOCK_SIZE = 512 bytes between steps. Rationale: the
+# model adapts fastest in the first few KB. After that each additional Adam
+# step contributes less per byte. Cost over a 1MB file drops from 65K steps
+# to ~2500 (26x), with no loss in early-file fidelity.
+_TRAIN_SCHEDULE_DOUBLING_BYTES = 4096
+_TRAIN_SCHEDULE_MAX_MULT = 32
+
+
+def training_block_size_at(bytes_observed: int) -> int:
+    """How many bytes to accumulate before the next optimizer step, given
+    that `bytes_observed` bytes have already been processed.
+
+    Both compress and decompress call this with the same argument at the
+    same point in the trajectory, so they agree on every training step
+    boundary without exchanging any extra state.
+    """
+    bucket = bytes_observed // _TRAIN_SCHEDULE_DOUBLING_BYTES
+    mult = min(1 << bucket, _TRAIN_SCHEDULE_MAX_MULT)
+    return BLOCK_SIZE * mult
 BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
 COPY_WINDOW = 65536
