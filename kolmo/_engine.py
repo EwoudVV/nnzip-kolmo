@@ -27,6 +27,12 @@ from kolmo.stable_init import stable_init_model
 
 SEED = 42
 LR = 1e-3
+# Linear warmup ramps LR from 0 to LR over the first N optimizer steps.
+# Bigger models need this — without warmup, Adam's first few steps with
+# zero-initialized m/v moments cause large updates that can destabilize
+# training (a known problem at d_model >= ~384). 100 steps ≈ the first
+# 1600 bytes of input, well before any training-block-size doubling.
+LR_WARMUP_STEPS = 100
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # base bytes between optimizer steps (early in file)
 # Sublinear training schedule: training interval doubles every 4KB of input
@@ -674,6 +680,17 @@ def train_block(
     loss = F.cross_entropy(block_logits, targets)
     optimizer.zero_grad()
     loss.backward()
+    # Linear LR warmup. Stored on the optimizer (no separate counter).
+    step_num = getattr(optimizer, "_kolmo_step", 0) + 1
+    optimizer._kolmo_step = step_num
+    if step_num <= LR_WARMUP_STEPS:
+        warm = step_num / LR_WARMUP_STEPS
+        for g in optimizer.param_groups:
+            g["lr"] = LR * warm
+    elif step_num == LR_WARMUP_STEPS + 1:
+        # Pin to base LR exactly once after warmup completes.
+        for g in optimizer.param_groups:
+            g["lr"] = LR
     optimizer.step()
     # Historical note: this used to round gradients to 1/8192 and Adam state
     # to 1/16384 to make cross-machine PyTorch produce identical updates. The

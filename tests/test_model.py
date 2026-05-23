@@ -20,11 +20,11 @@ def test_forward_returns_logits_with_expected_shape():
 def test_param_count_is_in_target_range():
     """Default config should land near 3.3M parameters.
 
-    Previously this asserted 5-12M because max_context defaulted to 16384,
-    making pos_emb a 4.2M-param tensor — most of it dead weight Adam still
-    updated every step. The new default max_context=512 brings pos_emb down
-    to ~131K. Bulk of remaining params is the 4 transformer blocks
-    (~800K each via FFN's 4*d_model expansion).
+    Tried scaling to d_model=384 n_layers=6 (~10M params); ratio benefit
+    at 1-4KB was negligible (-0.0 to -0.4 pp), and the model was 2.6x
+    slower. Reverted: bigger model wins only with bigger data. Will revisit
+    after Cython kernels + RoPE let us test at scales where scaling
+    actually pays off.
     """
     model = KolmoTransformer()
     n = model.num_parameters()
