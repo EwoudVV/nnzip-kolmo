@@ -39,7 +39,15 @@ ROUND_OFFSET: int = 1 << (SCALE_BITS - 1)  # add this before shifting → round,
 
 
 def _round_div_int64(values: np.ndarray, divisor: int) -> np.ndarray:
-    """Round signed int64 values divided by a positive integer."""
+    """Round signed int64 values divided by a positive integer.
+
+    Round-half-away-from-zero. The seemingly natural "shift by sign(v)*half"
+    rewrite is WRONG for negative values because Python's floor div goes
+    toward -infinity, not toward zero — so e.g. `(-5) // 4 = -2`, but
+    round(-0.75) under half-away-from-zero should be -1. The `abs+sign`
+    formulation below sidesteps the floor semantics by always doing the
+    division on a positive quantity.
+    """
     if divisor <= 0:
         raise ValueError("divisor must be positive")
     values = np.asarray(values, dtype=np.int64)
