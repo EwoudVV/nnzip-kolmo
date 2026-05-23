@@ -24,6 +24,10 @@ dependencies = [
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
+# numba accelerates the fixed-point hot kernels (isqrt_vec, exp_q15, etc.)
+# 3-7x via JIT compile. Optional — kolmo falls back to pure-numpy if
+# numba isn't installed, with identical output but slower execution.
+fast = ["numba>=0.60"]
 
 [project.scripts]
 kolmo = "kolmo.__main__:main"
