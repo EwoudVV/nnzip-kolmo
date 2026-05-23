@@ -25,6 +25,7 @@ def fixed_train_block(
     n_layers: int = 4,
     context: int = 256,
     tied_params: list[tuple[str, str]] | None = None,
+    use_rope: bool = False,
 ) -> FixedAdamState:
     """Train fixed-point weights on one compressor block, in-place.
 
@@ -59,6 +60,7 @@ def fixed_train_block(
         weights,
         n_heads=n_heads,
         n_layers=n_layers,
+        use_rope=use_rope,
     )
 
     # Sum tied gradients into their canonical entry, drop the alias gradient

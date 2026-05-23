@@ -23,7 +23,7 @@ import math
 import numpy as np
 
 from kolmo import fixed
-from kolmo.fixed_model import _block_weights
+from kolmo.fixed_model import _apply_rope_q15, _block_weights
 
 
 def _attention_warm_q15(
@@ -31,6 +31,9 @@ def _attention_warm_q15(
     qkv_w_q: np.ndarray,
     proj_w_q: np.ndarray,
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Full-sequence causal attention that also exposes K/V for caching.
 
@@ -46,6 +49,11 @@ def _attention_warm_q15(
     q = qkv[:, 0].transpose(1, 0, 2)  # (H, T, d_head)
     k = qkv[:, 1].transpose(1, 0, 2)
     v = qkv[:, 2].transpose(1, 0, 2)
+    if rope_cos_q is not None:
+        if position_ids is None or rope_sin_q is None:
+            raise ValueError("RoPE attention requires position_ids and sin table")
+        q = _apply_rope_q15(q, rope_cos_q, rope_sin_q, position_ids)
+        k = _apply_rope_q15(k, rope_cos_q, rope_sin_q, position_ids)
 
     scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
     mask = np.triu(np.ones((T, T), dtype=bool), k=1)
@@ -70,6 +78,9 @@ def _attention_step_q15(
     k_cache: np.ndarray,
     v_cache: np.ndarray,
     n_heads: int,
+    position_id: int | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Single-token causal attention against cached K/V.
 
@@ -87,6 +98,12 @@ def _attention_step_q15(
     q = qkv[:, 0].transpose(1, 0, 2)  # (H, 1, d_head)
     k_new = qkv[:, 1].transpose(1, 0, 2)
     v_new = qkv[:, 2].transpose(1, 0, 2)
+    if rope_cos_q is not None:
+        if position_id is None or rope_sin_q is None:
+            raise ValueError("RoPE attention requires position_id and sin table")
+        pos = np.array([position_id], dtype=np.int64)
+        q = _apply_rope_q15(q, rope_cos_q, rope_sin_q, pos)
+        k_new = _apply_rope_q15(k_new, rope_cos_q, rope_sin_q, pos)
 
     if k_cache.size == 0:
         k_full = k_new
@@ -111,6 +128,9 @@ def _block_warm_q15(
     x_q: np.ndarray,
     weights: dict[str, np.ndarray],
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """One pre-norm transformer block, full sequence, returning the layer's KV."""
     h = fixed.layernorm_q15(x_q, weights["ln1.weight"], weights["ln1.bias"])
@@ -119,6 +139,9 @@ def _block_warm_q15(
         weights["attn.qkv.weight"],
         weights["attn.proj.weight"],
         n_heads,
+        position_ids=position_ids,
+        rope_cos_q=rope_cos_q,
+        rope_sin_q=rope_sin_q,
     )
     x_q = fixed.add(x_q, attn_out)
 
@@ -134,6 +157,9 @@ def _block_step_q15(
     weights: dict[str, np.ndarray],
     layer_cache: dict[str, np.ndarray],
     n_heads: int,
+    position_id: int | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """One pre-norm transformer block, single new token, using cached KV."""
     h = fixed.layernorm_q15(x_new_q, weights["ln1.weight"], weights["ln1.bias"])
@@ -144,6 +170,9 @@ def _block_step_q15(
         layer_cache["k"],
         layer_cache["v"],
         n_heads,
+        position_id=position_id,
+        rope_cos_q=rope_cos_q,
+        rope_sin_q=rope_sin_q,
     )
     x_new_q = fixed.add(x_new_q, attn_out)
 
@@ -160,6 +189,7 @@ def fixed_warm(
     n_heads: int = 8,
     n_layers: int = 4,
     pos_offset: int = 0,
+    use_rope: bool = False,
 ) -> tuple[np.ndarray, list[dict[str, np.ndarray]]]:
     """Full-sequence forward that populates a fresh KV cache.
 
@@ -172,15 +202,27 @@ def fixed_warm(
     T = len(input_ids)
     positions = np.arange(pos_offset, pos_offset + T, dtype=np.int64)
 
-    h = fixed.add(
-        weights["token_emb.weight"][input_ids],
-        weights["pos_emb.weight"][positions],
-    )
+    if use_rope:
+        h = weights["token_emb.weight"][input_ids]
+        rope_cos_q = weights["rope.cos"]
+        rope_sin_q = weights["rope.sin"]
+    else:
+        h = fixed.add(
+            weights["token_emb.weight"][input_ids],
+            weights["pos_emb.weight"][positions],
+        )
+        rope_cos_q = None
+        rope_sin_q = None
 
     caches: list[dict[str, np.ndarray]] = []
     for layer in range(n_layers):
         h, layer_cache = _block_warm_q15(
-            h, _block_weights(weights, layer), n_heads
+            h,
+            _block_weights(weights, layer),
+            n_heads,
+            position_ids=positions if use_rope else None,
+            rope_cos_q=rope_cos_q,
+            rope_sin_q=rope_sin_q,
         )
         caches.append(layer_cache)
 
@@ -202,6 +244,7 @@ def fixed_step(
     n_heads: int = 8,
     n_layers: int = 4,
     pos_offset: int = 0,
+    use_rope: bool = False,
 ) -> tuple[np.ndarray, list[dict[str, np.ndarray]]]:
     """Push one new token through every layer using the existing cache.
 
@@ -211,15 +254,28 @@ def fixed_step(
     """
     token_arr = np.array([token_id], dtype=np.int64)
     pos_arr = np.array([pos_offset], dtype=np.int64)
-    h = fixed.add(
-        weights["token_emb.weight"][token_arr],
-        weights["pos_emb.weight"][pos_arr],
-    )
+    if use_rope:
+        h = weights["token_emb.weight"][token_arr]
+        rope_cos_q = weights["rope.cos"]
+        rope_sin_q = weights["rope.sin"]
+    else:
+        h = fixed.add(
+            weights["token_emb.weight"][token_arr],
+            weights["pos_emb.weight"][pos_arr],
+        )
+        rope_cos_q = None
+        rope_sin_q = None
 
     new_caches: list[dict[str, np.ndarray]] = []
     for layer in range(n_layers):
         h, layer_cache = _block_step_q15(
-            h, _block_weights(weights, layer), caches[layer], n_heads
+            h,
+            _block_weights(weights, layer),
+            caches[layer],
+            n_heads,
+            position_id=pos_offset if use_rope else None,
+            rope_cos_q=rope_cos_q,
+            rope_sin_q=rope_sin_q,
         )
         new_caches.append(layer_cache)
 

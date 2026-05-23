@@ -65,6 +65,18 @@ def test_fixed_point_roundtrip_exercises_kv_cache(monkeypatch):
     assert decompress(blob) == data
 
 
+def test_fixed_point_roundtrip_with_rope(monkeypatch):
+    """Fixed RoPE path should stay codec-symmetric through warm, step, and
+    training invalidation just like the absolute-pos path."""
+    monkeypatch.setenv("KOLMO_FIXED", "1")
+    monkeypatch.setenv("KOLMO_USE_ROPE", "1")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    data = b"rope must stay in lockstep across fixed compress and decompress."
+    blob = compress(data)
+    assert blob.startswith(MAGIC)
+    assert decompress(blob) == data
+
+
 def test_fixed_point_roundtrip_with_seed_prime(monkeypatch):
     """Smoke-test the seed-warmup path in fixed mode.
 

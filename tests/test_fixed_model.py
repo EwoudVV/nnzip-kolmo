@@ -80,6 +80,31 @@ def test_fixed_forward_tracks_torch_argmax_on_tiny_transformer():
     assert np.corrcoef(ref.flatten(), fixed_logits.flatten())[0, 1] > 0.99999
 
 
+def test_fixed_rope_forward_has_no_pos_emb_and_is_deterministic():
+    model = KolmoTransformer(
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        max_context=128,
+        tie_weights=False,
+        use_rope=True,
+    )
+    stable_init_model(model, seed=42)
+    weights = extract_fixed_weights(model)
+    x = np.array([1, 2, 3, 100, 200, 42], dtype=np.int64)
+
+    assert "pos_emb.weight" not in weights
+    assert "rope.cos" in weights
+    assert "rope.sin" in weights
+
+    out1 = fixed_forward(x, weights, n_heads=4, n_layers=2, use_rope=True)
+    out2 = fixed_forward(x, weights, n_heads=4, n_layers=2, use_rope=True)
+
+    assert out1.shape == (6, 256)
+    assert out1.dtype == np.int32
+    assert np.array_equal(out1, out2)
+
+
 def test_attention_backward_q15_matches_torch():
     """Fixed attention backward should track PyTorch autograd."""
     import math
@@ -123,6 +148,39 @@ def test_attention_backward_q15_matches_torch():
     assert np.max(np.abs(dequantize(grad_x) - x_t.grad.numpy())) < 0.004
     assert np.max(np.abs(dequantize(grad_qkv_w) - qkv_w_t.grad.numpy())) < 0.004
     assert np.max(np.abs(dequantize(grad_proj_w) - proj_w_t.grad.numpy())) < 0.004
+
+
+def test_fixed_rope_backward_produces_expected_gradient_keys():
+    model = KolmoTransformer(
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        max_context=128,
+        tie_weights=False,
+        use_rope=True,
+    )
+    stable_init_model(model, seed=42)
+    weights = extract_fixed_weights(model)
+    input_ids = np.array([1, 2, 3, 4, 5], dtype=np.int64)
+    target_positions = np.array([1, 2, 3], dtype=np.int64)
+    targets = np.array([2, 3, 4], dtype=np.int64)
+
+    logits, grads = fixed_backward(
+        input_ids,
+        target_positions,
+        targets,
+        weights,
+        n_heads=4,
+        n_layers=2,
+        use_rope=True,
+    )
+
+    assert logits.shape == (5, 256)
+    assert "pos_emb.weight" not in grads
+    assert "rope.cos" not in grads
+    assert "rope.sin" not in grads
+    assert "token_emb.weight" in grads
+    assert "blocks.0.attn.qkv.weight" in grads
 
 
 def test_block_backward_q15_matches_torch():

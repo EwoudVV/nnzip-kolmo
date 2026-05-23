@@ -195,6 +195,7 @@ class FixedModelState:
     optimizer_state: FixedAdamState | None = None
     n_heads: int = 8
     n_layers: int = 4
+    use_rope: bool = False
     # Pairs of (canonical, alias) parameter names that share underlying
     # weights — used to sum gradients before Adam and re-alias after.
     tied_params: list[tuple[str, str]] = None  # type: ignore[assignment]
@@ -396,18 +397,13 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
     use_rope = _use_rope()
-    if use_rope and _use_fixed():
-        raise NotImplementedError(
-            "KOLMO_USE_ROPE=1 with KOLMO_FIXED=1 is not yet supported — "
-            "the fixed-point engine still uses absolute pos_emb. Run RoPE "
-            "in PyTorch mode for now (unset KOLMO_FIXED)."
-        )
     model = KolmoTransformer(use_rope=use_rope)
     stable_init_model(model, SEED)
     if _use_fixed():
         fixed_model = FixedModelState(
             weights=extract_fixed_weights(model),
             tied_params=tied_param_pairs(model),
+            use_rope=use_rope,
         )
         if not _skip_prime():
             if _load_primed_state(fixed_model, model):
@@ -544,6 +540,7 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
             n_heads=model.n_heads,
             n_layers=model.n_layers,
             pos_offset=0,
+            use_rope=model.use_rope,
         )
         # If the prime/seed history is already longer than CONTEXT, the
         # warmed cache exceeds the window — trim now so subsequent steps
@@ -581,6 +578,7 @@ def step_cache(
             n_heads=model.n_heads,
             n_layers=model.n_layers,
             pos_offset=pos_offset,
+            use_rope=model.use_rope,
         )
         if caches and caches[0]["k"].shape[1] > CONTEXT:
             caches = trim_caches(caches, CONTEXT)
@@ -672,6 +670,7 @@ def train_block(
             n_layers=model.n_layers,
             context=CONTEXT,
             tied_params=model.tied_params,
+            use_rope=model.use_rope,
         )
         return
 

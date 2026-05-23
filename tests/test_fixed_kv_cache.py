@@ -99,6 +99,42 @@ def test_fixed_step_iterated_matches_full_forward(tiny_weights):
         )
 
 
+def test_fixed_rope_warm_and_step_match_full_forward():
+    """RoPE rotates Q/K before caching; cached K must still match a full
+    forward over the same absolute positions exactly."""
+    model = KolmoTransformer(
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        max_context=128,
+        use_rope=True,
+    )
+    stable_init_model(model, seed=42)
+    weights = extract_fixed_weights(model)
+    cfg = {"n_heads": 4, "n_layers": 2, "use_rope": True}
+    history = np.array([1, 2, 3, 4], dtype=np.int64)
+    new_bytes = [11, 22, 33, 44]
+
+    last_warm, caches = fixed_warm(history, weights, **cfg)
+    last_full = fixed_forward(history, weights, **cfg)[-1]
+    assert np.array_equal(last_warm, last_full)
+
+    pos = len(history)
+    extended = history.copy()
+    for byte in new_bytes:
+        last_step, caches = fixed_step(
+            byte,
+            caches,
+            weights,
+            pos_offset=pos,
+            **cfg,
+        )
+        extended = np.append(extended, byte)
+        last_full = fixed_forward(extended, weights, **cfg)[-1]
+        assert np.array_equal(last_step, last_full)
+        pos += 1
+
+
 def test_trim_caches_preserves_tail_rows(tiny_weights):
     """Trim is a pure slice — it must keep the last `max_len` K/V rows
     untouched at the bit level, on every layer.

@@ -39,6 +39,13 @@ def extract_fixed_weights(model) -> dict[str, np.ndarray]:
         canonical = seen_ids.get(id(param))
         if canonical is not None and name not in weights:
             weights[name] = weights[canonical]
+    # RoPE cos/sin tables are buffers, not Parameters. Fixed mode needs the
+    # quantized tables so compress/decompress use the exact same rotations.
+    for name, buf in model.named_buffers():
+        if name in {"rope.cos", "rope.sin"}:
+            weights[name] = fixed.quantize(
+                buf.detach().cpu().numpy().astype(np.float64)
+            )
     return weights
 
 
@@ -78,11 +85,63 @@ def _causal_mask_q15(t: int) -> np.ndarray:
     return np.triu(np.ones((t, t), dtype=bool), k=1)
 
 
+def _combine_q15(a_q: np.ndarray, b_q: np.ndarray, sign: int = 1) -> np.ndarray:
+    """Combine two Q15 arrays as `a + sign*b` with int32 saturation."""
+    out = a_q.astype(np.int64) + sign * b_q.astype(np.int64)
+    return np.clip(out, np.iinfo(np.int32).min, np.iinfo(np.int32).max).astype(np.int32)
+
+
+def _apply_rope_q15(
+    x_q: np.ndarray,
+    cos_q: np.ndarray,
+    sin_q: np.ndarray,
+    positions: np.ndarray,
+) -> np.ndarray:
+    """Apply Q15 RoPE rotation to q/k tensors of shape (H, T, d_head)."""
+    cos = cos_q[positions][None, :, :]
+    sin = sin_q[positions][None, :, :]
+    x1 = x_q[:, :, 0::2]
+    x2 = x_q[:, :, 1::2]
+    y1 = _combine_q15(fixed.mul(x1, cos), fixed.mul(x2, sin), sign=-1)
+    y2 = _combine_q15(fixed.mul(x1, sin), fixed.mul(x2, cos), sign=1)
+    out = np.empty_like(x_q)
+    out[:, :, 0::2] = y1
+    out[:, :, 1::2] = y2
+    return out
+
+
+def _unapply_rope_grad_q15(
+    grad_q: np.ndarray,
+    cos_q: np.ndarray,
+    sin_q: np.ndarray,
+    positions: np.ndarray,
+) -> np.ndarray:
+    """Backprop through RoPE rotation.
+
+    Forward is [y1, y2] = [x1*cos - x2*sin, x1*sin + x2*cos].
+    Since this is an orthogonal rotation, backward multiplies by R^T:
+    [dx1, dx2] = [dy1*cos + dy2*sin, -dy1*sin + dy2*cos].
+    """
+    cos = cos_q[positions][None, :, :]
+    sin = sin_q[positions][None, :, :]
+    g1 = grad_q[:, :, 0::2]
+    g2 = grad_q[:, :, 1::2]
+    x1 = _combine_q15(fixed.mul(g1, cos), fixed.mul(g2, sin), sign=1)
+    x2 = _combine_q15(fixed.mul(g2, cos), fixed.mul(g1, sin), sign=-1)
+    out = np.empty_like(grad_q)
+    out[:, :, 0::2] = x1
+    out[:, :, 1::2] = x2
+    return out
+
+
 def _attention_q15(
     x_q: np.ndarray,
     qkv_w_q: np.ndarray,
     proj_w_q: np.ndarray,
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> np.ndarray:
     """Causal self-attention for a full sequence.
 
@@ -96,6 +155,11 @@ def _attention_q15(
     q = qkv[:, 0].transpose(1, 0, 2)  # (H, T, d_head)
     k = qkv[:, 1].transpose(1, 0, 2)
     v = qkv[:, 2].transpose(1, 0, 2)
+    if rope_cos_q is not None:
+        if position_ids is None or rope_sin_q is None:
+            raise ValueError("RoPE attention requires position_ids and sin table")
+        q = _apply_rope_q15(q, rope_cos_q, rope_sin_q, position_ids)
+        k = _apply_rope_q15(k, rope_cos_q, rope_sin_q, position_ids)
 
     scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
     heads = []
@@ -118,6 +182,9 @@ def _attention_forward_parts_q15(
     x_q: np.ndarray,
     qkv_w_q: np.ndarray,
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return packed attention intermediates needed for backward.
 
@@ -132,6 +199,11 @@ def _attention_forward_parts_q15(
     q = qkv[:, 0].transpose(1, 0, 2)
     k = qkv[:, 1].transpose(1, 0, 2)
     v = qkv[:, 2].transpose(1, 0, 2)
+    if rope_cos_q is not None:
+        if position_ids is None or rope_sin_q is None:
+            raise ValueError("RoPE attention requires position_ids and sin table")
+        q = _apply_rope_q15(q, rope_cos_q, rope_sin_q, position_ids)
+        k = _apply_rope_q15(k, rope_cos_q, rope_sin_q, position_ids)
 
     scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
     mask = _causal_mask_q15(T)
@@ -151,6 +223,9 @@ def _attention_backward_q15(
     proj_w_q: np.ndarray,
     grad_y_q: np.ndarray,
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Backward pass for full-sequence causal self-attention.
 
@@ -172,7 +247,14 @@ def _attention_backward_q15(
     scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
     mask = _causal_mask_q15(T)
 
-    _qkv_flat, q, k, v, attn = _attention_forward_parts_q15(x_q, qkv_w_q, n_heads)
+    _qkv_flat, q, k, v, attn = _attention_forward_parts_q15(
+        x_q,
+        qkv_w_q,
+        n_heads,
+        position_ids=position_ids,
+        rope_cos_q=rope_cos_q,
+        rope_sin_q=rope_sin_q,
+    )
     heads = np.stack([fixed.matmul(attn[h], v[h]) for h in range(n_heads)], axis=1)
     out = heads.reshape(T, D)
 
@@ -205,6 +287,12 @@ def _attention_backward_q15(
         grad_q[h] = fixed.matmul(grad_scores, k[h])
         grad_k[h] = fixed.matmul(grad_scores.T, q[h])
 
+    if rope_cos_q is not None:
+        if position_ids is None or rope_sin_q is None:
+            raise ValueError("RoPE backward requires position_ids and sin table")
+        grad_q = _unapply_rope_grad_q15(grad_q, rope_cos_q, rope_sin_q, position_ids)
+        grad_k = _unapply_rope_grad_q15(grad_k, rope_cos_q, rope_sin_q, position_ids)
+
     grad_qkv = np.zeros((T, 3, n_heads, d_head), dtype=np.int32)
     grad_qkv[:, 0] = grad_q.transpose(1, 0, 2)
     grad_qkv[:, 1] = grad_k.transpose(1, 0, 2)
@@ -224,6 +312,9 @@ def _block_q15(
     x_q: np.ndarray,
     weights: dict[str, np.ndarray],
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> np.ndarray:
     """One pre-norm transformer block."""
     h = fixed.layernorm_q15(x_q, weights["ln1.weight"], weights["ln1.bias"])
@@ -232,6 +323,9 @@ def _block_q15(
         weights["attn.qkv.weight"],
         weights["attn.proj.weight"],
         n_heads,
+        position_ids=position_ids,
+        rope_cos_q=rope_cos_q,
+        rope_sin_q=rope_sin_q,
     )
     x_q = fixed.add(x_q, h)
 
@@ -247,6 +341,9 @@ def _block_backward_q15(
     weights: dict[str, np.ndarray],
     grad_y_q: np.ndarray,
     n_heads: int,
+    position_ids: np.ndarray | None = None,
+    rope_cos_q: np.ndarray | None = None,
+    rope_sin_q: np.ndarray | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Backward pass for one pre-norm transformer block.
 
@@ -264,6 +361,9 @@ def _block_backward_q15(
         weights["attn.qkv.weight"],
         weights["attn.proj.weight"],
         n_heads,
+        position_ids=position_ids,
+        rope_cos_q=rope_cos_q,
+        rope_sin_q=rope_sin_q,
     )
     x_res = fixed.add(x_q, attn_out)
     h2 = fixed.layernorm_q15(x_res, weights["ln2.weight"], weights["ln2.bias"])
@@ -291,6 +391,9 @@ def _block_backward_q15(
         weights["attn.proj.weight"],
         grad_x_res,
         n_heads,
+        position_ids=position_ids,
+        rope_cos_q=rope_cos_q,
+        rope_sin_q=rope_sin_q,
     )
     grad_x_from_ln1, grad_ln1_w, grad_ln1_b = fixed.layernorm_backward_q15(
         x_q,
@@ -334,6 +437,7 @@ def fixed_backward(
     n_heads: int = 8,
     n_layers: int = 4,
     pos_offset: int = 0,
+    use_rope: bool = False,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """Full fixed-point forward + backward for a cross-entropy training slice.
 
@@ -355,14 +459,28 @@ def fixed_backward(
     T = len(input_ids)
     positions = np.arange(pos_offset, pos_offset + T, dtype=np.int64)
 
-    h = fixed.add(
-        weights["token_emb.weight"][input_ids],
-        weights["pos_emb.weight"][positions],
-    )
+    if use_rope:
+        h = weights["token_emb.weight"][input_ids]
+        rope_cos_q = weights["rope.cos"]
+        rope_sin_q = weights["rope.sin"]
+    else:
+        h = fixed.add(
+            weights["token_emb.weight"][input_ids],
+            weights["pos_emb.weight"][positions],
+        )
+        rope_cos_q = None
+        rope_sin_q = None
     block_inputs = []
     for layer in range(n_layers):
         block_inputs.append(h)
-        h = _block_q15(h, _block_weights(weights, layer), n_heads)
+        h = _block_q15(
+            h,
+            _block_weights(weights, layer),
+            n_heads,
+            position_ids=positions if use_rope else None,
+            rope_cos_q=rope_cos_q,
+            rope_sin_q=rope_sin_q,
+        )
 
     h_before_ln_f = h
     h_norm = fixed.layernorm_q15(h, weights["ln_f.weight"], weights["ln_f.bias"])
@@ -393,6 +511,9 @@ def fixed_backward(
             _block_weights(weights, layer),
             grad_h,
             n_heads,
+            position_ids=positions if use_rope else None,
+            rope_cos_q=rope_cos_q,
+            rope_sin_q=rope_sin_q,
         )
         prefix = f"blocks.{layer}."
         for name, grad in block_grads.items():
@@ -403,11 +524,12 @@ def fixed_backward(
         input_ids,
         grad_h,
     )
-    grads["pos_emb.weight"] = _scatter_add_rows_q15(
-        weights["pos_emb.weight"].shape,
-        positions,
-        grad_h,
-    )
+    if not use_rope:
+        grads["pos_emb.weight"] = _scatter_add_rows_q15(
+            weights["pos_emb.weight"].shape,
+            positions,
+            grad_h,
+        )
     return logits, grads
 
 
@@ -417,6 +539,7 @@ def fixed_forward(
     n_heads: int = 8,
     n_layers: int = 4,
     pos_offset: int = 0,
+    use_rope: bool = False,
 ) -> np.ndarray:
     """Fixed-point full-sequence forward.
 
@@ -428,13 +551,27 @@ def fixed_forward(
     T = len(input_ids)
     positions = np.arange(pos_offset, pos_offset + T, dtype=np.int64)
 
-    h = fixed.add(
-        weights["token_emb.weight"][input_ids],
-        weights["pos_emb.weight"][positions],
-    )
+    if use_rope:
+        h = weights["token_emb.weight"][input_ids]
+        rope_cos_q = weights["rope.cos"]
+        rope_sin_q = weights["rope.sin"]
+    else:
+        h = fixed.add(
+            weights["token_emb.weight"][input_ids],
+            weights["pos_emb.weight"][positions],
+        )
+        rope_cos_q = None
+        rope_sin_q = None
 
     for layer in range(n_layers):
-        h = _block_q15(h, _block_weights(weights, layer), n_heads)
+        h = _block_q15(
+            h,
+            _block_weights(weights, layer),
+            n_heads,
+            position_ids=positions if use_rope else None,
+            rope_cos_q=rope_cos_q,
+            rope_sin_q=rope_sin_q,
+        )
 
     h = fixed.layernorm_q15(h, weights["ln_f.weight"], weights["ln_f.bias"])
     return fixed.linear_q15(h, weights["head.weight"])
