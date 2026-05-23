@@ -1,9 +1,11 @@
 """Sanity checks on the model: shapes, parameter count, valid distribution,
 and KV-cache equivalence with a single full forward."""
 
+import pytest
 import torch
 
 from kolmo import KolmoTransformer
+from kolmo.model import GeGLUFFN
 from kolmo.stable_init import stable_init_model
 
 
@@ -97,3 +99,32 @@ def test_kv_cache_one_token_at_a_time():
         incr_logits = torch.cat(incr_logits, dim=1)
 
     assert torch.allclose(incr_logits, full_logits, atol=1e-5)
+
+
+def test_geglu_constructs_and_forwards():
+    """Opt-in GeGLU FFN should construct, forward, and produce same-shape
+    output as the default GELU FFN."""
+    torch.manual_seed(7)
+    model = KolmoTransformer(ffn_type="geglu")
+    stable_init_model(model, seed=42)
+    x = torch.randint(0, 256, (1, 16))
+    logits, _ = model(x)
+    assert logits.shape == (1, 16, 256)
+    assert isinstance(model.blocks[0].ffn, GeGLUFFN)
+
+
+def test_geglu_param_count_close_to_gelu():
+    """GeGLU's d_ff = ceil(8*d_model/3 / 32) * 32 keeps total params within
+    a few percent of the standard 4*d_model GELU FFN."""
+    gelu_model = KolmoTransformer(ffn_type="gelu")
+    geglu_model = KolmoTransformer(ffn_type="geglu")
+    g = gelu_model.num_parameters()
+    gg = geglu_model.num_parameters()
+    assert abs(gg - g) < 0.05 * g, (
+        f"GeGLU param count {gg:,} too far from GELU {g:,}"
+    )
+
+
+def test_unknown_ffn_type_rejected():
+    with pytest.raises(ValueError, match="unknown ffn_type"):
+        KolmoTransformer(ffn_type="banana")

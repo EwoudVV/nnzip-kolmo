@@ -67,17 +67,47 @@ class CausalSelfAttention(nn.Module):
         return self.proj(out), new_cache
 
 
+class GeGLUFFN(nn.Module):
+    """GeGLU feed-forward block.
+
+    Replaces the standard `Linear -> GELU -> Linear` FFN with a gated
+    variant: `Linear -> (GELU(gate) * up) -> Linear`. Modern best practice
+    (LLaMA, PaLM, etc.) — typically gives 1-3% better ratio on text at
+    small model sizes for roughly the same parameter count and compute.
+
+    The intermediate dim is `8 * d_model / 3` (rounded to a multiple of
+    32) so that the three linear projections together have ~the same
+    param count as the original two projections at 4 * d_model.
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        d_ff = ((d_model * 8 + 32 * 3 - 1) // (3 * 32)) * 32
+        self.gate = nn.Linear(d_model, d_ff)
+        self.up = nn.Linear(d_model, d_ff)
+        self.down = nn.Linear(d_ff, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down(F.gelu(self.gate(x)) * self.up(x))
+
+
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int, n_heads: int):
+    def __init__(self, d_model: int, n_heads: int, ffn_type: str = "gelu"):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads)
         self.ln2 = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
-            nn.GELU(),
-            nn.Linear(4 * d_model, d_model),
-        )
+        if ffn_type == "geglu":
+            self.ffn = GeGLUFFN(d_model)
+        elif ffn_type == "gelu":
+            self.ffn = nn.Sequential(
+                nn.Linear(d_model, 4 * d_model),
+                nn.GELU(),
+                nn.Linear(4 * d_model, d_model),
+            )
+        else:
+            raise ValueError(f"unknown ffn_type: {ffn_type!r}")
+        self.ffn_type = ffn_type
 
     def forward(self, x: torch.Tensor, kv_cache: dict | None = None):
         h, new_cache = self.attn(self.ln1(x), kv_cache)
@@ -101,17 +131,20 @@ class KolmoTransformer(nn.Module):
         # of rows were dead weight — Adam still spent 30% of its time
         # updating them every step.
         tie_weights: bool = True,
+        ffn_type: str = "gelu",
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         self.max_context = max_context
         self.tie_weights = tie_weights
+        self.ffn_type = ffn_type
 
         self.token_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(max_context, d_model)
         self.blocks = nn.ModuleList(
-            [TransformerBlock(d_model, n_heads) for _ in range(n_layers)]
+            [TransformerBlock(d_model, n_heads, ffn_type=ffn_type)
+             for _ in range(n_layers)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
