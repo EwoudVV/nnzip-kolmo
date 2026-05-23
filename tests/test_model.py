@@ -128,3 +128,56 @@ def test_geglu_param_count_close_to_gelu():
 def test_unknown_ffn_type_rejected():
     with pytest.raises(ValueError, match="unknown ffn_type"):
         KolmoTransformer(ffn_type="banana")
+
+
+def test_rope_model_constructs_and_drops_pos_emb():
+    """use_rope=True should remove the pos_emb table and reclaim its 131K
+    params (vocab=256, max_context=512, d_model=256 -> 512*256 = 131,072).
+    """
+    abs_model = KolmoTransformer(use_rope=False)
+    rope_model = KolmoTransformer(use_rope=True)
+    delta = abs_model.num_parameters() - rope_model.num_parameters()
+    expected = 512 * 256  # max_context * d_model
+    assert delta == expected, (
+        f"expected RoPE to save {expected:,} params, got {delta:,}"
+    )
+    assert rope_model.pos_emb is None
+    assert rope_model.rope is not None
+    assert abs_model.pos_emb is not None
+    assert abs_model.rope is None
+
+
+def test_rope_kv_cache_matches_full_forward():
+    """The trickiest invariant for any positional scheme: feeding tokens
+    incrementally through the KV cache must produce the same logits as
+    a single full forward. With RoPE, K is rotated by its position when
+    first computed and then cached, so concatenated cached-K + new-K
+    must give the same attention scores as a fresh full-forward K.
+    """
+    torch.manual_seed(7)
+    model = KolmoTransformer(use_rope=True, max_context=64)
+    stable_init_model(model, seed=42)
+    model.eval()
+
+    x_full = torch.randint(0, 256, (1, 8))
+    with torch.no_grad():
+        full_logits, _ = model(x_full)
+        first, caches = model(x_full[:, :4], kv_caches=None, pos_offset=0)
+        second, _ = model(x_full[:, 4:], kv_caches=caches, pos_offset=4)
+
+    assert torch.allclose(first, full_logits[:, :4], atol=1e-5)
+    assert torch.allclose(second, full_logits[:, 4:], atol=1e-5)
+
+
+def test_rope_round_trip_via_engine_env(monkeypatch, tmp_path):
+    """End-to-end: enabling RoPE via the engine should not break round-trip.
+
+    Uses KOLMO_USE_ROPE=1 to flip the default; skip-prime to keep test fast.
+    """
+    monkeypatch.setenv("KOLMO_USE_ROPE", "1")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    monkeypatch.delenv("KOLMO_FIXED", raising=False)
+    from kolmo import compress, decompress
+    data = b"rope round-trip smoke test"
+    blob = compress(data)
+    assert decompress(blob) == data

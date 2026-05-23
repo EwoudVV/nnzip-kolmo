@@ -212,6 +212,10 @@ def _skip_prime() -> bool:
     return os.environ.get("KOLMO_SKIP_PRIME", "").lower() in {"1", "true", "yes"}
 
 
+def _use_rope() -> bool:
+    return os.environ.get("KOLMO_USE_ROPE", "").lower() in {"1", "true", "yes"}
+
+
 def offset_probs(n: int) -> np.ndarray:
     """Static prior over offset values 0..n-1 (representing actual offsets
     1..n). Uses 1/sqrt(k) — a reasonable starting point before any events
@@ -391,7 +395,14 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
     """Build a model with deterministic init. Both compress and decompress
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
-    model = KolmoTransformer()
+    use_rope = _use_rope()
+    if use_rope and _use_fixed():
+        raise NotImplementedError(
+            "KOLMO_USE_ROPE=1 with KOLMO_FIXED=1 is not yet supported — "
+            "the fixed-point engine still uses absolute pos_emb. Run RoPE "
+            "in PyTorch mode for now (unset KOLMO_FIXED)."
+        )
+    model = KolmoTransformer(use_rope=use_rope)
     stable_init_model(model, SEED)
     if _use_fixed():
         fixed_model = FixedModelState(
@@ -433,6 +444,7 @@ def _seed_cache_config(model: KolmoTransformer) -> dict:
         "n_layers": len(model.blocks),
         "max_context": model.max_context,
         "tie_weights": model.tie_weights,
+        "use_rope": model.use_rope,
         "lr": LR,
         "context": CONTEXT,
         "bos": BOS,
