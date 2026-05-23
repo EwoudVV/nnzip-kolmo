@@ -19,6 +19,7 @@ from kolmo._engine import (
     append_copy_history,
     new_model_and_optimizer,
     step_cache,
+    step_cache_batch,
     train_block,
     training_block_size_at,
     update_history,
@@ -77,6 +78,28 @@ def decompress(blob: bytes) -> bytes:
         append_copy_history(copy_history, byte)
         pending.append(byte)
 
+    def observe_byte_sequence(seq):
+        """Batched mirror of observe_byte for copy-event bytes.
+        See compress.py for the rationale; the trajectory must match.
+        """
+        nonlocal copy_history, pending, probs, caches, pos_offset
+        i = 0
+        seq_len = len(seq)
+        while i < seq_len:
+            train_pending_if_full()
+            ensure_cache()
+            threshold = training_block_size_at(bytes_trained_through)
+            room = threshold - len(pending)
+            chunk_end = min(i + room, seq_len)
+            chunk = seq[i:chunk_end]
+            probs, caches, pos_offset = step_cache_batch(
+                model, chunk, caches, pos_offset
+            )
+            for b in chunk:
+                append_copy_history(copy_history, int(b))
+                pending.append(int(b))
+            i = chunk_end
+
     decoded_total = 0
     while decoded_total < n_bytes:
         event = decoder.decode(event_model.probs())
@@ -106,10 +129,9 @@ def decompress(blob: bytes) -> bytes:
             offset_model.observe(offset)
             length_model.observe(length - COPY_MIN)
             start = len(copy_history) - offset
-            copied = copy_history[start : start + length]
-            for byte in copied:
-                output.append(byte)
-                observe_byte(byte)
+            copied = bytes(copy_history[start : start + length])
+            output.extend(copied)
+            observe_byte_sequence(copied)
             decoded_total += length
             continue
 

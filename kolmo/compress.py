@@ -22,6 +22,7 @@ from kolmo._engine import (
     append_copy_history,
     new_model_and_optimizer,
     step_cache,
+    step_cache_batch,
     train_block,
     training_block_size_at,
     update_history,
@@ -79,6 +80,36 @@ def compress(data: bytes) -> bytes:
         append_copy_history(copy_history, byte)
         pending.append(byte)
 
+    def observe_byte_sequence(seq):
+        """Feed a known sequence (copied bytes) through the model in batches.
+
+        Each chunk runs as one forward pass through the KV cache, which is
+        ~10x faster than per-byte forward on PyTorch for non-trivial chunks.
+        Chunks are bounded by the next training-block boundary, since
+        training invalidates the cache and the schedule depends on
+        bytes_trained_through.
+
+        Per-byte probabilities are discarded — the copy event is encoded by
+        its (offset, length), not by predicting each copied byte.
+        """
+        nonlocal copy_history, pending, probs, caches, pos_offset
+        i = 0
+        seq_len = len(seq)
+        while i < seq_len:
+            train_pending_if_full()
+            ensure_cache()
+            threshold = training_block_size_at(bytes_trained_through)
+            room = threshold - len(pending)
+            chunk_end = min(i + room, seq_len)
+            chunk = seq[i:chunk_end]
+            probs, caches, pos_offset = step_cache_batch(
+                model, chunk, caches, pos_offset
+            )
+            for b in chunk:
+                append_copy_history(copy_history, int(b))
+                pending.append(int(b))
+            i = chunk_end
+
     pos = 0
     while pos < len(data):
         copy = copy_matcher.find(pos)
@@ -105,9 +136,8 @@ def compress(data: bytes) -> bytes:
             offset_model.observe(offset)
             length_model.observe(length - COPY_MIN)
             start = len(copy_history) - offset
-            copied = copy_history[start : start + length]
-            for byte in copied:
-                observe_byte(byte)
+            copied = bytes(copy_history[start : start + length])
+            observe_byte_sequence(copied)
             pos += length
             continue
 

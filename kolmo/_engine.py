@@ -575,6 +575,50 @@ def step_cache(
     return probs, caches, pos_offset + 1
 
 
+def step_cache_batch(
+    model: KolmoTransformer | FixedModelState,
+    bytes_list: list[int] | bytes | bytearray,
+    caches: list,
+    pos_offset: int,
+) -> tuple[np.ndarray, list, int]:
+    """Feed a sequence of new bytes through the KV cache in one forward pass.
+
+    Used for copy events, where the bytes are already known (from the copy's
+    offset+length) so per-byte probabilities are not needed for encoding.
+    The cache still has to absorb all N bytes so the next prediction is
+    accurate. One forward over N tokens is much faster than N forwards over
+    1 token because matmul efficiency scales with the batch dim.
+
+    Returns (probs for the byte AFTER the batch, updated caches, new pos_offset).
+    The returned `probs` is the same as if the last byte's `step_cache` had
+    been called individually.
+    """
+    if not bytes_list:
+        # No-op convenience; callers typically guarantee non-empty.
+        return np.zeros(0, dtype=np.float64), caches, pos_offset
+
+    if isinstance(model, FixedModelState):
+        # Fixed mode doesn't have a batched step yet; fall back to a per-byte
+        # loop. Still saves the function-call overhead vs the outer caller
+        # doing the loop, and keeps the interface uniform.
+        last_probs = None
+        for byte in bytes_list:
+            last_probs, caches, pos_offset = step_cache(
+                model, int(byte), caches, pos_offset
+            )
+        return last_probs, caches, pos_offset
+
+    device = next(model.parameters()).device
+    x = torch.tensor([list(bytes_list)], dtype=torch.long, device=device)
+    with torch.no_grad():
+        logits, caches = model(x, kv_caches=caches, pos_offset=pos_offset)
+    caches = _trim_caches(caches, CONTEXT)
+    last_logits = logits[0, -1].cpu().numpy().astype(np.float64)
+    freqs = logits_to_int_freqs(last_logits)
+    probs = freqs.astype(np.float64) / float(TOTAL_FREQ)
+    return probs, caches, pos_offset + len(bytes_list)
+
+
 def _probs_from_q15_logits(last_logits_q: np.ndarray) -> np.ndarray:
     """Dequantize Q15 logits and quantize them through the deterministic
     int-frequency grid so the resulting probs match the PyTorch path."""
