@@ -45,9 +45,8 @@ import kolmo._engine as engine
 engine.COPY_MIN = __COPY_MIN__
 engine.COPY_WINDOW = __WINDOW__
 
-import kolmo.compress as compress_mod
-import kolmo.decompress as decompress_mod
-
+compress_mod = importlib.import_module("kolmo.compress")
+decompress_mod = importlib.import_module("kolmo.decompress")
 compress_mod = importlib.reload(compress_mod)
 decompress_mod = importlib.reload(decompress_mod)
 
