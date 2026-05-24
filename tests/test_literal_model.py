@@ -54,3 +54,28 @@ def test_literal_model_proxy_bits_reflect_learned_context(monkeypatch):
     unexpected = model.proxy_bits(b"x", neural_bpb=2.75)
 
     assert expected < unexpected
+
+
+def test_literal_model_order4_learns_observed_transition(monkeypatch):
+    monkeypatch.setattr(engine, "LITERAL_ORDER4_WEIGHT", 0.25)
+    monkeypatch.setattr(engine, "LITERAL_ORDER4_CONFIDENCE", 1.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER4_BUCKETS", 1 << 12)
+    monkeypatch.setattr(engine, "LITERAL_ORDER3_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER2_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER1_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER0_WEIGHT", 0.0)
+
+    model = LiteralModel()
+    neural = np.ones(256, dtype=np.float64) / 256.0
+
+    # Teach context ("a", "b", "c", "d") -> "e" repeatedly.
+    for _ in range(20):
+        for ch in b"abcde":
+            model.observe(ch)
+
+    for ch in b"abcd":
+        model.observe(ch)
+    probs = model.probs(neural)
+
+    assert probs[ord("e")] > probs[ord("x")]
+    assert np.isclose(probs.sum(), 1.0)
