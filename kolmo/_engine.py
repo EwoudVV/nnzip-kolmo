@@ -76,10 +76,11 @@ COPY_LITERAL_BPB = 3.0
 # mirrored by the decoder and costs zero blob bytes. It learns file-local byte
 # statistics much faster than the transformer's gradient updates, especially
 # for wiki markup and punctuation. Strong mixes hurt enwik; the default is a
-# small total nudge that improved both 16KB and 32KB prefixes.
-LITERAL_ORDER2_WEIGHT = 0.0
-LITERAL_ORDER1_WEIGHT = 0.05
-LITERAL_ORDER0_WEIGHT = 0.01
+# order-2 carries the file-local byte structure; keep small order-1/order-0
+# backoff nudges for contexts that are still cold.
+LITERAL_ORDER2_WEIGHT = 0.50
+LITERAL_ORDER1_WEIGHT = 0.03
+LITERAL_ORDER0_WEIGHT = 0.005
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
