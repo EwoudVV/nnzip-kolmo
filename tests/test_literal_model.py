@@ -34,3 +34,23 @@ def test_literal_model_order2_learns_observed_transition(monkeypatch):
 
     assert probs[ord("c")] > probs[ord("x")]
     assert np.isclose(probs.sum(), 1.0)
+
+
+def test_literal_model_proxy_bits_reflect_learned_context(monkeypatch):
+    monkeypatch.setattr(engine, "LITERAL_ORDER2_WEIGHT", 0.5)
+    monkeypatch.setattr(engine, "LITERAL_ORDER2_CONFIDENCE", 1.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER1_WEIGHT", 0.03)
+    monkeypatch.setattr(engine, "LITERAL_ORDER0_WEIGHT", 0.005)
+
+    model = LiteralModel()
+    for _ in range(20):
+        model.observe(ord("a"))
+        model.observe(ord("b"))
+        model.observe(ord("c"))
+
+    model.observe(ord("a"))
+    model.observe(ord("b"))
+    expected = model.proxy_bits(b"c", neural_bpb=2.75)
+    unexpected = model.proxy_bits(b"x", neural_bpb=2.75)
+
+    assert expected < unexpected

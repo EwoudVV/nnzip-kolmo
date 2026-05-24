@@ -139,10 +139,10 @@ Measured on ElliePC (RTX 4060 Ti), full seed warmup, RoPE, cost-aware copy selec
 
 | Prefix | gzip -9 | kolmo | Delta |
 |---:|---:|---:|---:|
-| 16 KB | 6,266 B / 3.060 bpb | **6,012 B / 2.936 bpb** | -4.1% |
-| 32 KB | 12,501 B / 3.052 bpb | **11,880 B / 2.900 bpb** | -5.0% |
-| 64 KB | 24,623 B / 3.006 bpb | **23,348 B / 2.850 bpb** | -5.2% |
-| 128 KB | 46,944 B / 2.865 bpb | **44,688 B / 2.728 bpb** | -4.8% |
+| 16 KB | 6,266 B / 3.060 bpb | **5,980 B / 2.920 bpb** | -4.6% |
+| 32 KB | 12,501 B / 3.052 bpb | **11,836 B / 2.890 bpb** | -5.3% |
+| 64 KB | 24,623 B / 3.006 bpb | **23,272 B / 2.841 bpb** | -5.5% |
+| 128 KB | 46,944 B / 2.865 bpb | **44,596 B / 2.722 bpb** | -5.0% |
 
 The current bottleneck is speed, not whether the ratio direction works: the 128 KB no-decode run took ~23.5 minutes on the RTX 4060 Ti path. Full enwik9 needs more kernel work and/or a less expensive training schedule before it is practical.
 
