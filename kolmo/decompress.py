@@ -15,6 +15,7 @@ from kolmo._engine import (
     COPY_WINDOW,
     EventModel,
     LengthModel,
+    LiteralModel,
     OffsetModel,
     append_copy_history,
     new_model_and_optimizer,
@@ -40,6 +41,7 @@ def decompress(blob: bytes) -> bytes:
     offset_model = OffsetModel(COPY_WINDOW)
     event_model = EventModel()
     length_model = LengthModel(COPY_MAX - COPY_MIN + 1)
+    literal_model = LiteralModel()
 
     history = [BOS]
     copy_history = bytearray()
@@ -76,6 +78,7 @@ def decompress(blob: bytes) -> bytes:
         ensure_cache()
         probs, caches, pos_offset = step_cache(model, byte, caches, pos_offset)
         append_copy_history(copy_history, byte)
+        literal_model.observe(byte)
         pending.append(byte)
 
     def observe_byte_sequence(seq):
@@ -97,6 +100,7 @@ def decompress(blob: bytes) -> bytes:
             )
             for b in chunk:
                 append_copy_history(copy_history, int(b))
+                literal_model.observe(int(b))
                 pending.append(int(b))
             i = chunk_end
 
@@ -136,7 +140,7 @@ def decompress(blob: bytes) -> bytes:
             continue
 
         ensure_cache()
-        byte = decoder.decode(probs)
+        byte = decoder.decode(literal_model.probs(probs))
         output.append(byte)
         observe_byte(byte)
         decoded_total += 1

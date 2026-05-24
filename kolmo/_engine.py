@@ -72,6 +72,13 @@ COPY_CANDIDATES = 64
 # current RoPE runs are ~3.1 bpb at 32KB, and long-file literals should get
 # cheaper as the model adapts, so short/far copies need to clear a real bar.
 COPY_LITERAL_BPB = 3.0
+# Adaptive literal side model mixed into neural byte probabilities. This is
+# mirrored by the decoder and costs zero blob bytes. It learns file-local byte
+# statistics much faster than the transformer's gradient updates, especially
+# for wiki markup and punctuation. We keep the neural model dominant; the
+# n-gram model is a corrective prior, not a replacement.
+LITERAL_ORDER1_WEIGHT = 0.25
+LITERAL_ORDER0_WEIGHT = 0.05
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
@@ -294,6 +301,48 @@ class EventModel:
             self.copy_count += 1.0
         else:
             self.literal_count += 1.0
+
+
+class LiteralModel:
+    """Adaptive byte-context model mixed with neural literal probabilities.
+
+    The transformer adapts via comparatively expensive optimizer steps. This
+    model adapts immediately after every observed byte, including bytes emitted
+    by copy events, and captures cheap file-local regularities such as:
+    - after '<' in wiki/XML markup, letters and '/' are common
+    - after '[' another '[' is common
+    - after '\n' markup bullets, headings, and capitals are common
+
+    It is deliberately tiny: order-0 counts plus a dense order-1 table
+    (256*256 counts). That is stable memory on enwik9 and fast enough to query
+    on every literal.
+    """
+
+    def __init__(self, prior: float = 1.0):
+        self.count0 = np.full(256, prior, dtype=np.float64)
+        self.count1 = np.full((256, 256), prior, dtype=np.float64)
+        self.prev = BOS
+
+    def probs(self, neural_probs: np.ndarray) -> np.ndarray:
+        p = neural_probs.astype(np.float64, copy=True)
+        if LITERAL_ORDER0_WEIGHT <= 0.0 and LITERAL_ORDER1_WEIGHT <= 0.0:
+            return p / p.sum()
+
+        p0 = self.count0 / self.count0.sum()
+        row = self.count1[self.prev]
+        p1 = row / row.sum()
+        neural_w = max(0.0, 1.0 - LITERAL_ORDER0_WEIGHT - LITERAL_ORDER1_WEIGHT)
+        mixed = (
+            neural_w * p
+            + LITERAL_ORDER0_WEIGHT * p0
+            + LITERAL_ORDER1_WEIGHT * p1
+        )
+        return mixed / mixed.sum()
+
+    def observe(self, byte: int) -> None:
+        self.count0[byte] += 1.0
+        self.count1[self.prev, byte] += 1.0
+        self.prev = byte
 
 
 class OffsetModel:
