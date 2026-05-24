@@ -84,7 +84,7 @@ LITERAL_ORDER0_WEIGHT = 0.005
 # 0 means "use the full order-2 weight after the context has been seen once".
 # Positive values ramp order-2 trust as count/(count + confidence), useful if
 # one-observation contexts overfit.
-LITERAL_ORDER2_CONFIDENCE = 0.0
+LITERAL_ORDER2_CONFIDENCE = 1.0
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
