@@ -140,9 +140,15 @@ Measured on ElliePC (RTX 4060 Ti), full seed warmup, RoPE, cost-aware copy selec
 | Prefix | gzip -9 | kolmo | Delta |
 |---:|---:|---:|---:|
 | 16 KB | 6,266 B / 3.060 bpb | **5,980 B / 2.920 bpb** | -4.6% |
-| 32 KB | 12,501 B / 3.052 bpb | **11,836 B / 2.890 bpb** | -5.3% |
-| 64 KB | 24,623 B / 3.006 bpb | **23,272 B / 2.841 bpb** | -5.5% |
+| 32 KB | 12,501 B / 3.052 bpb | **11,808 B / 2.883 bpb** | -5.5% |
+| 64 KB | 24,623 B / 3.006 bpb | **23,196 B / 2.832 bpb** | -5.8% |
 | 128 KB | 46,944 B / 2.865 bpb | **44,596 B / 2.722 bpb** | -5.0% |
+
+The latest length-bucket + order-2 retune has been remeasured on ElliePC
+through 64 KB. The 128 KB ElliePC retry was interrupted when the PC dropped
+off the network; a local Mac fallback on the same enwik9 prefix produced
+44,436 B / 2.712 bpb, suggesting the 128 KB row should also improve, but rerun
+it on ElliePC before treating that row as canonical.
 
 The current bottleneck is speed, not whether the ratio direction works: the 128 KB no-decode run took ~23.5 minutes on the RTX 4060 Ti path. Full enwik9 needs more kernel work and/or a less expensive training schedule before it is practical.
 
