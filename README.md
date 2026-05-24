@@ -12,7 +12,7 @@ This is the same architecture that the current Hutter Prize contenders use, in c
 |---:|---|---|
 | 1 | PyTorch online-training prototype, single machine | ✅ done |
 | 2 | Bit-deterministic on a single machine (drop PyTorch's nondeterminism) | ✅ done — `KOLMO_FIXED=1` |
-| 3 | Beat nnzip's compression ratio on long files | — |
+| 3 | Beat gzip on real enwik prefixes, then chase nnzip / Hutter-scale ratios | ✅ started — beats `gzip -9` on 16-128 KB enwik9 prefixes |
 | 4 | Cross-platform fixed-point math (Mac/Linux/x86/ARM identical) | ✅ done (folded into Rung 2 via Q15 integer engine; CI verifies on every push) |
 | 5 | Match SOTA on enwik9 (~0.85 bpb) | — |
 | 6 | Submit to Marcus Hutter and win the actual prize | — |
@@ -32,7 +32,7 @@ The two backends produce *different* blobs even on the same input (they're compu
 
 ### Why the fixed-point mode is slower
 
-The 20× gap is honest cost of doing transformer math in pure-Python numpy int64 instead of vectorized BLAS float32. Closing the gap further needs a C extension (Cython, numba, or a hand-written kernel) — not a redesign, just engineering. The current pure-numpy version is fast enough to test, slow enough to make a real Hutter run impractical without that next push.
+The remaining gap is honest cost of doing transformer math in mostly Python/numpy integer code instead of vectorized float32 kernels. Some hotspots now use safe accelerators (float64 BLAS for Q15 matmul, numba for integer kernels), but a real enwik9 run still needs more kernel work.
 
 ### Pre-computed seed cache
 
@@ -56,6 +56,7 @@ The cache invalidates automatically when any of (seed corpus, model architecture
 2. They both warm up on a **5 KB seed corpus** baked into the source code. The seed costs zero bytes in the output blob — it's part of the algorithm, like a lookup table.
 3. For each byte in the input:
    - Run a forward pass to get a probability distribution over the next byte.
+   - Mix that neural distribution with an adaptive byte-context side model (dense order-2 + small order-1/order-0 backoff).
    - Encode the actual next byte under that distribution using arithmetic coding — fewer bits when the model predicts correctly.
    - Append the byte to the running history.
 4. Every 16 bytes (`BLOCK_SIZE`), do **one backward pass + Adam step** so the model adapts to the file it's currently compressing.
@@ -89,6 +90,8 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 - **Weight tying**: the `(vocab, d_model)` token embedding and the `(d_model, vocab)` output head share one matrix. Standard modern-LM trick; ~65 K parameters dropped from a ~2 M total, and gradients from either side improve the shared tensor.
 - **Sliding-window KV cache** (PyTorch and fixed mode both): per-byte inference cost drops from O(T²) to O(T) where T is the context length. The fixed-mode cache is bit-identical to running `fixed_forward` over the same history — proven by a test that compares warm + step against full forward at the bit level.
 - **Rolling-hash copy matcher + adaptive copy models**: the compressor indexes 8-byte keys in a bounded 64 KB window, then encodes `(offset, length)` copy events with adaptive offset / length / event-flag distributions. The decoder only needs to replay the encoded copies; both sides update the adaptive distributions in lockstep.
+- **Adaptive byte-context literal model**: literals are encoded under a mixture of transformer probabilities and a mirrored byte model: 50% dense order-2, 3% order-1, 0.5% order-0, remainder neural. The order-2 table is bounded at 64 MB (`65536 * 256 * uint32`) and learns enwik's local markup/text byte transitions immediately, including from copied bytes.
+- **RoPE positional encoding**: PyTorch mode defaults to rotary position embeddings instead of learned absolute `pos_emb`; this removed the dead position table and improved enwik prefix ratios.
 - **Deterministic-quantized probabilities** (`det_probs.py`): logits are snapped to a 1/64 grid and converted to integer frequencies on a `2^16` total before they touch the arithmetic coder. This isolates the coder from any residual float drift in PyTorch mode.
 
 ## Speed (May 2026)
@@ -130,20 +133,18 @@ Compression ratio on a 246-byte English snippet, both modes without seed prime (
 
 With prime, the PyTorch mode pulls ahead on accuracy and the gap closes; the fixed mode pays a tiny ratio cost (< 1 pp on most regimes) for its determinism guarantee.
 
-## Compression ratio (PyTorch path, with seed prime)
+## Compression ratio (PyTorch path, enwik9 prefixes)
 
-These are from a ~3.4 M param model trained online with the full seed warmup. Re-measured after the Rung 2 architecture changes (weight tying, smaller pos_emb, bigger more-diverse seed, removed PyTorch-mode Adam state rounding).
+Measured on ElliePC (RTX 4060 Ti), full seed warmup, RoPE, cost-aware copy selection, and the tuned order-2 byte-context literal model. These are still tiny compared with enwik9's full 1 GB, but they are real enwik bytes and the curve improves with size.
 
-**Mixed local corpus** (8.9 KB of prose / wiki / dialogue / markdown):
+| Prefix | gzip -9 | kolmo | Delta |
+|---:|---:|---:|---:|
+| 16 KB | 6,266 B / 3.060 bpb | **6,012 B / 2.936 bpb** | -4.1% |
+| 32 KB | 12,501 B / 3.052 bpb | **11,880 B / 2.900 bpb** | -5.0% |
+| 64 KB | 24,623 B / 3.006 bpb | **23,348 B / 2.850 bpb** | -5.2% |
+| 128 KB | 46,944 B / 2.865 bpb | **44,688 B / 2.728 bpb** | -4.8% |
 
-| Size | gzip -9 | kolmo |
-|---:|---:|---:|
-| 1 KB | 55.3% | **50.0%** |
-| 2 KB | 50.0% | **47.9%** |
-| 4 KB | 47.8% | **46.6%** |
-| 8 KB | 45.7% | 46.0% |
-
-`kolmo` beats `gzip -9` on the short / mixed-vocabulary regimes and ties around 8 KB. Pre-Rung-2 numbers (older architecture, no weight tying) were ~2 pp tighter — the new architecture lost a bit of raw ratio to gain cross-machine determinism. Closing that gap and pushing past gzip on uniform real prose is what Rung 3 is for.
+The current bottleneck is speed, not whether the ratio direction works: the 128 KB no-decode run took ~23.5 minutes on the RTX 4060 Ti path. Full enwik9 needs more kernel work and/or a less expensive training schedule before it is practical.
 
 ## Development
 
