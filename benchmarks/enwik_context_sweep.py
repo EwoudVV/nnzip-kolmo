@@ -44,7 +44,10 @@ engine.CONTEXT = __CONTEXT__
 from kolmo import model as model_mod
 orig_init = model_mod.KolmoTransformer.__init__
 def patched_init(self, *args, **kwargs):
-    kwargs.setdefault("max_context", max(512, __CONTEXT__ + 16))
+    # Cached inference can warm `context` positions and then batch-feed a copy
+    # chunk before the next training boundary, so max_context needs headroom
+    # beyond CONTEXT itself. Production default is 512 for CONTEXT=256.
+    kwargs.setdefault("max_context", max(512, 2 * __CONTEXT__ + 16))
     orig_init(self, *args, **kwargs)
 model_mod.KolmoTransformer.__init__ = patched_init
 
