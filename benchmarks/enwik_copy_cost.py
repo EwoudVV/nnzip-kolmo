@@ -94,6 +94,9 @@ def main() -> None:
         literals = 0
         copy_bits = 0.0
         event_bits = 0.0
+        copy_event_bits = 0.0
+        offset_bits = 0.0
+        length_bits = 0.0
         profitable = 0
         lengths: Counter[int] = Counter()
         length_buckets: dict[str, BucketStats] = {
@@ -122,11 +125,13 @@ def main() -> None:
 
             max_offset = min(args.window, pos)
             max_len_symbols = min(engine.COPY_MAX, n - pos) - engine.COPY_MIN + 1
-            bits = bits_for_prob(float(probs[1]))
+            ev_bits = bits_for_prob(float(probs[1]))
+            bits = ev_bits
 
             offset_bucket = offset_model.bucket_for(offset)
             bucket_probs = offset_model.probs_for(max_offset)
-            bits += bits_for_prob(float(bucket_probs[offset_bucket]))
+            off_bits = bits_for_prob(float(bucket_probs[offset_bucket]))
+            bits += off_bits
             offset_lo, offset_hi = offset_model.bucket_bounds(
                 offset_bucket,
                 max_offset,
@@ -137,13 +142,19 @@ def main() -> None:
                     offset_bucket,
                     max_offset,
                 )
+                off_bits += bits_for_prob(float(residual_probs[offset - offset_lo]))
                 bits += bits_for_prob(float(residual_probs[offset - offset_lo]))
 
+            len_bits = 0.0
             if max_len_symbols > 1:
                 len_probs = length_model.probs_for(max_len_symbols)
-                bits += bits_for_prob(float(len_probs[length - engine.COPY_MIN]))
+                len_bits = bits_for_prob(float(len_probs[length - engine.COPY_MIN]))
+                bits += len_bits
 
-            event_bits += bits_for_prob(float(probs[1]))
+            event_bits += ev_bits
+            copy_event_bits += ev_bits
+            offset_bits += off_bits
+            length_bits += len_bits
             copy_bits += bits
             if bits < args.literal_bpb * length:
                 profitable += 1
@@ -179,6 +190,12 @@ def main() -> None:
             f"{copy_bits/max(events, 1):>12.2f} | "
             f"{100*profitable/max(events, 1):>9.1f}% | "
             f"{est_bits/n:>14.3f}"
+        )
+        print(
+            "          hdr/event components: "
+            f"event={copy_event_bits/max(events, 1):.2f} "
+            f"offset={offset_bits/max(events, 1):.2f} "
+            f"length={length_bits/max(events, 1):.2f}"
         )
 
         if args.show_buckets:
