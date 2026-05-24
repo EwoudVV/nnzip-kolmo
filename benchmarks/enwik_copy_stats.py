@@ -17,7 +17,7 @@ REPO = HERE.parent
 sys.path.insert(0, str(REPO))
 
 from enwik_prefix import default_enwik_path, parse_sizes
-from kolmo._engine import COPY_MAX, RollingCopyMatcher
+import kolmo._engine as engine
 
 
 def main() -> None:
@@ -25,7 +25,14 @@ def main() -> None:
     parser.add_argument("--path", type=Path, default=default_enwik_path())
     parser.add_argument("--sizes", default="32kb,64kb,128kb,256kb")
     parser.add_argument("--offset-buckets", action="store_true")
+    parser.add_argument(
+        "--candidates",
+        type=int,
+        default=engine.COPY_CANDIDATES,
+        help="candidate positions to inspect per COPY_MIN key",
+    )
     args = parser.parse_args()
+    engine.COPY_CANDIDATES = args.candidates
     if args.path is None or not args.path.is_file():
         raise SystemExit("enwik file not found; pass --path or set ENWIK_PATH")
 
@@ -39,7 +46,7 @@ def main() -> None:
     print("-" * 104)
     for n in sizes:
         data = raw_all[:n]
-        matcher = RollingCopyMatcher(data)
+        matcher = engine.RollingCopyMatcher(data)
         pos = 0
         lengths: Counter[int] = Counter()
         offset_buckets: dict[int, Counter[int]] = {}
@@ -57,7 +64,7 @@ def main() -> None:
             offset_buckets.setdefault(bucket, Counter())[length] += 1
             total += length
             events += 1
-            saturated += int(length == COPY_MAX)
+            saturated += int(length == engine.COPY_MAX)
             pos += length
         mean = total / max(events, 1)
         top = " ".join(f"{length}:{count}" for length, count in lengths.most_common(8))
