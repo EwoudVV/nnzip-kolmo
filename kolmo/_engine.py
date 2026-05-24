@@ -71,7 +71,7 @@ COPY_CANDIDATES = 64
 # as literals at this proxy bpb. This is deliberately conservative for enwik:
 # current RoPE runs are ~3.1 bpb at 32KB, and long-file literals should get
 # cheaper as the model adapts, so short/far copies need to clear a real bar.
-COPY_LITERAL_BPB = 3.0
+COPY_LITERAL_BPB = 2.75
 # Adaptive literal side model mixed into neural byte probabilities. This is
 # mirrored by the decoder and costs zero blob bytes. It learns file-local byte
 # statistics much faster than the transformer's gradient updates, especially
