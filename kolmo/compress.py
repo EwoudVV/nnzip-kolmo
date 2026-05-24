@@ -16,6 +16,7 @@ from kolmo._engine import (
     COPY_LITERAL_BPB,
     COPY_MAX,
     COPY_MIN,
+    COPY_USE_LITERAL_MODEL_PROXY,
     COPY_WINDOW,
     EventModel,
     LengthModel,
@@ -152,7 +153,14 @@ def compress(data: bytes) -> bytes:
         best_savings = 0.0
         for offset, length in copy_matcher.candidates(pos):
             header_bits = copy_header_bits(offset, length, pos)
-            savings = COPY_LITERAL_BPB * length - header_bits
+            if COPY_USE_LITERAL_MODEL_PROXY:
+                literal_bits = literal_model.proxy_bits(
+                    data[pos : pos + length],
+                    COPY_LITERAL_BPB,
+                )
+            else:
+                literal_bits = COPY_LITERAL_BPB * length
+            savings = literal_bits - header_bits
             if savings > best_savings:
                 best_savings = savings
                 best = (offset, length)

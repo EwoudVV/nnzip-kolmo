@@ -27,7 +27,12 @@ sys.path.insert(0, str(REPO))
 from enwik_prefix import default_enwik_path, parse_sizes
 
 
-def run_one(raw: bytes, copy_bpb: float, decode: bool) -> tuple[int, float, float, str]:
+def run_one(
+    raw: bytes,
+    copy_bpb: float,
+    use_literal_proxy: bool,
+    decode: bool,
+) -> tuple[int, float, float, str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("KOLMO_FIXED", None)
@@ -41,6 +46,7 @@ import time
 import kolmo._engine as engine
 
 engine.COPY_LITERAL_BPB = __COPY_BPB__
+engine.COPY_USE_LITERAL_MODEL_PROXY = __USE_LITERAL_PROXY__
 
 compress_mod = importlib.import_module("kolmo.compress")
 decompress_mod = importlib.import_module("kolmo.decompress")
@@ -59,7 +65,9 @@ if __DECODE__:
     if out != data:
         raise SystemExit("round-trip mismatch")
 print(len(blob), f"{enc:.3f}", f"{dec:.3f}", hashlib.sha256(blob).hexdigest()[:16])
-""".replace("__COPY_BPB__", repr(copy_bpb)).replace("__DECODE__", repr(decode))
+""".replace("__COPY_BPB__", repr(copy_bpb)).replace(
+        "__USE_LITERAL_PROXY__", repr(use_literal_proxy)
+    ).replace("__DECODE__", repr(decode))
     proc = subprocess.run(
         [sys.executable, "-c", script],
         input=raw,
@@ -81,6 +89,7 @@ def main() -> None:
     parser.add_argument("--path", type=Path, default=default_enwik_path())
     parser.add_argument("--sizes", default="16kb,32kb")
     parser.add_argument("--copy-bpbs", default="2.0,2.25,2.5,2.75,3.0,3.25")
+    parser.add_argument("--literal-proxy", action="store_true")
     parser.add_argument("--no-decode", action="store_true")
     args = parser.parse_args()
 
@@ -94,6 +103,7 @@ def main() -> None:
 
     print(f"file: {args.path}")
     print(f"decode: {decode}")
+    print(f"literal proxy: {args.literal_proxy}")
     print("     size | copy_bpb |     bytes |   ratio |    bpb |      enc | sha")
     print("-" * 76)
     for n in sizes:
@@ -105,7 +115,12 @@ def main() -> None:
             flush=True,
         )
         for copy_bpb in copy_bpbs:
-            blob_len, enc, _dec, sha = run_one(raw, copy_bpb, decode)
+            blob_len, enc, _dec, sha = run_one(
+                raw,
+                copy_bpb,
+                use_literal_proxy=args.literal_proxy,
+                decode=decode,
+            )
             print(
                 f"{n:>9,d} | {copy_bpb:>8.3f} | {blob_len:>9,d} | "
                 f"{blob_len/n:>7.4f} | {8*blob_len/n:>6.3f} | "

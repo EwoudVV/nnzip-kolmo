@@ -72,6 +72,7 @@ COPY_CANDIDATES = 64
 # current RoPE runs are ~3.1 bpb at 32KB, and long-file literals should get
 # cheaper as the model adapts, so short/far copies need to clear a real bar.
 COPY_LITERAL_BPB = 2.75
+COPY_USE_LITERAL_MODEL_PROXY = False
 # Adaptive literal side model mixed into neural byte probabilities. This is
 # mirrored by the decoder and costs zero blob bytes. It learns file-local byte
 # statistics much faster than the transformer's gradient updates, especially
@@ -413,6 +414,87 @@ class LiteralModel:
         self.prev3 = self.prev2
         self.prev2 = self.prev
         self.prev = byte
+
+    def proxy_bits(self, seq: bytes | bytearray, neural_bpb: float) -> float:
+        """Cheap estimate of literal bits for a known byte sequence.
+
+        Used only by the encoder when deciding whether a copy candidate is
+        worth its header. We don't have future neural probabilities without
+        actually stepping the transformer through the candidate, so this uses
+        `neural_bpb` as a constant proxy for the neural component and adds the
+        current adaptive byte-context probabilities for the actual bytes.
+
+        The method intentionally does not mutate counts. It advances the local
+        context variables while reading the current tables; that is enough to
+        distinguish "the byte model expects this sequence" from "copy header is
+        probably cheaper" without spending GPU work on rejected candidates.
+        """
+        if not seq:
+            return 0.0
+        base_p = 2.0 ** (-neural_bpb)
+        count0_sum = self.count0.sum()
+        prev3 = self.prev3
+        prev2 = self.prev2
+        prev = self.prev
+        total_bits = 0.0
+        for byte in seq:
+            p0 = float(self.count0[byte] / count0_sum)
+            row1 = self.count1[prev]
+            p1 = float(row1[byte] / row1.sum())
+
+            context2 = (prev2 << 8) | prev
+            row2 = self.count2[context2]
+            row2_sum = int(row2.sum())
+            if row2_sum > 0:
+                p2 = float(row2[byte] / row2_sum)
+                if LITERAL_ORDER2_CONFIDENCE > 0.0:
+                    confidence2 = row2_sum / (row2_sum + LITERAL_ORDER2_CONFIDENCE)
+                    order2_w = LITERAL_ORDER2_WEIGHT * confidence2
+                else:
+                    order2_w = LITERAL_ORDER2_WEIGHT
+            else:
+                p2 = base_p
+                order2_w = 0.0
+
+            order3_w = 0.0
+            p3 = base_p
+            if self.count3 is not None:
+                context3 = (prev3 << 16) | (prev2 << 8) | prev
+                bucket3 = (
+                    ((context3 * 2654435761) & 0xFFFFFFFF)
+                    % LITERAL_ORDER3_BUCKETS
+                )
+                row3 = self.count3[bucket3]
+                row3_sum = int(row3.sum())
+                if row3_sum > 0:
+                    p3 = float(row3[byte] / row3_sum)
+                    confidence3 = (
+                        row3_sum / (row3_sum + LITERAL_ORDER3_CONFIDENCE)
+                        if LITERAL_ORDER3_CONFIDENCE > 0.0
+                        else 1.0
+                    )
+                    order3_w = LITERAL_ORDER3_WEIGHT * confidence3
+
+            neural_w = max(
+                0.0,
+                1.0
+                - LITERAL_ORDER0_WEIGHT
+                - LITERAL_ORDER1_WEIGHT
+                - order2_w
+                - order3_w,
+            )
+            p = (
+                neural_w * base_p
+                + LITERAL_ORDER0_WEIGHT * p0
+                + LITERAL_ORDER1_WEIGHT * p1
+                + order2_w * p2
+                + order3_w * p3
+            )
+            total_bits += -np.log2(max(p, 1e-300))
+            prev3 = prev2
+            prev2 = prev
+            prev = int(byte)
+        return float(total_bits)
 
 
 class OffsetModel:
