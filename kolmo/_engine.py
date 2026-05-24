@@ -81,6 +81,10 @@ COPY_LITERAL_BPB = 2.75
 LITERAL_ORDER2_WEIGHT = 0.50
 LITERAL_ORDER1_WEIGHT = 0.03
 LITERAL_ORDER0_WEIGHT = 0.005
+# 0 means "use the full order-2 weight after the context has been seen once".
+# Positive values ramp order-2 trust as count/(count + confidence), useful if
+# one-observation contexts overfit.
+LITERAL_ORDER2_CONFIDENCE = 0.0
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
@@ -344,7 +348,11 @@ class LiteralModel:
         row2_sum = int(row2.sum())
         if row2_sum > 0:
             p2 = row2.astype(np.float64) / float(row2_sum)
-            order2_w = LITERAL_ORDER2_WEIGHT
+            if LITERAL_ORDER2_CONFIDENCE > 0.0:
+                confidence = row2_sum / (row2_sum + LITERAL_ORDER2_CONFIDENCE)
+                order2_w = LITERAL_ORDER2_WEIGHT * confidence
+            else:
+                order2_w = LITERAL_ORDER2_WEIGHT
         else:
             p2 = p
             order2_w = 0.0
