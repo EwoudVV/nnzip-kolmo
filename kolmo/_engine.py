@@ -85,6 +85,9 @@ LITERAL_ORDER0_WEIGHT = 0.005
 # Positive values ramp order-2 trust as count/(count + confidence), useful if
 # one-observation contexts overfit.
 LITERAL_ORDER2_CONFIDENCE = 1.0
+LITERAL_ORDER3_WEIGHT = 0.0
+LITERAL_ORDER3_CONFIDENCE = 2.0
+LITERAL_ORDER3_BUCKETS = 1 << 16
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
@@ -319,15 +322,22 @@ class LiteralModel:
     - after '[' another '[' is common
     - after '\n' markup bullets, headings, and capitals are common
 
-    It is deliberately bounded: order-0 counts, a dense order-1 table, and a
-    dense order-2 table. The order-2 table is 65,536*256 uint32 counts = 64MB,
-    which is acceptable for enwik9 and avoids unbounded Python dict growth.
+    It is deliberately bounded: order-0 counts, a dense order-1 table, a dense
+    order-2 table, and an optional hashed order-3 table. Dense exact order-3
+    would be too large (2^24 contexts * 256 next bytes); the hashed table is
+    fixed-size and collisions only smear the distribution.
     """
 
     def __init__(self, prior: float = 1.0):
         self.count0 = np.full(256, prior, dtype=np.float64)
         self.count1 = np.full((256, 256), prior, dtype=np.float64)
         self.count2 = np.zeros((256 * 256, 256), dtype=np.uint32)
+        self.count3 = (
+            np.zeros((LITERAL_ORDER3_BUCKETS, 256), dtype=np.uint16)
+            if LITERAL_ORDER3_WEIGHT > 0.0
+            else None
+        )
+        self.prev3 = BOS
         self.prev2 = BOS
         self.prev = BOS
 
@@ -337,8 +347,25 @@ class LiteralModel:
             LITERAL_ORDER0_WEIGHT <= 0.0
             and LITERAL_ORDER1_WEIGHT <= 0.0
             and LITERAL_ORDER2_WEIGHT <= 0.0
+            and LITERAL_ORDER3_WEIGHT <= 0.0
         ):
             return p / p.sum()
+
+        order3_w = 0.0
+        p3 = p
+        if self.count3 is not None:
+            context3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
+            bucket3 = ((context3 * 2654435761) & 0xFFFFFFFF) % LITERAL_ORDER3_BUCKETS
+            row3 = self.count3[bucket3]
+            row3_sum = int(row3.sum())
+            if row3_sum > 0:
+                p3 = row3.astype(np.float64) / float(row3_sum)
+                confidence3 = (
+                    row3_sum / (row3_sum + LITERAL_ORDER3_CONFIDENCE)
+                    if LITERAL_ORDER3_CONFIDENCE > 0.0
+                    else 1.0
+                )
+                order3_w = LITERAL_ORDER3_WEIGHT * confidence3
 
         p0 = self.count0 / self.count0.sum()
         row = self.count1[self.prev]
@@ -358,13 +385,18 @@ class LiteralModel:
             order2_w = 0.0
         neural_w = max(
             0.0,
-            1.0 - LITERAL_ORDER0_WEIGHT - LITERAL_ORDER1_WEIGHT - order2_w,
+            1.0
+            - LITERAL_ORDER0_WEIGHT
+            - LITERAL_ORDER1_WEIGHT
+            - order2_w
+            - order3_w,
         )
         mixed = (
             neural_w * p
             + LITERAL_ORDER0_WEIGHT * p0
             + LITERAL_ORDER1_WEIGHT * p1
             + order2_w * p2
+            + order3_w * p3
         )
         return mixed / mixed.sum()
 
@@ -373,6 +405,12 @@ class LiteralModel:
         self.count1[self.prev, byte] += 1.0
         context2 = (self.prev2 << 8) | self.prev
         self.count2[context2, byte] += 1
+        if self.count3 is not None:
+            context3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
+            bucket3 = ((context3 * 2654435761) & 0xFFFFFFFF) % LITERAL_ORDER3_BUCKETS
+            if self.count3[bucket3, byte] < np.iinfo(np.uint16).max:
+                self.count3[bucket3, byte] += 1
+        self.prev3 = self.prev2
         self.prev2 = self.prev
         self.prev = byte
 

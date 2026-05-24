@@ -17,7 +17,7 @@ sys.path.insert(0, str(REPO))
 from enwik_prefix import default_enwik_path, parse_sizes
 
 
-def parse_weights(text: str) -> list[tuple[float, float, float, float]]:
+def parse_weights(text: str) -> list[tuple[float, float, float, float, float]]:
     out = []
     for part in text.split(","):
         part = part.strip()
@@ -25,25 +25,32 @@ def parse_weights(text: str) -> list[tuple[float, float, float, float]]:
             continue
         pieces = [float(x) for x in part.split(":")]
         if len(pieces) == 2:
+            w3 = 0.0
             w2 = 0.0
             w1, w0 = pieces
             confidence = 0.0
         elif len(pieces) == 3:
+            w3 = 0.0
             w2, w1, w0 = pieces
             confidence = 0.0
         elif len(pieces) == 4:
+            w3 = 0.0
             w2, w1, w0, confidence = pieces
+        elif len(pieces) == 5:
+            w3, w2, w1, w0, confidence = pieces
         else:
             raise ValueError(
                 "weights must be order1:order0, order2:order1:order0, "
-                "or order2:order1:order0:confidence"
+                "order2:order1:order0:confidence, "
+                "or order3:order2:order1:order0:confidence"
             )
-        out.append((w2, w1, w0, confidence))
+        out.append((w3, w2, w1, w0, confidence))
     return out
 
 
 def run_one(
     raw: bytes,
+    w3: float,
     w2: float,
     w1: float,
     w0: float,
@@ -66,6 +73,7 @@ engine.LITERAL_ORDER1_WEIGHT = __W1__
 engine.LITERAL_ORDER0_WEIGHT = __W0__
 engine.LITERAL_ORDER2_WEIGHT = __W2__
 engine.LITERAL_ORDER2_CONFIDENCE = __CONFIDENCE__
+engine.LITERAL_ORDER3_WEIGHT = __W3__
 
 compress_mod = importlib.import_module("kolmo.compress")
 decompress_mod = importlib.import_module("kolmo.decompress")
@@ -84,7 +92,7 @@ if __DECODE__:
     if out != data:
         raise SystemExit("round-trip mismatch")
 print(len(blob), f"{enc:.3f}", f"{dec:.3f}", hashlib.sha256(blob).hexdigest()[:16])
-""".replace("__W2__", repr(w2)).replace("__W1__", repr(w1)).replace("__W0__", repr(w0)).replace("__CONFIDENCE__", repr(confidence)).replace(
+""".replace("__W3__", repr(w3)).replace("__W2__", repr(w2)).replace("__W1__", repr(w1)).replace("__W0__", repr(w0)).replace("__CONFIDENCE__", repr(confidence)).replace(
         "__DECODE__", repr(decode)
     )
     proc = subprocess.run(
@@ -110,7 +118,7 @@ def main() -> None:
     parser.add_argument(
         "--weights",
         default="0:0:0,0:0.05:0.01,0.05:0.03:0.005,0.10:0.05:0.01",
-        help="comma-separated order2:order1:order0[:confidence] weights",
+        help="comma-separated order2:order1:order0[:confidence] or order3:order2:order1:order0:confidence weights",
     )
     parser.add_argument("--no-decode", action="store_true")
     args = parser.parse_args()
@@ -125,20 +133,20 @@ def main() -> None:
 
     print(f"file: {args.path}")
     print(f"decode: {decode}")
-    print("     size | order2 | order1 | order0 |   conf |     bytes |   ratio |    bpb |      enc | sha")
-    print("-" * 103)
+    print("     size | order3 | order2 | order1 | order0 |   conf |     bytes |   ratio |    bpb |      enc | sha")
+    print("-" * 112)
     for n in sizes:
         raw = raw_all[:n]
         gz = gzip.compress(raw, compresslevel=9)
         print(
-            f"{n:>9,d} | {'gzip':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {len(gz):>9,d} | "
+            f"{n:>9,d} | {'gzip':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {len(gz):>9,d} | "
             f"{len(gz)/n:>7.4f} | {8*len(gz)/n:>6.3f} | {'-':>8} | -",
             flush=True,
         )
-        for w2, w1, w0, confidence in weights:
-            blob_len, enc, _dec, sha = run_one(raw, w2, w1, w0, confidence, decode)
+        for w3, w2, w1, w0, confidence in weights:
+            blob_len, enc, _dec, sha = run_one(raw, w3, w2, w1, w0, confidence, decode)
             print(
-                f"{n:>9,d} | {w2:>6.3f} | {w1:>6.3f} | {w0:>6.3f} | {confidence:>6.1f} | {blob_len:>9,d} | "
+                f"{n:>9,d} | {w3:>6.3f} | {w2:>6.3f} | {w1:>6.3f} | {w0:>6.3f} | {confidence:>6.1f} | {blob_len:>9,d} | "
                 f"{blob_len/n:>7.4f} | {8*blob_len/n:>6.3f} | {enc:>8.1f}s | {sha}",
                 flush=True,
             )
