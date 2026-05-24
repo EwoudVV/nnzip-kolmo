@@ -76,7 +76,8 @@ COPY_LITERAL_BPB = 3.0
 # mirrored by the decoder and costs zero blob bytes. It learns file-local byte
 # statistics much faster than the transformer's gradient updates, especially
 # for wiki markup and punctuation. Strong mixes hurt enwik; the default is a
-# small 6% total nudge that improved both 16KB and 32KB prefixes.
+# small total nudge that improved both 16KB and 32KB prefixes.
+LITERAL_ORDER2_WEIGHT = 0.0
 LITERAL_ORDER1_WEIGHT = 0.05
 LITERAL_ORDER0_WEIGHT = 0.01
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
@@ -313,35 +314,57 @@ class LiteralModel:
     - after '[' another '[' is common
     - after '\n' markup bullets, headings, and capitals are common
 
-    It is deliberately tiny: order-0 counts plus a dense order-1 table
-    (256*256 counts). That is stable memory on enwik9 and fast enough to query
-    on every literal.
+    It is deliberately bounded: order-0 counts, a dense order-1 table, and a
+    dense order-2 table. The order-2 table is 65,536*256 uint32 counts = 64MB,
+    which is acceptable for enwik9 and avoids unbounded Python dict growth.
     """
 
     def __init__(self, prior: float = 1.0):
         self.count0 = np.full(256, prior, dtype=np.float64)
         self.count1 = np.full((256, 256), prior, dtype=np.float64)
+        self.count2 = np.zeros((256 * 256, 256), dtype=np.uint32)
+        self.prev2 = BOS
         self.prev = BOS
 
     def probs(self, neural_probs: np.ndarray) -> np.ndarray:
         p = neural_probs.astype(np.float64, copy=True)
-        if LITERAL_ORDER0_WEIGHT <= 0.0 and LITERAL_ORDER1_WEIGHT <= 0.0:
+        if (
+            LITERAL_ORDER0_WEIGHT <= 0.0
+            and LITERAL_ORDER1_WEIGHT <= 0.0
+            and LITERAL_ORDER2_WEIGHT <= 0.0
+        ):
             return p / p.sum()
 
         p0 = self.count0 / self.count0.sum()
         row = self.count1[self.prev]
         p1 = row / row.sum()
-        neural_w = max(0.0, 1.0 - LITERAL_ORDER0_WEIGHT - LITERAL_ORDER1_WEIGHT)
+        context2 = (self.prev2 << 8) | self.prev
+        row2 = self.count2[context2]
+        row2_sum = int(row2.sum())
+        if row2_sum > 0:
+            p2 = row2.astype(np.float64) / float(row2_sum)
+            order2_w = LITERAL_ORDER2_WEIGHT
+        else:
+            p2 = p
+            order2_w = 0.0
+        neural_w = max(
+            0.0,
+            1.0 - LITERAL_ORDER0_WEIGHT - LITERAL_ORDER1_WEIGHT - order2_w,
+        )
         mixed = (
             neural_w * p
             + LITERAL_ORDER0_WEIGHT * p0
             + LITERAL_ORDER1_WEIGHT * p1
+            + order2_w * p2
         )
         return mixed / mixed.sum()
 
     def observe(self, byte: int) -> None:
         self.count0[byte] += 1.0
         self.count1[self.prev, byte] += 1.0
+        context2 = (self.prev2 << 8) | self.prev
+        self.count2[context2, byte] += 1
+        self.prev2 = self.prev
         self.prev = byte
 
 

@@ -17,18 +17,31 @@ sys.path.insert(0, str(REPO))
 from enwik_prefix import default_enwik_path, parse_sizes
 
 
-def parse_weights(text: str) -> list[tuple[float, float]]:
+def parse_weights(text: str) -> list[tuple[float, float, float]]:
     out = []
     for part in text.split(","):
         part = part.strip()
         if not part:
             continue
-        a, b = part.split(":")
-        out.append((float(a), float(b)))
+        pieces = [float(x) for x in part.split(":")]
+        if len(pieces) == 2:
+            w2 = 0.0
+            w1, w0 = pieces
+        elif len(pieces) == 3:
+            w2, w1, w0 = pieces
+        else:
+            raise ValueError("weights must be order1:order0 or order2:order1:order0")
+        out.append((w2, w1, w0))
     return out
 
 
-def run_one(raw: bytes, w1: float, w0: float, decode: bool) -> tuple[int, float, float, str]:
+def run_one(
+    raw: bytes,
+    w2: float,
+    w1: float,
+    w0: float,
+    decode: bool,
+) -> tuple[int, float, float, str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("KOLMO_FIXED", None)
@@ -43,6 +56,7 @@ import kolmo._engine as engine
 
 engine.LITERAL_ORDER1_WEIGHT = __W1__
 engine.LITERAL_ORDER0_WEIGHT = __W0__
+engine.LITERAL_ORDER2_WEIGHT = __W2__
 
 compress_mod = importlib.import_module("kolmo.compress")
 decompress_mod = importlib.import_module("kolmo.decompress")
@@ -61,7 +75,7 @@ if __DECODE__:
     if out != data:
         raise SystemExit("round-trip mismatch")
 print(len(blob), f"{enc:.3f}", f"{dec:.3f}", hashlib.sha256(blob).hexdigest()[:16])
-""".replace("__W1__", repr(w1)).replace("__W0__", repr(w0)).replace(
+""".replace("__W2__", repr(w2)).replace("__W1__", repr(w1)).replace("__W0__", repr(w0)).replace(
         "__DECODE__", repr(decode)
     )
     proc = subprocess.run(
@@ -86,8 +100,8 @@ def main() -> None:
     parser.add_argument("--sizes", default="16kb")
     parser.add_argument(
         "--weights",
-        default="0:0,0.02:0.005,0.05:0.01,0.10:0.02,0.25:0.05",
-        help="comma-separated order1:order0 weights",
+        default="0:0:0,0:0.05:0.01,0.05:0.03:0.005,0.10:0.05:0.01",
+        help="comma-separated order2:order1:order0 weights",
     )
     parser.add_argument("--no-decode", action="store_true")
     args = parser.parse_args()
@@ -102,20 +116,20 @@ def main() -> None:
 
     print(f"file: {args.path}")
     print(f"decode: {decode}")
-    print("     size | order1 | order0 |     bytes |   ratio |    bpb |      enc | sha")
-    print("-" * 84)
+    print("     size | order2 | order1 | order0 |     bytes |   ratio |    bpb |      enc | sha")
+    print("-" * 94)
     for n in sizes:
         raw = raw_all[:n]
         gz = gzip.compress(raw, compresslevel=9)
         print(
-            f"{n:>9,d} | {'gzip':>6} | {'-':>6} | {len(gz):>9,d} | "
+            f"{n:>9,d} | {'gzip':>6} | {'-':>6} | {'-':>6} | {len(gz):>9,d} | "
             f"{len(gz)/n:>7.4f} | {8*len(gz)/n:>6.3f} | {'-':>8} | -",
             flush=True,
         )
-        for w1, w0 in weights:
-            blob_len, enc, _dec, sha = run_one(raw, w1, w0, decode)
+        for w2, w1, w0 in weights:
+            blob_len, enc, _dec, sha = run_one(raw, w2, w1, w0, decode)
             print(
-                f"{n:>9,d} | {w1:>6.3f} | {w0:>6.3f} | {blob_len:>9,d} | "
+                f"{n:>9,d} | {w2:>6.3f} | {w1:>6.3f} | {w0:>6.3f} | {blob_len:>9,d} | "
                 f"{blob_len/n:>7.4f} | {8*blob_len/n:>6.3f} | {enc:>8.1f}s | {sha}",
                 flush=True,
             )
