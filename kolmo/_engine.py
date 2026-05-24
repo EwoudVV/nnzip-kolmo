@@ -816,26 +816,32 @@ class RollingCopyMatcher:
             if not candidates:
                 del self._index[key]
 
-    def find(self, pos: int) -> tuple[int, int] | None:
+    def candidates(self, pos: int) -> list[tuple[int, int]]:
+        """Return plausible (offset, length) copy candidates at `pos`.
+
+        Candidates are newest-first (same order the matcher inspects them),
+        capped by `max_candidates`, and already filtered to length >= COPY_MIN.
+        The compressor can use this to choose by estimated coding cost instead
+        of blindly taking the longest match.
+        """
         remaining = len(self.data) - pos
         if remaining < COPY_MIN:
-            return None
+            return []
 
         self._index_known_prefix(pos)
         self._prune_old(pos)
         key = self.data[pos : pos + COPY_MIN]
         candidates = self._index.get(key)
         if not candidates:
-            return None
+            return []
 
         min_start = pos - self.window
         while candidates and candidates[0] < min_start:
             candidates.popleft()
         if not candidates:
-            return None
+            return []
 
-        best_offset = 0
-        best_len = 0
+        out: list[tuple[int, int]] = []
         checked = 0
         for start in reversed(candidates):
             offset = pos - start
@@ -850,15 +856,18 @@ class RollingCopyMatcher:
                 and self.data[start + length] == self.data[pos + length]
             ):
                 length += 1
-            if length > best_len:
-                best_offset = offset
-                best_len = length
-                if best_len == COPY_MAX:
+            if length >= COPY_MIN:
+                out.append((offset, length))
+                if length == COPY_MAX:
                     break
             checked += 1
             if checked >= self.max_candidates:
                 break
 
-        if best_len < COPY_MIN:
+        return out
+
+    def find(self, pos: int) -> tuple[int, int] | None:
+        candidates = self.candidates(pos)
+        if not candidates:
             return None
-        return best_offset, best_len
+        return max(candidates, key=lambda item: item[1])

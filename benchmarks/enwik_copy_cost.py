@@ -41,6 +41,40 @@ def bits_for_prob(p: float) -> float:
     return -math.log2(max(p, 1e-300))
 
 
+def copy_header_bits(
+    *,
+    offset: int,
+    length: int,
+    pos: int,
+    n: int,
+    window: int,
+    event_model: engine.EventModel,
+    offset_model: engine.OffsetModel,
+    length_model: engine.LengthModel,
+) -> tuple[float, float, float]:
+    """Return (event_bits, offset_bits, length_bits) for one copy event
+    under the current adaptive model states, without mutating them."""
+    probs = event_model.probs()
+    ev_bits = bits_for_prob(float(probs[1]))
+    max_offset = min(window, pos)
+    max_len_symbols = min(engine.COPY_MAX, n - pos) - engine.COPY_MIN + 1
+
+    offset_bucket = offset_model.bucket_for(offset)
+    bucket_probs = offset_model.probs_for(max_offset)
+    off_bits = bits_for_prob(float(bucket_probs[offset_bucket]))
+    offset_lo, offset_hi = offset_model.bucket_bounds(offset_bucket, max_offset)
+    offset_width = offset_hi - offset_lo + 1
+    if offset_width > 1:
+        residual_probs = offset_model.residual_probs_for(offset_bucket, max_offset)
+        off_bits += bits_for_prob(float(residual_probs[offset - offset_lo]))
+
+    len_bits = 0.0
+    if max_len_symbols > 1:
+        len_probs = length_model.probs_for(max_len_symbols)
+        len_bits = bits_for_prob(float(len_probs[length - engine.COPY_MIN]))
+    return ev_bits, off_bits, len_bits
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", type=Path, default=default_enwik_path())
@@ -57,6 +91,14 @@ def main() -> None:
         "--show-buckets",
         action="store_true",
         help="print stats by copy length bucket",
+    )
+    parser.add_argument(
+        "--choose-cost-aware",
+        action="store_true",
+        help=(
+            "choose the candidate with the best literal-bpb savings instead "
+            "of the longest candidate"
+        ),
     )
     args = parser.parse_args()
 
@@ -109,7 +151,28 @@ def main() -> None:
         }
 
         while pos < n:
-            copy = matcher.find(pos)
+            if args.choose_cost_aware:
+                all_candidates = matcher.candidates(pos)
+                best_savings = 0.0
+                copy = None
+                for cand_offset, cand_length in all_candidates:
+                    ev_b, off_b, len_b = copy_header_bits(
+                        offset=cand_offset,
+                        length=cand_length,
+                        pos=pos,
+                        n=n,
+                        window=args.window,
+                        event_model=event_model,
+                        offset_model=offset_model,
+                        length_model=length_model,
+                    )
+                    bits = ev_b + off_b + len_b
+                    savings = args.literal_bpb * cand_length - bits
+                    if savings > best_savings:
+                        best_savings = savings
+                        copy = (cand_offset, cand_length)
+            else:
+                copy = matcher.find(pos)
             probs = event_model.probs()
             if copy is None:
                 event_bits += bits_for_prob(float(probs[0]))
@@ -123,33 +186,19 @@ def main() -> None:
             copied += length
             lengths[length] += 1
 
-            max_offset = min(args.window, pos)
-            max_len_symbols = min(engine.COPY_MAX, n - pos) - engine.COPY_MIN + 1
-            ev_bits = bits_for_prob(float(probs[1]))
-            bits = ev_bits
-
-            offset_bucket = offset_model.bucket_for(offset)
-            bucket_probs = offset_model.probs_for(max_offset)
-            off_bits = bits_for_prob(float(bucket_probs[offset_bucket]))
-            bits += off_bits
-            offset_lo, offset_hi = offset_model.bucket_bounds(
-                offset_bucket,
-                max_offset,
+            ev_bits, off_bits, len_bits = copy_header_bits(
+                offset=offset,
+                length=length,
+                pos=pos,
+                n=n,
+                window=args.window,
+                event_model=event_model,
+                offset_model=offset_model,
+                length_model=length_model,
             )
-            offset_width = offset_hi - offset_lo + 1
-            if offset_width > 1:
-                residual_probs = offset_model.residual_probs_for(
-                    offset_bucket,
-                    max_offset,
-                )
-                off_bits += bits_for_prob(float(residual_probs[offset - offset_lo]))
-                bits += bits_for_prob(float(residual_probs[offset - offset_lo]))
-
-            len_bits = 0.0
-            if max_len_symbols > 1:
-                len_probs = length_model.probs_for(max_len_symbols)
-                len_bits = bits_for_prob(float(len_probs[length - engine.COPY_MIN]))
-                bits += len_bits
+            bits = ev_bits
+            bits += off_bits
+            bits += len_bits
 
             event_bits += ev_bits
             copy_event_bits += ev_bits
