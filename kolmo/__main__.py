@@ -13,6 +13,7 @@ Environment variables that affect behavior:
     KOLMO_NO_SEED_CACHE=1   force fixed-mode prime to re-run, bypassing cache
     KOLMO_CACHE_DIR=path    override the primed-state cache location
     KOLMO_DEVICE=cpu|cuda   force PyTorch path to a specific device
+    KOLMO_USE_ROPE=0        disable RoPE and use learned absolute pos_emb
 """
 
 import sys

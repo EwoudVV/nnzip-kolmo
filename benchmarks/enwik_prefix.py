@@ -68,14 +68,17 @@ def run_one(raw: bytes, variant: str, decode: bool) -> None:
     env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
     env.pop("KOLMO_FIXED", None)
     env.pop("KOLMO_USE_ROPE", None)
-    if variant == "rope":
+    if variant == "abs":
+        env["KOLMO_USE_ROPE"] = "0"
+    elif variant == "rope":
         env["KOLMO_USE_ROPE"] = "1"
     elif variant == "fixed":
         env["KOLMO_FIXED"] = "1"
+        env["KOLMO_USE_ROPE"] = "0"
     elif variant == "fixed-rope":
         env["KOLMO_FIXED"] = "1"
         env["KOLMO_USE_ROPE"] = "1"
-    elif variant != "abs":
+    else:
         raise ValueError(f"unknown variant {variant!r}")
 
     script = """
@@ -137,7 +140,7 @@ def main() -> None:
         "--variant",
         action="append",
         choices=["abs", "rope", "fixed", "fixed-rope"],
-        help="variant to run; repeatable. Defaults to abs.",
+        help="variant to run; repeatable. Defaults to rope (current model default).",
     )
     parser.add_argument("--no-decode", action="store_true")
     args = parser.parse_args()
@@ -149,7 +152,7 @@ def main() -> None:
         )
 
     sizes = parse_sizes(args.sizes)
-    variants = args.variant or ["abs"]
+    variants = args.variant or ["rope"]
     max_size = max(sizes)
     raw_all = args.path.read_bytes()[:max_size]
     if len(raw_all) < max_size:

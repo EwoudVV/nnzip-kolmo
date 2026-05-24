@@ -36,10 +36,10 @@ LR_WARMUP_STEPS = 100
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # base bytes between optimizer steps (early in file)
 # Sublinear training schedule: training interval doubles every 4KB of input
-# seen, capped at 32x BLOCK_SIZE = 512 bytes between steps. Rationale: the
-# model adapts fastest in the first few KB. After that each additional Adam
-# step contributes less per byte. Cost over a 1MB file drops from 65K steps
-# to ~2500 (26x), with no loss in early-file fidelity.
+# seen, capped by CONTEXT-1 so every training slice still has at least one
+# preceding token to predict the first byte of the block. Rationale: the model
+# adapts fastest in the first few KB. After that each additional Adam step
+# contributes less per byte.
 _TRAIN_SCHEDULE_DOUBLING_BYTES = 4096
 _TRAIN_SCHEDULE_MAX_MULT = 32
 
@@ -54,7 +54,7 @@ def training_block_size_at(bytes_observed: int) -> int:
     """
     bucket = bytes_observed // _TRAIN_SCHEDULE_DOUBLING_BYTES
     mult = min(1 << bucket, _TRAIN_SCHEDULE_MAX_MULT)
-    return BLOCK_SIZE * mult
+    return min(BLOCK_SIZE * mult, CONTEXT - 1)
 BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
 COPY_WINDOW = 65536
@@ -214,7 +214,10 @@ def _skip_prime() -> bool:
 
 
 def _use_rope() -> bool:
-    return os.environ.get("KOLMO_USE_ROPE", "").lower() in {"1", "true", "yes"}
+    value = os.environ.get("KOLMO_USE_ROPE")
+    if value is None:
+        return True
+    return value.lower() in {"1", "true", "yes"}
 
 
 def offset_probs(n: int) -> np.ndarray:
