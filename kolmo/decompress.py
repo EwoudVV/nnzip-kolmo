@@ -127,7 +127,18 @@ def decompress(blob: bytes) -> bytes:
                 offset = offset_lo
             len_alpha = max_len - COPY_MIN + 1
             if len_alpha > 1:
-                length = decoder.decode(length_model.probs_for(len_alpha)) + COPY_MIN
+                length_bucket = decoder.decode(length_model.probs_for(len_alpha))
+                len_lo, len_hi = length_model.bucket_bounds(
+                    length_bucket,
+                    len_alpha,
+                )
+                if len_hi > len_lo:
+                    length_offset = len_lo + decoder.decode(
+                        length_model.residual_probs_for(length_bucket, len_alpha)
+                    )
+                else:
+                    length_offset = len_lo
+                length = length_offset + COPY_MIN
             else:
                 length = COPY_MIN
             offset_model.observe(offset)

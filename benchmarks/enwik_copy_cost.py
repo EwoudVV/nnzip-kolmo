@@ -70,8 +70,17 @@ def copy_header_bits(
 
     len_bits = 0.0
     if max_len_symbols > 1:
+        length_offset = length - engine.COPY_MIN
+        length_bucket = length_model.bucket_for(length_offset)
         len_probs = length_model.probs_for(max_len_symbols)
-        len_bits = bits_for_prob(float(len_probs[length - engine.COPY_MIN]))
+        len_bits = bits_for_prob(float(len_probs[length_bucket]))
+        len_lo, len_hi = length_model.bucket_bounds(length_bucket, max_len_symbols)
+        if len_hi > len_lo:
+            residual_probs = length_model.residual_probs_for(
+                length_bucket,
+                max_len_symbols,
+            )
+            len_bits += bits_for_prob(float(residual_probs[length_offset - len_lo]))
     return ev_bits, off_bits, len_bits
 
 

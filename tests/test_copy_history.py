@@ -10,6 +10,7 @@ bytearray instead of copying the whole file prefix at every position.
 from kolmo._engine import (
     COPY_MIN,
     COPY_WINDOW,
+    LengthModel,
     OffsetModel,
     RollingCopyMatcher,
     append_copy_history,
@@ -127,3 +128,39 @@ def test_offset_model_residual_probs_are_clipped_to_max_offset():
     probs = model.residual_probs_for(6, 100)
     assert len(probs) == 37
     assert abs(float(probs.sum()) - 1.0) < 1e-12
+
+
+def test_length_model_buckets_cover_legal_length_offsets():
+    model = LengthModel(1024 - COPY_MIN + 1)
+    assert len(model.probs_for(1)) == 1
+    assert len(model.probs_for(8)) == 4
+    assert len(model.probs_for(1024 - COPY_MIN + 1)) == 10
+
+    assert model.bucket_for(0) == 0
+    assert model.bucket_for(1) == 1
+    assert model.bucket_for(2) == 1
+    assert model.bucket_for(7) == 3
+    assert model.bucket_for(1024 - COPY_MIN) == 9
+
+    assert model.bucket_bounds(0, 100) == (0, 0)
+    assert model.bucket_bounds(3, 100) == (7, 14)
+    assert model.bucket_bounds(6, 100) == (63, 99)
+
+
+def test_length_model_observe_updates_bucket_and_residual():
+    model = LengthModel(1024 - COPY_MIN + 1)
+    bucket_before = model.counts.copy()
+    residual_before = [counts.copy() for counts in model.residual_counts]
+
+    model.observe(17)
+    bucket = model.bucket_for(17)
+    assert model.counts[bucket] == bucket_before[bucket] + 1.0
+    for i, (got, old) in enumerate(zip(model.counts, bucket_before)):
+        if i != bucket:
+            assert got == old
+
+    lo, _ = model.bucket_bounds(bucket, model.n)
+    residual = 17 - lo
+    assert model.residual_counts[bucket][residual] == (
+        residual_before[bucket][residual] + 1.0
+    )

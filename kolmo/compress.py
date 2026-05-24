@@ -144,8 +144,19 @@ def compress(data: bytes) -> bytes:
                 max(float(residual_probs[offset - offset_lo]), 1e-300)
             )
         if max_len > 1:
+            length_offset = length - COPY_MIN
+            length_bucket = length_model.bucket_for(length_offset)
             len_probs = length_model.probs_for(max_len)
-            bits += -math.log2(max(float(len_probs[length - COPY_MIN]), 1e-300))
+            bits += -math.log2(max(float(len_probs[length_bucket]), 1e-300))
+            len_lo, len_hi = length_model.bucket_bounds(length_bucket, max_len)
+            if len_hi > len_lo:
+                residual_probs = length_model.residual_probs_for(
+                    length_bucket,
+                    max_len,
+                )
+                bits += -math.log2(
+                    max(float(residual_probs[length_offset - len_lo]), 1e-300)
+                )
         return bits
 
     def choose_copy(pos: int):
@@ -188,7 +199,15 @@ def compress(data: bytes) -> bytes:
                     offset_model.residual_probs_for(offset_bucket, max_offset),
                 )
             if max_len > 1:
-                encoder.encode(length - COPY_MIN, length_model.probs_for(max_len))
+                length_offset = length - COPY_MIN
+                length_bucket = length_model.bucket_for(length_offset)
+                encoder.encode(length_bucket, length_model.probs_for(max_len))
+                len_lo, len_hi = length_model.bucket_bounds(length_bucket, max_len)
+                if len_hi > len_lo:
+                    encoder.encode(
+                        length_offset - len_lo,
+                        length_model.residual_probs_for(length_bucket, max_len),
+                    )
             offset_model.observe(offset)
             length_model.observe(length - COPY_MIN)
             start = len(copy_history) - offset

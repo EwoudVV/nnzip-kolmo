@@ -267,23 +267,90 @@ def length_probs(n: int) -> np.ndarray:
 
 
 class LengthModel:
-    """Adaptive probability model over match lengths (encoded as offsets from
-    COPY_MIN, so the symbol range is [0, COPY_MAX - COPY_MIN]).
+    """Adaptive probability model for copy lengths using log buckets.
 
-    Length distribution is steep — most matches are at or near COPY_MIN. The
-    static 1/k prior is decent but not perfect for any particular corpus.
+    Lengths are represented as offsets from COPY_MIN:
+
+      length_offset = length - COPY_MIN  # 0..COPY_MAX-COPY_MIN
+
+    The old model encoded that offset as one categorical symbol over up to
+    1017 choices. That works, but after COPY_MAX=1024 long matches pay for a
+    large flat alphabet even though lengths are naturally log-ish: exact 8-byte
+    copies are common, then ranges like 9-10, 11-14, 15-22, etc.
+
+    This mirrors OffsetModel:
+
+      1. bucket = floor(log2(length_offset + 1))
+      2. residual = length_offset - bucket_lo
+
+    The initial bucket/residual priors are derived from the old 1/k exact
+    length prior, so first-copy behavior stays close while the adaptive model
+    learns whether a file prefers tiny or long matches.
     """
 
-    def __init__(self, n: int, prior_strength: float = 16.0):
-        prior = length_probs(n) * prior_strength
+    def __init__(
+        self,
+        n: int,
+        prior_strength: float = 16.0,
+        residual_prior_strength: float = 8.0,
+    ):
+        self.n = n
+        offsets = np.arange(n, dtype=np.int64)
+        buckets = np.array(
+            [self.bucket_for(int(o)) for o in offsets],
+            dtype=np.int64,
+        )
+        exact_prior = length_probs(n)
+        prior = np.bincount(
+            buckets,
+            weights=exact_prior,
+            minlength=n.bit_length(),
+        )
+        prior = prior / prior.sum() * prior_strength
         self.counts = prior.astype(np.float64)
+        self.residual_counts: list[np.ndarray] = []
+        for bucket in range(n.bit_length()):
+            lo, hi = self.bucket_bounds(bucket, n)
+            exact = exact_prior[lo : hi + 1].copy()
+            exact = exact / exact.sum() * residual_prior_strength
+            self.residual_counts.append(exact.astype(np.float64))
+
+    @staticmethod
+    def bucket_for(length_offset: int) -> int:
+        if length_offset < 0:
+            raise ValueError("length offset must be non-negative")
+        return (length_offset + 1).bit_length() - 1
+
+    @staticmethod
+    def bucket_bounds(bucket: int, max_n: int) -> tuple[int, int]:
+        if bucket < 0:
+            raise ValueError("bucket must be non-negative")
+        if max_n <= 0:
+            raise ValueError("max_n must be positive")
+        lo = (1 << bucket) - 1
+        hi = min((1 << (bucket + 1)) - 2, max_n - 1)
+        if lo > hi:
+            raise ValueError("bucket is not legal for max_n")
+        return lo, hi
 
     def probs_for(self, max_n: int) -> np.ndarray:
-        p = self.counts[:max_n].copy()
+        """Return normalized probabilities over legal length buckets."""
+        if max_n <= 0:
+            return np.array([], dtype=np.float64)
+        p = self.counts[: max_n.bit_length()].copy()
+        return p / p.sum()
+
+    def residual_probs_for(self, bucket: int, max_n: int) -> np.ndarray:
+        lo, hi = self.bucket_bounds(bucket, max_n)
+        width = hi - lo + 1
+        p = self.residual_counts[bucket][:width].copy()
         return p / p.sum()
 
     def observe(self, length_offset: int) -> None:
-        self.counts[length_offset] += 1.0
+        bucket = self.bucket_for(length_offset)
+        lo, _ = self.bucket_bounds(bucket, self.n)
+        self.counts[bucket] += 1.0
+        self.residual_counts[bucket][length_offset - lo] += 1.0
 
 
 class EventModel:
