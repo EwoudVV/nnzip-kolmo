@@ -66,6 +66,12 @@ COPY_MIN = 8
 # paying its own event flag + offset + length header.
 COPY_MAX = 1024
 COPY_CANDIDATES = 64
+# Encoder-side heuristic for copy selection. A copy event is used only if its
+# adaptive event+offset+length header costs less than spelling the same bytes
+# as literals at this proxy bpb. This is deliberately conservative for enwik:
+# current RoPE runs are ~3.1 bpb at 32KB, and long-file literals should get
+# cheaper as the model adapts, so short/far copies need to clear a real bar.
+COPY_LITERAL_BPB = 3.0
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common

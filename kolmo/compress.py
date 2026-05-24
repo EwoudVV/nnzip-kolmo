@@ -8,10 +8,12 @@ bytes and trains every BLOCK_SIZE bytes, so decompression can replay the same
 trajectory.
 """
 
+import math
 import struct
 
 from kolmo._engine import (
     BOS,
+    COPY_LITERAL_BPB,
     COPY_MAX,
     COPY_MIN,
     COPY_WINDOW,
@@ -110,9 +112,51 @@ def compress(data: bytes) -> bytes:
                 pending.append(int(b))
             i = chunk_end
 
+    def copy_header_bits(offset: int, length: int, pos: int) -> float:
+        """Approximate arithmetic-coded bits for a copy header now.
+
+        This mirrors the actual event/offset/length encoding below but only
+        reads model probabilities. It lets the encoder reject short/far copies
+        whose header costs more than the bytes they replace. Decoder behavior
+        is unchanged because the chosen event stream remains explicit.
+        """
+        probs = event_model.probs()
+        bits = -math.log2(max(float(probs[1]), 1e-300))
+
+        max_offset = min(COPY_WINDOW, len(copy_history))
+        max_len = min(COPY_MAX, len(data) - pos) - COPY_MIN + 1
+        offset_bucket = offset_model.bucket_for(offset)
+        bucket_probs = offset_model.probs_for(max_offset)
+        bits += -math.log2(max(float(bucket_probs[offset_bucket]), 1e-300))
+        offset_lo, offset_hi = offset_model.bucket_bounds(offset_bucket, max_offset)
+        offset_width = offset_hi - offset_lo + 1
+        if offset_width > 1:
+            residual_probs = offset_model.residual_probs_for(
+                offset_bucket,
+                max_offset,
+            )
+            bits += -math.log2(
+                max(float(residual_probs[offset - offset_lo]), 1e-300)
+            )
+        if max_len > 1:
+            len_probs = length_model.probs_for(max_len)
+            bits += -math.log2(max(float(len_probs[length - COPY_MIN]), 1e-300))
+        return bits
+
+    def choose_copy(pos: int):
+        best = None
+        best_savings = 0.0
+        for offset, length in copy_matcher.candidates(pos):
+            header_bits = copy_header_bits(offset, length, pos)
+            savings = COPY_LITERAL_BPB * length - header_bits
+            if savings > best_savings:
+                best_savings = savings
+                best = (offset, length)
+        return best
+
     pos = 0
     while pos < len(data):
-        copy = copy_matcher.find(pos)
+        copy = choose_copy(pos)
         if copy is not None:
             offset, length = copy
             encoder.encode(1, event_model.probs())
