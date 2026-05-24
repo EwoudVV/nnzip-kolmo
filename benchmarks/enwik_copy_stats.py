@@ -31,6 +31,12 @@ def main() -> None:
         default=engine.COPY_CANDIDATES,
         help="candidate positions to inspect per COPY_MIN key",
     )
+    parser.add_argument(
+        "--window",
+        type=int,
+        default=engine.COPY_WINDOW,
+        help="copy window size to test",
+    )
     args = parser.parse_args()
     engine.COPY_CANDIDATES = args.candidates
     if args.path is None or not args.path.is_file():
@@ -40,13 +46,18 @@ def main() -> None:
     raw_all = args.path.read_bytes()[: max(sizes)]
 
     print(f"file: {args.path}")
+    print(f"window: {args.window:,} candidates: {args.candidates}")
     print(
         "     size | events | copied bytes | copied% | mean len | sat@COPY_MAX | top lengths"
     )
     print("-" * 104)
     for n in sizes:
         data = raw_all[:n]
-        matcher = engine.RollingCopyMatcher(data)
+        matcher = engine.RollingCopyMatcher(
+            data,
+            window=args.window,
+            max_candidates=args.candidates,
+        )
         pos = 0
         lengths: Counter[int] = Counter()
         offset_buckets: dict[int, Counter[int]] = {}
