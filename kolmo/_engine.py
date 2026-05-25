@@ -79,7 +79,7 @@ COPY_USE_LITERAL_MODEL_PROXY = False
 # for wiki markup and punctuation. Strong mixes hurt enwik; the default is a
 # order-2 carries the file-local byte structure; keep small order-1/order-0
 # backoff nudges for contexts that are still cold.
-LITERAL_ORDER2_WEIGHT = 0.30
+LITERAL_ORDER2_WEIGHT = 0.40
 LITERAL_ORDER1_WEIGHT = 0.02
 LITERAL_ORDER0_WEIGHT = 0.005
 # 0 means "use the full order-2 weight after the context has been seen once".
@@ -89,12 +89,40 @@ LITERAL_ORDER2_CONFIDENCE = 2.0
 LITERAL_ORDER3_WEIGHT = 0.0
 LITERAL_ORDER3_CONFIDENCE = 2.0
 LITERAL_ORDER3_BUCKETS = 1 << 16
-LITERAL_ORDER4_WEIGHT = 0.30
+LITERAL_ORDER4_WEIGHT = 0.20
 LITERAL_ORDER4_CONFIDENCE = 2.0
 LITERAL_ORDER4_BUCKETS = 1 << 18
 LITERAL_ORDER5_WEIGHT = 0.0
 LITERAL_ORDER5_CONFIDENCE = 4.0
 LITERAL_ORDER5_BUCKETS = 1 << 18
+_MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+def literal_context_bucket(context: int, buckets: int) -> int:
+    """Map a byte context integer to a hashed literal-model bucket.
+
+    The high-order literal tables are bounded and hashed. The old code used
+    `context * odd_constant % buckets`; when `buckets` is a power of two, that
+    mostly preserves low-bit structure. For byte contexts, low bits are just
+    the most recent byte(s), so many distinct order-4 contexts collapsed into
+    surprisingly few buckets on enwik prefixes.
+
+    SplitMix64's finalizer gives a cheap avalanche: nearby contexts and
+    contexts sharing suffix bytes spread across the whole table. Collisions
+    still happen (bounded memory is the point), but they become random noise
+    instead of systematic suffix aliasing.
+    """
+    if buckets <= 0:
+        raise ValueError("bucket count must be positive")
+    x = (int(context) + 0x9E3779B97F4A7C15) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    x = (x ^ (x >> 31)) & _MASK64
+    if buckets & (buckets - 1) == 0:
+        return x & (buckets - 1)
+    return x % buckets
+
+
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
@@ -450,9 +478,7 @@ class LiteralModel:
                 | (self.prev2 << 8)
                 | self.prev
             )
-            bucket5 = (
-                (context5 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
-            ) % LITERAL_ORDER5_BUCKETS
+            bucket5 = literal_context_bucket(context5, LITERAL_ORDER5_BUCKETS)
             row5 = self.count5[bucket5]
             row5_sum = int(row5.sum())
             if row5_sum > 0:
@@ -473,9 +499,7 @@ class LiteralModel:
                 | (self.prev2 << 8)
                 | self.prev
             )
-            bucket4 = (
-                (context4 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
-            ) % LITERAL_ORDER4_BUCKETS
+            bucket4 = literal_context_bucket(context4, LITERAL_ORDER4_BUCKETS)
             row4 = self.count4[bucket4]
             row4_sum = int(row4.sum())
             if row4_sum > 0:
@@ -491,7 +515,7 @@ class LiteralModel:
         p3 = p
         if self.count3 is not None:
             context3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
-            bucket3 = ((context3 * 2654435761) & 0xFFFFFFFF) % LITERAL_ORDER3_BUCKETS
+            bucket3 = literal_context_bucket(context3, LITERAL_ORDER3_BUCKETS)
             row3 = self.count3[bucket3]
             row3_sum = int(row3.sum())
             if row3_sum > 0:
@@ -547,7 +571,7 @@ class LiteralModel:
         self.count2[context2, byte] += 1
         if self.count3 is not None:
             context3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
-            bucket3 = ((context3 * 2654435761) & 0xFFFFFFFF) % LITERAL_ORDER3_BUCKETS
+            bucket3 = literal_context_bucket(context3, LITERAL_ORDER3_BUCKETS)
             if self.count3[bucket3, byte] < np.iinfo(np.uint16).max:
                 self.count3[bucket3, byte] += 1
         if self.count4 is not None:
@@ -557,9 +581,7 @@ class LiteralModel:
                 | (self.prev2 << 8)
                 | self.prev
             )
-            bucket4 = (
-                (context4 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
-            ) % LITERAL_ORDER4_BUCKETS
+            bucket4 = literal_context_bucket(context4, LITERAL_ORDER4_BUCKETS)
             if self.count4[bucket4, byte] < np.iinfo(np.uint16).max:
                 self.count4[bucket4, byte] += 1
         if self.count5 is not None:
@@ -570,9 +592,7 @@ class LiteralModel:
                 | (self.prev2 << 8)
                 | self.prev
             )
-            bucket5 = (
-                (context5 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
-            ) % LITERAL_ORDER5_BUCKETS
+            bucket5 = literal_context_bucket(context5, LITERAL_ORDER5_BUCKETS)
             if self.count5[bucket5, byte] < np.iinfo(np.uint16).max:
                 self.count5[bucket5, byte] += 1
         self.prev5 = self.prev4
@@ -634,9 +654,7 @@ class LiteralModel:
                     | (prev2 << 8)
                     | prev
                 )
-                bucket5 = (
-                    (context5 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
-                ) % LITERAL_ORDER5_BUCKETS
+                bucket5 = literal_context_bucket(context5, LITERAL_ORDER5_BUCKETS)
                 row5 = self.count5[bucket5]
                 row5_sum = int(row5.sum())
                 if row5_sum > 0:
@@ -654,9 +672,7 @@ class LiteralModel:
                 context4 = (
                     (prev4 << 24) | (prev3 << 16) | (prev2 << 8) | prev
                 )
-                bucket4 = (
-                    (context4 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
-                ) % LITERAL_ORDER4_BUCKETS
+                bucket4 = literal_context_bucket(context4, LITERAL_ORDER4_BUCKETS)
                 row4 = self.count4[bucket4]
                 row4_sum = int(row4.sum())
                 if row4_sum > 0:
@@ -673,8 +689,7 @@ class LiteralModel:
             if self.count3 is not None:
                 context3 = (prev3 << 16) | (prev2 << 8) | prev
                 bucket3 = (
-                    ((context3 * 2654435761) & 0xFFFFFFFF)
-                    % LITERAL_ORDER3_BUCKETS
+                    literal_context_bucket(context3, LITERAL_ORDER3_BUCKETS)
                 )
                 row3 = self.count3[bucket3]
                 row3_sum = int(row3.sum())

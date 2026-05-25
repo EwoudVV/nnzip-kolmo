@@ -90,7 +90,7 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 - **Weight tying**: the `(vocab, d_model)` token embedding and the `(d_model, vocab)` output head share one matrix. Standard modern-LM trick; ~65 K parameters dropped from a ~2 M total, and gradients from either side improve the shared tensor.
 - **Sliding-window KV cache** (PyTorch and fixed mode both): per-byte inference cost drops from O(T²) to O(T) where T is the context length. The fixed-mode cache is bit-identical to running `fixed_forward` over the same history — proven by a test that compares warm + step against full forward at the bit level.
 - **Rolling-hash copy matcher + adaptive copy models**: the compressor indexes 8-byte keys in a bounded 64 KB window, then encodes `(offset, length)` copy events with adaptive offset / length / event-flag distributions. The decoder only needs to replay the encoded copies; both sides update the adaptive distributions in lockstep.
-- **Adaptive byte-context literal model**: literals are encoded under a mixture of transformer probabilities and a mirrored byte model: 50% dense order-2, 3% order-1, 0.5% order-0, remainder neural. The order-2 table is bounded at 64 MB (`65536 * 256 * uint32`) and learns enwik's local markup/text byte transitions immediately, including from copied bytes.
+- **Adaptive byte-context literal model**: literals are encoded under a mixture of transformer probabilities and a mirrored byte model: 40% dense order-2, 20% hashed order-4, 2% order-1, 0.5% order-0, remainder neural. The dense order-2 table is bounded at 64 MB (`65536 * 256 * uint32`); the order-4 table is a fixed-size hashed table with SplitMix-style bucket mixing so repeated wiki markup/text contexts are learned immediately without unbounded memory.
 - **RoPE positional encoding**: PyTorch mode defaults to rotary position embeddings instead of learned absolute `pos_emb`; this removed the dead position table and improved enwik prefix ratios.
 - **Deterministic-quantized probabilities** (`det_probs.py`): logits are snapped to a 1/64 grid and converted to integer frequencies on a `2^16` total before they touch the arithmetic coder. This isolates the coder from any residual float drift in PyTorch mode.
 
@@ -140,17 +140,18 @@ length bucket coding, and the hashed order-4 byte-context literal model). These
 are still tiny compared with enwik9's full 1 GB, but they are real enwik bytes
 and the curve improves with size.
 
-The 16-128 KB rows below were remeasured locally on the Mac after ElliePC
+The current 16-64 KB rows below were remeasured locally on the Mac after ElliePC
 dropped off the network. Treat them as current-code fallback numbers until the
-same run is repeated on ElliePC; earlier ElliePC runs tracked the same trend but
-were missing the order-4 default.
+same run is repeated on ElliePC. The 128 KB row is the previous local fallback
+before the SplitMix bucket-mixer retune and is marked pending because the
+current 128 KB rerun is slow (~20+ minutes).
 
 | Prefix | gzip -9 | kolmo | Delta |
 |---:|---:|---:|---:|
-| 16 KB | 6,247 B / 3.050 bpb | **5,916 B / 2.889 bpb** | -5.3% |
-| 32 KB | 12,488 B / 3.049 bpb | **11,672 B / 2.850 bpb** | -6.5% |
-| 64 KB | 24,589 B / 3.002 bpb | **22,884 B / 2.793 bpb** | -6.9% |
-| 128 KB | 46,884 B / 2.862 bpb | **43,780 B / 2.672 bpb** | -6.6% |
+| 16 KB | 6,247 B / 3.050 bpb | **5,920 B / 2.891 bpb** | -5.2% |
+| 32 KB | 12,488 B / 3.049 bpb | **11,668 B / 2.849 bpb** | -6.6% |
+| 64 KB | 24,589 B / 3.002 bpb | **22,792 B / 2.782 bpb** | -7.3% |
+| 128 KB | 46,884 B / 2.862 bpb | **43,780 B / 2.672 bpb** | -6.6% (pending rerun) |
 
 The current bottleneck is speed, not whether the ratio direction works: the
 latest 128 KB no-decode run took ~22 minutes locally, and earlier ElliePC runs

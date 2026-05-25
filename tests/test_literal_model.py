@@ -1,7 +1,7 @@
 import numpy as np
 
 import kolmo._engine as engine
-from kolmo._engine import LiteralModel
+from kolmo._engine import LiteralModel, literal_context_bucket
 
 
 def test_literal_model_probs_are_normalized_and_nonzero():
@@ -105,3 +105,17 @@ def test_literal_model_order5_learns_observed_transition(monkeypatch):
 
     assert probs[ord("f")] > probs[ord("x")]
     assert np.isclose(probs.sum(), 1.0)
+
+
+def test_literal_context_bucket_avalanches_shared_suffix_contexts():
+    """High-order byte contexts often share suffix bytes on real text.
+
+    Bucket counts are powers of two, so a plain multiplicative hash mostly
+    preserves low-bit structure; contexts with the same final byte can collapse
+    into a tiny fraction of the table. The bucket mixer should avalanche those
+    contexts across most of the table instead.
+    """
+    buckets = 1 << 18
+    contexts = [(i << 8) | ord(" ") for i in range(4096)]
+    occupied = {literal_context_bucket(ctx, buckets) for ctx in contexts}
+    assert len(occupied) > 4000
