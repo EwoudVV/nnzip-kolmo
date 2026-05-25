@@ -135,22 +135,27 @@ With prime, the PyTorch mode pulls ahead on accuracy and the gap closes; the fix
 
 ## Compression ratio (PyTorch path, enwik9 prefixes)
 
-Measured on ElliePC (RTX 4060 Ti), full seed warmup, RoPE, cost-aware copy selection, and the tuned order-2 byte-context literal model. These are still tiny compared with enwik9's full 1 GB, but they are real enwik bytes and the curve improves with size.
+Latest current-default run (full seed warmup, RoPE, cost-aware copy selection,
+length bucket coding, and the hashed order-4 byte-context literal model). These
+are still tiny compared with enwik9's full 1 GB, but they are real enwik bytes
+and the curve improves with size.
+
+The 16-128 KB rows below were remeasured locally on the Mac after ElliePC
+dropped off the network. Treat them as current-code fallback numbers until the
+same run is repeated on ElliePC; earlier ElliePC runs tracked the same trend but
+were missing the order-4 default.
 
 | Prefix | gzip -9 | kolmo | Delta |
 |---:|---:|---:|---:|
-| 16 KB | 6,266 B / 3.060 bpb | **5,980 B / 2.920 bpb** | -4.6% |
-| 32 KB | 12,501 B / 3.052 bpb | **11,808 B / 2.883 bpb** | -5.5% |
-| 64 KB | 24,623 B / 3.006 bpb | **23,196 B / 2.832 bpb** | -5.8% |
-| 128 KB | 46,944 B / 2.865 bpb | **44,596 B / 2.722 bpb** | -5.0% |
+| 16 KB | 6,247 B / 3.050 bpb | **5,916 B / 2.889 bpb** | -5.3% |
+| 32 KB | 12,488 B / 3.049 bpb | **11,672 B / 2.850 bpb** | -6.5% |
+| 64 KB | 24,589 B / 3.002 bpb | **22,884 B / 2.793 bpb** | -6.9% |
+| 128 KB | 46,884 B / 2.862 bpb | **43,780 B / 2.672 bpb** | -6.6% |
 
-The latest length-bucket + order-2 retune has been remeasured on ElliePC
-through 64 KB. The 128 KB ElliePC retry was interrupted when the PC dropped
-off the network; a local Mac fallback on the same enwik9 prefix produced
-44,436 B / 2.712 bpb, suggesting the 128 KB row should also improve, but rerun
-it on ElliePC before treating that row as canonical.
-
-The current bottleneck is speed, not whether the ratio direction works: the 128 KB no-decode run took ~23.5 minutes on the RTX 4060 Ti path. Full enwik9 needs more kernel work and/or a less expensive training schedule before it is practical.
+The current bottleneck is speed, not whether the ratio direction works: the
+latest 128 KB no-decode run took ~22 minutes locally, and earlier ElliePC runs
+were in the same painful 20-25 minute band. Full enwik9 needs more kernel work
+and/or a less expensive training schedule before it is practical.
 
 ## Development
 
