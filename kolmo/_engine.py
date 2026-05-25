@@ -79,18 +79,18 @@ COPY_USE_LITERAL_MODEL_PROXY = False
 # for wiki markup and punctuation. Strong mixes hurt enwik; the default is a
 # order-2 carries the file-local byte structure; keep small order-1/order-0
 # backoff nudges for contexts that are still cold.
-LITERAL_ORDER2_WEIGHT = 0.60
+LITERAL_ORDER2_WEIGHT = 0.30
 LITERAL_ORDER1_WEIGHT = 0.02
 LITERAL_ORDER0_WEIGHT = 0.005
 # 0 means "use the full order-2 weight after the context has been seen once".
 # Positive values ramp order-2 trust as count/(count + confidence), useful if
 # one-observation contexts overfit.
-LITERAL_ORDER2_CONFIDENCE = 1.0
+LITERAL_ORDER2_CONFIDENCE = 2.0
 LITERAL_ORDER3_WEIGHT = 0.0
 LITERAL_ORDER3_CONFIDENCE = 2.0
 LITERAL_ORDER3_BUCKETS = 1 << 16
-LITERAL_ORDER4_WEIGHT = 0.0
-LITERAL_ORDER4_CONFIDENCE = 4.0
+LITERAL_ORDER4_WEIGHT = 0.30
+LITERAL_ORDER4_CONFIDENCE = 2.0
 LITERAL_ORDER4_BUCKETS = 1 << 18
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
