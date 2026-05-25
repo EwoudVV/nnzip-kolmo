@@ -92,6 +92,9 @@ LITERAL_ORDER3_BUCKETS = 1 << 16
 LITERAL_ORDER4_WEIGHT = 0.30
 LITERAL_ORDER4_CONFIDENCE = 2.0
 LITERAL_ORDER4_BUCKETS = 1 << 18
+LITERAL_ORDER5_WEIGHT = 0.0
+LITERAL_ORDER5_CONFIDENCE = 4.0
+LITERAL_ORDER5_BUCKETS = 1 << 18
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
 # the compressed blob, but trains the model to a useful starting state before
 # the user's data is touched. Bigger and more diverse = better prior on common
@@ -394,10 +397,10 @@ class LiteralModel:
     - after '\n' markup bullets, headings, and capitals are common
 
     It is deliberately bounded: order-0 counts, a dense order-1 table, a dense
-    order-2 table, and optional hashed order-3/order-4 tables. Dense exact
-    order-3 would be too large (2^24 contexts * 256 next bytes), and dense
-    exact order-4 is completely out. The hashed tables are fixed-size and
-    collisions only smear the distribution.
+    order-2 table, and optional hashed order-3/order-4/order-5 tables. Dense
+    exact order-3 would be too large (2^24 contexts * 256 next bytes), and
+    dense exact order-4/order-5 is completely out. The hashed tables are
+    fixed-size and collisions only smear the distribution.
     """
 
     def __init__(self, prior: float = 1.0):
@@ -414,6 +417,12 @@ class LiteralModel:
             if LITERAL_ORDER4_WEIGHT > 0.0
             else None
         )
+        self.count5 = (
+            np.zeros((LITERAL_ORDER5_BUCKETS, 256), dtype=np.uint16)
+            if LITERAL_ORDER5_WEIGHT > 0.0
+            else None
+        )
+        self.prev5 = BOS
         self.prev4 = BOS
         self.prev3 = BOS
         self.prev2 = BOS
@@ -427,8 +436,33 @@ class LiteralModel:
             and LITERAL_ORDER2_WEIGHT <= 0.0
             and LITERAL_ORDER3_WEIGHT <= 0.0
             and LITERAL_ORDER4_WEIGHT <= 0.0
+            and LITERAL_ORDER5_WEIGHT <= 0.0
         ):
             return p / p.sum()
+
+        order5_w = 0.0
+        p5 = p
+        if self.count5 is not None:
+            context5 = (
+                (self.prev5 << 32)
+                | (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            bucket5 = (
+                (context5 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
+            ) % LITERAL_ORDER5_BUCKETS
+            row5 = self.count5[bucket5]
+            row5_sum = int(row5.sum())
+            if row5_sum > 0:
+                p5 = row5.astype(np.float64) / float(row5_sum)
+                confidence5 = (
+                    row5_sum / (row5_sum + LITERAL_ORDER5_CONFIDENCE)
+                    if LITERAL_ORDER5_CONFIDENCE > 0.0
+                    else 1.0
+                )
+                order5_w = LITERAL_ORDER5_WEIGHT * confidence5
 
         order4_w = 0.0
         p4 = p
@@ -492,7 +526,8 @@ class LiteralModel:
             - LITERAL_ORDER1_WEIGHT
             - order2_w
             - order3_w
-            - order4_w,
+            - order4_w
+            - order5_w,
         )
         mixed = (
             neural_w * p
@@ -501,6 +536,7 @@ class LiteralModel:
             + order2_w * p2
             + order3_w * p3
             + order4_w * p4
+            + order5_w * p5
         )
         return mixed / mixed.sum()
 
@@ -526,6 +562,20 @@ class LiteralModel:
             ) % LITERAL_ORDER4_BUCKETS
             if self.count4[bucket4, byte] < np.iinfo(np.uint16).max:
                 self.count4[bucket4, byte] += 1
+        if self.count5 is not None:
+            context5 = (
+                (self.prev5 << 32)
+                | (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            bucket5 = (
+                (context5 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
+            ) % LITERAL_ORDER5_BUCKETS
+            if self.count5[bucket5, byte] < np.iinfo(np.uint16).max:
+                self.count5[bucket5, byte] += 1
+        self.prev5 = self.prev4
         self.prev4 = self.prev3
         self.prev3 = self.prev2
         self.prev2 = self.prev
@@ -549,6 +599,7 @@ class LiteralModel:
             return 0.0
         base_p = 2.0 ** (-neural_bpb)
         count0_sum = self.count0.sum()
+        prev5 = self.prev5
         prev4 = self.prev4
         prev3 = self.prev3
         prev2 = self.prev2
@@ -572,6 +623,30 @@ class LiteralModel:
             else:
                 p2 = base_p
                 order2_w = 0.0
+
+            order5_w = 0.0
+            p5 = base_p
+            if self.count5 is not None:
+                context5 = (
+                    (prev5 << 32)
+                    | (prev4 << 24)
+                    | (prev3 << 16)
+                    | (prev2 << 8)
+                    | prev
+                )
+                bucket5 = (
+                    (context5 * 11400714819323198485) & 0xFFFFFFFFFFFFFFFF
+                ) % LITERAL_ORDER5_BUCKETS
+                row5 = self.count5[bucket5]
+                row5_sum = int(row5.sum())
+                if row5_sum > 0:
+                    p5 = float(row5[byte] / row5_sum)
+                    confidence5 = (
+                        row5_sum / (row5_sum + LITERAL_ORDER5_CONFIDENCE)
+                        if LITERAL_ORDER5_CONFIDENCE > 0.0
+                        else 1.0
+                    )
+                    order5_w = LITERAL_ORDER5_WEIGHT * confidence5
 
             order4_w = 0.0
             p4 = base_p
@@ -619,7 +694,8 @@ class LiteralModel:
                 - LITERAL_ORDER1_WEIGHT
                 - order2_w
                 - order3_w
-                - order4_w,
+                - order4_w
+                - order5_w,
             )
             p = (
                 neural_w * base_p
@@ -628,8 +704,10 @@ class LiteralModel:
                 + order2_w * p2
                 + order3_w * p3
                 + order4_w * p4
+                + order5_w * p5
             )
             total_bits += -np.log2(max(p, 1e-300))
+            prev5 = prev4
             prev4 = prev3
             prev3 = prev2
             prev2 = prev

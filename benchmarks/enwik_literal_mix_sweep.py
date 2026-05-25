@@ -19,7 +19,7 @@ from enwik_prefix import default_enwik_path, parse_sizes
 
 def parse_weights(
     text: str,
-) -> list[tuple[float, float, float, float, float, float]]:
+) -> list[tuple[float, float, float, float, float, float, float]]:
     out = []
     for part in text.split(","):
         part = part.strip()
@@ -27,38 +27,47 @@ def parse_weights(
             continue
         pieces = [float(x) for x in part.split(":")]
         if len(pieces) == 2:
+            w5 = 0.0
             w4 = 0.0
             w3 = 0.0
             w2 = 0.0
             w1, w0 = pieces
             confidence = 0.0
         elif len(pieces) == 3:
+            w5 = 0.0
             w4 = 0.0
             w3 = 0.0
             w2, w1, w0 = pieces
             confidence = 0.0
         elif len(pieces) == 4:
+            w5 = 0.0
             w4 = 0.0
             w3 = 0.0
             w2, w1, w0, confidence = pieces
         elif len(pieces) == 5:
+            w5 = 0.0
             w4 = 0.0
             w3, w2, w1, w0, confidence = pieces
         elif len(pieces) == 6:
+            w5 = 0.0
             w4, w3, w2, w1, w0, confidence = pieces
+        elif len(pieces) == 7:
+            w5, w4, w3, w2, w1, w0, confidence = pieces
         else:
             raise ValueError(
                 "weights must be order1:order0, order2:order1:order0, "
                 "order2:order1:order0:confidence, "
                 "order3:order2:order1:order0:confidence, "
-                "or order4:order3:order2:order1:order0:confidence"
+                "order4:order3:order2:order1:order0:confidence, "
+                "or order5:order4:order3:order2:order1:order0:confidence"
             )
-        out.append((w4, w3, w2, w1, w0, confidence))
+        out.append((w5, w4, w3, w2, w1, w0, confidence))
     return out
 
 
 def run_one(
     raw: bytes,
+    w5: float,
     w4: float,
     w3: float,
     w2: float,
@@ -67,6 +76,7 @@ def run_one(
     confidence: float,
     order3_buckets: int,
     order4_buckets: int,
+    order5_buckets: int,
     decode: bool,
 ) -> tuple[int, float, float, str]:
     env = os.environ.copy()
@@ -91,6 +101,9 @@ engine.LITERAL_ORDER3_BUCKETS = __ORDER3_BUCKETS__
 engine.LITERAL_ORDER4_WEIGHT = __W4__
 engine.LITERAL_ORDER4_CONFIDENCE = __CONFIDENCE__
 engine.LITERAL_ORDER4_BUCKETS = __ORDER4_BUCKETS__
+engine.LITERAL_ORDER5_WEIGHT = __W5__
+engine.LITERAL_ORDER5_CONFIDENCE = __CONFIDENCE__
+engine.LITERAL_ORDER5_BUCKETS = __ORDER5_BUCKETS__
 
 compress_mod = importlib.import_module("kolmo.compress")
 decompress_mod = importlib.import_module("kolmo.decompress")
@@ -109,12 +122,14 @@ if __DECODE__:
     if out != data:
         raise SystemExit("round-trip mismatch")
 print(len(blob), f"{enc:.3f}", f"{dec:.3f}", hashlib.sha256(blob).hexdigest()[:16])
-""".replace("__W4__", repr(w4)).replace("__W3__", repr(w3)).replace(
+""".replace("__W5__", repr(w5)).replace("__W4__", repr(w4)).replace("__W3__", repr(w3)).replace(
         "__W2__", repr(w2)
     ).replace("__W1__", repr(w1)).replace("__W0__", repr(w0)).replace(
         "__CONFIDENCE__", repr(confidence)
     ).replace("__ORDER3_BUCKETS__", repr(order3_buckets)).replace(
         "__ORDER4_BUCKETS__", repr(order4_buckets)
+    ).replace(
+        "__ORDER5_BUCKETS__", repr(order5_buckets)
     ).replace("__DECODE__", repr(decode))
     proc = subprocess.run(
         [sys.executable, "-c", script],
@@ -142,11 +157,13 @@ def main() -> None:
         help=(
             "comma-separated order2:order1:order0[:confidence], "
             "order3:order2:order1:order0:confidence, or "
-            "order4:order3:order2:order1:order0:confidence weights"
+            "order4:order3:order2:order1:order0:confidence, or "
+            "order5:order4:order3:order2:order1:order0:confidence weights"
         ),
     )
     parser.add_argument("--order3-buckets", type=int, default=1 << 16)
     parser.add_argument("--order4-buckets", type=int, default=1 << 18)
+    parser.add_argument("--order5-buckets", type=int, default=1 << 18)
     parser.add_argument("--no-decode", action="store_true")
     args = parser.parse_args()
 
@@ -161,21 +178,22 @@ def main() -> None:
     print(f"file: {args.path}")
     print(f"decode: {decode}")
     print(
-        "     size | order4 | order3 | order2 | order1 | order0 |   conf |"
+        "     size | order5 | order4 | order3 | order2 | order1 | order0 |   conf |"
         "     bytes |   ratio |    bpb |      enc | sha"
     )
-    print("-" * 123)
+    print("-" * 134)
     for n in sizes:
         raw = raw_all[:n]
         gz = gzip.compress(raw, compresslevel=9)
         print(
-            f"{n:>9,d} | {'gzip':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {len(gz):>9,d} | "
+            f"{n:>9,d} | {'gzip':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {'-':>6} | {len(gz):>9,d} | "
             f"{len(gz)/n:>7.4f} | {8*len(gz)/n:>6.3f} | {'-':>8} | -",
             flush=True,
         )
-        for w4, w3, w2, w1, w0, confidence in weights:
+        for w5, w4, w3, w2, w1, w0, confidence in weights:
             blob_len, enc, _dec, sha = run_one(
                 raw,
+                w5,
                 w4,
                 w3,
                 w2,
@@ -184,10 +202,11 @@ def main() -> None:
                 confidence,
                 args.order3_buckets,
                 args.order4_buckets,
+                args.order5_buckets,
                 decode,
             )
             print(
-                f"{n:>9,d} | {w4:>6.3f} | {w3:>6.3f} | {w2:>6.3f} | {w1:>6.3f} | {w0:>6.3f} | {confidence:>6.1f} | {blob_len:>9,d} | "
+                f"{n:>9,d} | {w5:>6.3f} | {w4:>6.3f} | {w3:>6.3f} | {w2:>6.3f} | {w1:>6.3f} | {w0:>6.3f} | {confidence:>6.1f} | {blob_len:>9,d} | "
                 f"{blob_len/n:>7.4f} | {8*blob_len/n:>6.3f} | {enc:>8.1f}s | {sha}",
                 flush=True,
             )

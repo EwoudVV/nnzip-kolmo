@@ -79,3 +79,29 @@ def test_literal_model_order4_learns_observed_transition(monkeypatch):
 
     assert probs[ord("e")] > probs[ord("x")]
     assert np.isclose(probs.sum(), 1.0)
+
+
+def test_literal_model_order5_learns_observed_transition(monkeypatch):
+    monkeypatch.setattr(engine, "LITERAL_ORDER5_WEIGHT", 0.25)
+    monkeypatch.setattr(engine, "LITERAL_ORDER5_CONFIDENCE", 1.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER5_BUCKETS", 1 << 12)
+    monkeypatch.setattr(engine, "LITERAL_ORDER4_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER3_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER2_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER1_WEIGHT", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_ORDER0_WEIGHT", 0.0)
+
+    model = LiteralModel()
+    neural = np.ones(256, dtype=np.float64) / 256.0
+
+    # Teach context ("a", "b", "c", "d", "e") -> "f" repeatedly.
+    for _ in range(20):
+        for ch in b"abcdef":
+            model.observe(ch)
+
+    for ch in b"abcde":
+        model.observe(ch)
+    probs = model.probs(neural)
+
+    assert probs[ord("f")] > probs[ord("x")]
+    assert np.isclose(probs.sum(), 1.0)
