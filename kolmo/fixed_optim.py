@@ -95,28 +95,28 @@ def fixed_adam_step(
         if v_old is None:
             v_old = np.zeros_like(grad, dtype=np.int64)
 
+        # m_old/v_old are stored as int64 (FixedAdamState invariant), so the
+        # previous `.astype(int64)` calls were no-op allocations. Skip them.
         g_q31 = g << M_EXTRA_BITS
-        m_num = beta1_num * m_old.astype(np.int64) + (beta1_den - beta1_num) * g_q31
-        m_new = _round_div(m_num, beta1_den).astype(np.int64)
+        m_num = beta1_num * m_old + (beta1_den - beta1_num) * g_q31
+        m_new = _round_div(m_num, beta1_den)
 
         g2_q30 = g * g
         max_shiftable = np.iinfo(np.int64).max >> V_EXTRA_BITS
         g2_q46 = np.minimum(g2_q30, max_shiftable) << V_EXTRA_BITS
-        v_num = beta2_num * v_old.astype(np.int64) + (beta2_den - beta2_num) * g2_q46
-        v_new = _round_div(v_num, beta2_den).astype(np.int64)
+        v_num = beta2_num * v_old + (beta2_den - beta2_num) * g2_q46
+        v_new = _round_div(v_num, beta2_den)
 
         # Bias correction. m is Q31, v is Q46.
+        # max_*_bias_correctable values bound m/v_for_hat so that the
+        # subsequent <<30 shift can't overflow int64 (the shift is the
+        # actual numerator going into one_minus_b1/b2 division).
         max_m_bias_correctable = np.iinfo(np.int64).max >> 30
-        m_for_hat = np.clip(
-            m_new,
-            -max_m_bias_correctable,
-            max_m_bias_correctable,
-        )
-        m_hat_q31 = _round_div(m_for_hat.astype(np.int64) << 30, one_minus_b1)
+        m_for_hat = np.clip(m_new, -max_m_bias_correctable, max_m_bias_correctable)
+        m_hat_q31 = _round_div(m_for_hat << 30, one_minus_b1)
         m_hat = _round_div(m_hat_q31, 1 << M_EXTRA_BITS).astype(np.int32)
-        max_bias_correctable = np.iinfo(np.int64).max >> 30
-        v_for_hat = np.minimum(v_new, max_bias_correctable)
-        v_hat_q46 = _round_div(v_for_hat.astype(np.int64) << 30, one_minus_b2).astype(np.int64)
+        v_for_hat = np.minimum(v_new, max_m_bias_correctable)
+        v_hat_q46 = _round_div(v_for_hat << 30, one_minus_b2)
         # sqrt(Q46) is Q23. Shift down by 8 guard bits to get Q15.
         denom_q23 = fixed.isqrt_vec(np.maximum(v_hat_q46, 0))
         denom = _round_div(denom_q23, 1 << (V_EXTRA_BITS // 2)).astype(np.int32)
