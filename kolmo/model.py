@@ -154,11 +154,22 @@ class CausalSelfAttention(nn.Module):
         new_cache = {"k": k.detach(), "v": v.detach()}
 
         T_total = k.shape[2]
-        scores = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, T_new, T_total)
-        mask = _causal_mask(T_new, T_total, x.device)
-        scores = scores.masked_fill(mask, float("-inf"))
-        attn = F.softmax(scores, dim=-1)
-        out = attn @ v  # (B, H, T_new, d_head)
+        # F.scaled_dot_product_attention is a fused matmul + softmax + matmul
+        # with PyTorch's optimized CPU/GPU kernel. About 2x faster than the
+        # manual `q@k.T * scale -> mask -> softmax -> attn@v` on CPU.
+        # is_causal=True is the fast path but only valid when query length
+        # equals key length (no KV cache). With a cache we pass an explicit
+        # mask; _causal_mask returns True for MASK-OUT, SDPA bool masks use
+        # True for INCLUDE, so we invert.
+        if T_new == T_total:
+            out = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, scale=self.scale,
+            )
+        else:
+            attn_mask = ~_causal_mask(T_new, T_total, x.device)
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, scale=self.scale,
+            )
         out = out.transpose(1, 2).contiguous().view(B, T_new, D)
         return self.proj(out), new_cache
 
