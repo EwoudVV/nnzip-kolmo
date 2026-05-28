@@ -995,7 +995,7 @@ def warm_cache(model: KolmoTransformer, history: list[int]) -> tuple[np.ndarray,
 
     device = next(model.parameters()).device
     x = torch.tensor([history], dtype=torch.long, device=device)
-    with torch.no_grad():
+    with torch.inference_mode():
         logits, caches = model(x, kv_caches=None, pos_offset=0)
     last_logits = logits[0, -1].cpu().numpy().astype(np.float64)
     # Quantize through deterministic int frequencies so probs derived
@@ -1030,7 +1030,7 @@ def step_cache(
 
     device = next(model.parameters()).device
     x = torch.tensor([[byte]], dtype=torch.long, device=device)
-    with torch.no_grad():
+    with torch.inference_mode():
         logits, caches = model(x, kv_caches=caches, pos_offset=pos_offset)
     caches = _trim_caches(caches, CONTEXT)
     last_logits = logits[0, -1].cpu().numpy().astype(np.float64)
@@ -1074,7 +1074,7 @@ def step_cache_batch(
 
     device = next(model.parameters()).device
     x = torch.tensor([list(bytes_list)], dtype=torch.long, device=device)
-    with torch.no_grad():
+    with torch.inference_mode():
         logits, caches = model(x, kv_caches=caches, pos_offset=pos_offset)
     caches = _trim_caches(caches, CONTEXT)
     last_logits = logits[0, -1].cpu().numpy().astype(np.float64)
