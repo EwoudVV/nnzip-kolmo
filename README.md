@@ -96,16 +96,24 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 
 ## Speed (May 2026)
 
-Numbers from the Mac dev machine. ~3.4 M param model (d_model=256, n_heads=8, n_layers=4, max_context=512, tied head/embedding):
+Numbers from the Mac dev machine. ~3.4 M param model (d_model=256, n_heads=8, n_layers=4, max_context=512, tied head/embedding, RoPE default):
 
 | Phase | PyTorch | Fixed |
 |---|---|---|
-| Inner-loop compress per byte | ~14 ms | ~95 ms |
-| Inner-loop decompress per byte | ~9 ms | ~95 ms |
-| Seed warmup (cache miss, full corpus) | ~5 s | ~45 s |
+| Inner-loop compress per byte (4KB skip-prime) | ~10.7 ms | ~71 ms |
+| Inner-loop decompress per byte | ~9.2 ms | ~71 ms |
+| Seed warmup (cache miss, full corpus) | ~70 s | ~45 s |
 | Seed warmup (cache miss, tiny test corpus) | <1 s | ~3 s |
 | Seed warmup (cache hit) | not cached | ~0.9 s |
 | Round-trip on 62-byte payload (skip prime) | ~1 s | ~5.7 s |
+
+Recent PyTorch-path speedups (all bit-equivalent, ratio unchanged):
+- `torch.no_grad()` → `torch.inference_mode()` in inference
+- `_causal_mask` cached per `(T_new, T_total, device)` instead of allocated 15k times per 4KB
+- `RotaryPositionalEmbedding.apply` uses `stack(...).flatten(-2)` instead of `empty_like + strided writes`
+- Manual attention → `F.scaled_dot_product_attention` (small CPU win, would be much bigger on GPU)
+
+4KB enwik-style compress (skip-prime): 108s baseline → 81.8s current (-24%).
 
 The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance, but matmul is now routed through float64 BLAS (bit-identical to int64 for our value ranges — products fit exactly in float64's 53-bit mantissa, so no rounding losses, so reorderings don't change the result).
 
