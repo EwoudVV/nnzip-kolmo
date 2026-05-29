@@ -14,6 +14,9 @@ Environment variables that affect behavior:
     KOLMO_CACHE_DIR=path    override the primed-state cache location
     KOLMO_DEVICE=cpu|cuda   force PyTorch path to a specific device
     KOLMO_USE_ROPE=0        disable RoPE and use learned absolute pos_emb
+    KOLMO_MODEL=full|draft  full (default, 3.4M params) or draft (1.4M params,
+                            ~35% faster, ~0.4 pp ratio cost — for sweeps).
+                            Blobs are NOT interchangeable across presets.
 """
 
 import sys

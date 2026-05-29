@@ -284,6 +284,27 @@ def _use_rope() -> bool:
     return value.lower() in {"1", "true", "yes"}
 
 
+# Model presets for hyperparameter sweeps. The "full" preset is the production
+# default. The "draft" preset trades ~1pp of ratio for ~2x speed — useful when
+# iterating on copy / literal / schedule tuning where the ratio delta between
+# configs is what matters, not absolute ratio. Blobs are NOT interchangeable
+# across presets; set KOLMO_MODEL on both sides.
+_MODEL_PRESETS = {
+    "full": dict(d_model=256, n_heads=8, n_layers=4),
+    "draft": dict(d_model=192, n_heads=6, n_layers=3),
+}
+
+
+def _model_preset() -> str:
+    name = os.environ.get("KOLMO_MODEL", "full").lower()
+    if name not in _MODEL_PRESETS:
+        raise ValueError(
+            f"unknown KOLMO_MODEL preset {name!r}; "
+            f"choices: {sorted(_MODEL_PRESETS)}"
+        )
+    return name
+
+
 def offset_probs(n: int) -> np.ndarray:
     """Static prior over offset values 0..n-1 (representing actual offsets
     1..n). Uses 1/sqrt(k) — a reasonable starting point before any events
@@ -847,7 +868,8 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
     use_rope = _use_rope()
-    model = KolmoTransformer(use_rope=use_rope)
+    preset_kwargs = _MODEL_PRESETS[_model_preset()]
+    model = KolmoTransformer(use_rope=use_rope, **preset_kwargs)
     stable_init_model(model, SEED)
     if _use_fixed():
         fixed_model = FixedModelState(

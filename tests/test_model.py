@@ -181,3 +181,42 @@ def test_rope_round_trip_via_engine_env(monkeypatch, tmp_path):
     data = b"rope round-trip smoke test"
     blob = compress(data)
     assert decompress(blob) == data
+
+
+def test_draft_preset_round_trip(monkeypatch):
+    """KOLMO_MODEL=draft should build a smaller model that still round-trips."""
+    monkeypatch.setenv("KOLMO_MODEL", "draft")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    monkeypatch.delenv("KOLMO_FIXED", raising=False)
+    from kolmo import compress, decompress
+    data = b"draft preset round-trip smoke"
+    blob = compress(data)
+    assert decompress(blob) == data
+
+
+def test_draft_preset_has_smaller_param_count(monkeypatch):
+    """Draft preset should have substantially fewer params than full."""
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    monkeypatch.delenv("KOLMO_FIXED", raising=False)
+    from kolmo._engine import new_model_and_optimizer
+
+    monkeypatch.setenv("KOLMO_MODEL", "full")
+    full_model, _ = new_model_and_optimizer()
+    full_n = sum(p.numel() for p in full_model.parameters())
+
+    monkeypatch.setenv("KOLMO_MODEL", "draft")
+    draft_model, _ = new_model_and_optimizer()
+    draft_n = sum(p.numel() for p in draft_model.parameters())
+
+    assert draft_n < full_n * 0.5, (
+        f"draft should be < half of full: draft={draft_n:,} full={full_n:,}"
+    )
+
+
+def test_unknown_preset_rejected(monkeypatch):
+    monkeypatch.setenv("KOLMO_MODEL", "banana")
+    monkeypatch.setenv("KOLMO_SKIP_PRIME", "1")
+    from kolmo._engine import new_model_and_optimizer
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="unknown KOLMO_MODEL"):
+        new_model_and_optimizer()
