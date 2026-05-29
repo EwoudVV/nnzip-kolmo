@@ -59,15 +59,14 @@ def _attention_warm_q15(
     mask = np.triu(np.ones((T, T), dtype=bool), k=1)
     very_negative = np.int32(-30 * fixed.SCALE)
 
-    heads = []
-    for h in range(n_heads):
-        scores = fixed.matmul(q[h], k[h].T)
-        scores = fixed.mul(scores, np.full_like(scores, scale_q))
-        scores = np.where(mask, very_negative, scores).astype(np.int32)
-        attn = fixed.softmax_q15(scores)
-        heads.append(fixed.matmul(attn, v[h]))
-
-    out = np.stack(heads, axis=1).reshape(T, D)
+    # Batched attention across heads — see _attention_q15 in fixed_model
+    # for the bit-identity argument.
+    scores = fixed.matmul(q, k.transpose(0, 2, 1))  # (H, T, T)
+    scores = fixed.mul(scores, scale_q)
+    scores = np.where(mask[None, :, :], very_negative, scores).astype(np.int32)
+    attn = fixed.softmax_q15(scores)
+    head_out = fixed.matmul(attn, v)  # (H, T, d_head)
+    out = head_out.transpose(1, 0, 2).reshape(T, D)
     return fixed.linear_q15(out, proj_w_q), k, v
 
 
@@ -113,14 +112,13 @@ def _attention_step_q15(
         v_full = np.concatenate([v_cache, v_new], axis=1)
 
     scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
-    heads = []
-    for h in range(n_heads):
-        scores = fixed.matmul(q[h], k_full[h].T)  # (1, T_total)
-        scores = fixed.mul(scores, np.full_like(scores, scale_q))
-        attn = fixed.softmax_q15(scores)
-        heads.append(fixed.matmul(attn, v_full[h]))
-
-    out = np.stack(heads, axis=1).reshape(1, D)
+    # Batched single-token attention. No causal mask needed: new token can
+    # attend to all of cache + itself.
+    scores = fixed.matmul(q, k_full.transpose(0, 2, 1))  # (H, 1, T_total)
+    scores = fixed.mul(scores, scale_q)
+    attn = fixed.softmax_q15(scores)
+    head_out = fixed.matmul(attn, v_full)  # (H, 1, d_head)
+    out = head_out.transpose(1, 0, 2).reshape(1, D)
     return fixed.linear_q15(out, proj_w_q), k_full, v_full
 
 

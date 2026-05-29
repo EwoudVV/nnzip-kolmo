@@ -162,19 +162,19 @@ def _attention_q15(
         k = _apply_rope_q15(k, rope_cos_q, rope_sin_q, position_ids)
 
     scale_q = np.int32(round((1.0 / math.sqrt(d_head)) * fixed.SCALE))
-    heads = []
     mask = _causal_mask_q15(T)
     very_negative = np.int32(-30 * fixed.SCALE)
 
-    for h in range(n_heads):
-        # Q15 scores: q @ k.T then multiply by 1/sqrt(d_head).
-        scores = fixed.matmul(q[h], k[h].T)
-        scores = fixed.mul(scores, np.full_like(scores, scale_q))
-        scores = np.where(mask, very_negative, scores).astype(np.int32)
-        attn = fixed.softmax_q15(scores)
-        heads.append(fixed.matmul(attn, v[h]))
-
-    out = np.stack(heads, axis=1).reshape(T, D)
+    # Batched attention: one matmul per axis (q @ k.T then attn @ v) instead
+    # of n_heads separate calls. fixed.matmul handles n-d inputs naturally
+    # via numpy's @ operator, which dispatches to batched float64 BLAS.
+    # Bit-identical to the per-head loop (verified directly).
+    scores = fixed.matmul(q, k.transpose(0, 2, 1))  # (H, T, T)
+    scores = fixed.mul(scores, scale_q)  # 0-d broadcasts
+    scores = np.where(mask[None, :, :], very_negative, scores).astype(np.int32)
+    attn = fixed.softmax_q15(scores)  # softmax over last axis works batched
+    head_out = fixed.matmul(attn, v)  # (H, T, d_head)
+    out = head_out.transpose(1, 0, 2).reshape(T, D)
     return fixed.linear_q15(out, proj_w_q)
 
 
