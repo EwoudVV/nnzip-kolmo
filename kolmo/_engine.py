@@ -33,7 +33,8 @@ LR = 1e-3
 # training (a known problem at d_model >= ~384). 100 steps ≈ the first
 # 1600 bytes of input, well before any training-block-size doubling.
 LR_WARMUP_STEPS = 100
-CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
+_CONTEXT_ENV = os.environ.get("KOLMO_CONTEXT")
+CONTEXT = int(_CONTEXT_ENV) if _CONTEXT_ENV else 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # base bytes between optimizer steps (early in file)
 # Sublinear training schedule: training interval doubles every N bytes of
 # input seen, capped by CONTEXT-1 so every training slice still has at least
@@ -873,7 +874,18 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
     must call this and get bit-identical starting weights."""
     torch.manual_seed(SEED)
     use_rope = _use_rope()
-    preset_kwargs = _MODEL_PRESETS[_model_preset()]
+    preset_kwargs = dict(_MODEL_PRESETS[_model_preset()])
+    # max_context must exceed the highest absolute position ever indexed.
+    # After warm_cache (positions 0..len(history)-1, len(history) <= CONTEXT),
+    # step_cache increments pos_offset per byte. A training block can grow
+    # up to training_block_size_at == min(BLOCK_SIZE * mult, CONTEXT - 1)
+    # before firing, so the worst case is 2*CONTEXT - 1 (full history +
+    # full pending). Round up to a power of two for clean RoPE tables.
+    min_max_context = 2 * CONTEXT
+    max_context = 512
+    while max_context < min_max_context:
+        max_context *= 2
+    preset_kwargs.setdefault("max_context", max_context)
     model = KolmoTransformer(use_rope=use_rope, **preset_kwargs)
     stable_init_model(model, SEED)
     if _use_fixed():
