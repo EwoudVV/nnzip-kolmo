@@ -292,6 +292,11 @@ def _use_rope() -> bool:
 _MODEL_PRESETS = {
     "full": dict(d_model=256, n_heads=8, n_layers=4),
     "draft": dict(d_model=192, n_heads=6, n_layers=3),
+    # Scaling-law experiment: bigger than full. Earlier 10M-at-4-KB test
+    # showed no benefit because there wasn't enough training data; theory
+    # says it should win once the model has seen enough bytes to actually
+    # use the extra capacity. ~11 M params.
+    "large": dict(d_model=384, n_heads=8, n_layers=6),
 }
 
 
