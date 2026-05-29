@@ -107,13 +107,29 @@ Numbers from the Mac dev machine. ~3.4 M param model (d_model=256, n_heads=8, n_
 | Seed warmup (cache hit) | not cached | ~0.9 s |
 | Round-trip on 62-byte payload (skip prime) | ~1 s | ~5.7 s |
 
-Recent PyTorch-path speedups (all bit-equivalent, ratio unchanged):
+Recent PyTorch-path speedups (all bit-equivalent except the schedule change, which deliberately trades training cadence for speed):
 - `torch.no_grad()` → `torch.inference_mode()` in inference
 - `_causal_mask` cached per `(T_new, T_total, device)` instead of allocated 15k times per 4KB
 - `RotaryPositionalEmbedding.apply` uses `stack(...).flatten(-2)` instead of `empty_like + strided writes`
 - Manual attention → `F.scaled_dot_product_attention` (small CPU win, would be much bigger on GPU)
+- Training schedule doubles every 2 KB instead of 4 KB (caps the per-byte training cost sooner; ratio neutral)
 
-4KB enwik-style compress (skip-prime): 108s baseline → 81.8s current (-24%).
+4KB enwik-style compress (skip-prime), running ledger:
+- baseline (pre-sprint): 108 s
+- after inference path cleanup: 81.8 s (-24%)
+- after schedule doubling=2048: 78.1 s (-28%)
+- after `KOLMO_MODEL=draft` preset: 50.9 s (-53%) — only ~+0.4 pp ratio cost
+
+### `KOLMO_MODEL` presets
+
+For hyperparameter sweeps you can switch to the draft preset:
+
+| preset | params | 4 KB total | 16 KB enwik total | 4 KB ratio | 16 KB enwik bpb |
+|---|---|---|---|---|---|
+| `full` (default) | 3.4 M | 78 s | 174 s | 0.4551 | 2.953 |
+| `draft` | 1.4 M | 51 s | 111 s | 0.4590 | 2.967 |
+
+The 0.014 bpb gap on 16 KB enwik is small enough that ratio *deltas* between configs are visible — useful for sweeping copy / literal / schedule knobs at ~2x cadence, then validating the winning config on `full`. Blobs are not interchangeable across presets (different model architectures), so set `KOLMO_MODEL=draft` on both compress and decompress.
 
 The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance, but matmul is now routed through float64 BLAS (bit-identical to int64 for our value ranges — products fit exactly in float64's 53-bit mantissa, so no rounding losses, so reorderings don't change the result).
 
@@ -193,6 +209,8 @@ python benchmarks/determinism/hash_fixed_compress.py
 | `KOLMO_NO_SEED_CACHE` | `0` | `1` forces fixed-mode prime to re-run, ignoring `~/.cache/kolmo/` |
 | `KOLMO_CACHE_DIR` | `~/.cache/kolmo` | override the primed-state cache location |
 | `KOLMO_DEVICE` | auto | force PyTorch path to `cpu` or `cuda` |
+| `KOLMO_MODEL` | `full` | `draft` selects a smaller 1.4 M model for faster iteration (set on both compress + decompress; blobs aren't interchangeable) |
+| `KOLMO_USE_ROPE` | `1` | `0` falls back to learned absolute position embeddings |
 
 ## License
 
