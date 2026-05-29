@@ -35,12 +35,19 @@ LR = 1e-3
 LR_WARMUP_STEPS = 100
 CONTEXT = 256  # sliding-window cap (max tokens kept in KV cache)
 BLOCK_SIZE = 16  # base bytes between optimizer steps (early in file)
-# Sublinear training schedule: training interval doubles every 4KB of input
-# seen, capped by CONTEXT-1 so every training slice still has at least one
-# preceding token to predict the first byte of the block. Rationale: the model
-# adapts fastest in the first few KB. After that each additional Adam step
-# contributes less per byte.
-_TRAIN_SCHEDULE_DOUBLING_BYTES = 4096
+# Sublinear training schedule: training interval doubles every N bytes of
+# input seen, capped by CONTEXT-1 so every training slice still has at least
+# one preceding token to predict the first byte of the block. Rationale: the
+# model adapts fastest in the first few KB. After that each additional Adam
+# step contributes less per byte.
+#
+# Schedule sweep at 4KB (skip-prime, mixed prose):
+#   doubling=4096 (old): 4096->1868  ratio=0.4561  total=107.5s
+#   doubling=2048      : 4096->1864  ratio=0.4551  total= 92.5s   (-14%, -0.10pp)
+# 2048 is a clear win — slightly better ratio AND faster, because halving the
+# doubling distance gets the schedule to bigger block sizes sooner, which
+# saves more backward calls without losing meaningful early-file adaptation.
+_TRAIN_SCHEDULE_DOUBLING_BYTES = 2048
 _TRAIN_SCHEDULE_MAX_MULT = 32
 
 
