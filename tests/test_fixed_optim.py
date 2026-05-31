@@ -68,3 +68,50 @@ def test_fixed_adam_rejects_unknown_gradient():
     grads = {"missing": quantize(np.zeros((2, 2), dtype=np.float64))}
     with pytest.raises(KeyError):
         fixed_adam_step(params, grads)
+
+
+def test_fixed_adam_numba_matches_numpy_fallback(monkeypatch):
+    """The fused-numba Adam kernel must produce bit-identical params/m/v as
+    the pure-numpy fallback for every step, across a multi-step trajectory.
+    This is the contract that lets fixed mode keep its cross-machine
+    determinism guarantee — if the kernel and the fallback diverge by even
+    one bit, fixed-mode blobs would be platform-dependent again.
+    """
+    from kolmo import _kernels
+
+    if not _kernels.HAS_NUMBA:
+        pytest.skip("numba not installed; nothing to compare against")
+
+    rng = np.random.default_rng(123)
+    init = quantize(rng.normal(size=(6, 7)).astype(np.float64) * 0.1)
+    grads_seq = [
+        {"w": quantize(rng.normal(size=(6, 7)).astype(np.float64) * 0.02)}
+        for _ in range(6)
+    ]
+
+    # Numba path
+    params_n = {"w": init.copy()}
+    state_n = init_fixed_adam_state()
+    for g in grads_seq:
+        state_n = fixed_adam_step(params_n, {"w": g["w"].copy()}, state_n)
+
+    # Numpy fallback path — flip HAS_NUMBA off + null out the kernel symbol
+    # so the dispatch in fixed_adam_step falls through to the numpy block.
+    monkeypatch.setattr(_kernels, "HAS_NUMBA", False)
+    monkeypatch.setattr(_kernels, "_fused_adam_step_numba", None)
+    params_p = {"w": init.copy()}
+    state_p = init_fixed_adam_state()
+    for g in grads_seq:
+        state_p = fixed_adam_step(params_p, {"w": g["w"].copy()}, state_p)
+
+    assert np.array_equal(params_n["w"], params_p["w"]), (
+        "numba Adam diverged from numpy fallback in params"
+    )
+    assert np.array_equal(state_n.m["w"], state_p.m["w"]), (
+        "numba Adam diverged from numpy fallback in m"
+    )
+    assert np.array_equal(state_n.v["w"], state_p.v["w"]), (
+        "numba Adam diverged from numpy fallback in v"
+    )
+    assert state_n.beta1_pow_q30 == state_p.beta1_pow_q30
+    assert state_n.beta2_pow_q30 == state_p.beta2_pow_q30
