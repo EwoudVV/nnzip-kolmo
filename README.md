@@ -135,7 +135,7 @@ The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~5
 
 Where the time goes now (from cProfile on the 5.7s round-trip):
 
-- `fixed_adam_step`: ~2.9 s — per-tensor Adam moments + bias correction
+- `fixed_adam_step`: ~1.4 s — was 2.9 s before A2 fused the 17-stage per-tensor numpy pipeline into one numba pass (2.1x on the draft tensor zoo, bit-identical to the numpy fallback). Round-trip bench in fixed mode dropped accordingly.
 - `isqrt_vec`: ~1.5 s (Newton sqrt used by LayerNorm and Adam's `sqrt(v)`)
 - `matmul` (now float64 BLAS): not in the top profile entries
 - Everything else: ~1.3 s
