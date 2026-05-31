@@ -87,6 +87,23 @@ COPY_USE_LITERAL_MODEL_PROXY = False
 # for wiki markup and punctuation. Strong mixes hurt enwik; the default is a
 # order-2 carries the file-local byte structure; keep small order-1/order-0
 # backoff nudges for contexts that are still cold.
+# KOLMO_LITERAL chooses the literal-model strategy at module load:
+#   "ppm" — PPM-C style escape blend (longest available context, then back off);
+#           default. Each byte pays its actual escape cost only for orders that
+#           didn't match. -0.018 bpb vs "mix" on 16 KB enwik9 prefix at
+#           neural_w=0.50 (full preset: 6048 -> 6012 bytes).
+#   "mix" — fixed-weight blend of order-0/1/2/4 with confidence ramps (legacy)
+_LITERAL_STRATEGY = os.environ.get("KOLMO_LITERAL", "ppm").lower()
+if _LITERAL_STRATEGY not in {"mix", "ppm"}:
+    raise ValueError(
+        f"KOLMO_LITERAL must be 'mix' or 'ppm', got {_LITERAL_STRATEGY!r}"
+    )
+# For PPM mode: how much weight to put on the neural distribution when blending
+# with the PPM byte-context distribution. 0 = pure PPM; 1 = pure neural.
+# 0.50 wins on 16 KB enwik9 for both draft and full presets; re-sweep at larger
+# scales as the neural model accumulates more training signal.
+LITERAL_NEURAL_WEIGHT = float(os.environ.get("KOLMO_NEURAL_WEIGHT", "0.50"))
+
 LITERAL_ORDER2_WEIGHT = 0.40
 LITERAL_ORDER1_WEIGHT = 0.02
 LITERAL_ORDER0_WEIGHT = 0.005
@@ -490,7 +507,109 @@ class LiteralModel:
         self.prev2 = BOS
         self.prev = BOS
 
+    def _ppm_distribution(self) -> np.ndarray:
+        """PPM-C blended byte distribution.
+
+        Walks orders 5, 4, 3, 2, 1, 0 from longest to shortest. Orders
+        whose count tables are None (weight = 0) are skipped. At each
+        order:
+          - p(b) = count[b] / (sum + distinct)  for b seen at this order
+          - escape = distinct / (sum + distinct)
+        A byte's final probability is the first (longest-context) match
+        times all the escapes above it. Bytes that never appear at any
+        order get a tiny uniform 1/256 share of the remaining escape.
+
+        This is the principled way to combine variable-order context
+        counts — every byte pays its actual escape cost only for the
+        orders that didn't match, instead of paying the static blend
+        every time like the legacy "mix" strategy.
+        """
+        p = np.zeros(256, dtype=np.float64)
+        accounted = np.zeros(256, dtype=bool)
+        escape = 1.0
+
+        def fold(row: np.ndarray) -> None:
+            nonlocal escape
+            s = row.sum()
+            if s <= 0.0:
+                return
+            seen = row > 0.0
+            distinct = float(seen.sum())
+            denom = s + distinct
+            mask = seen & ~accounted
+            p[mask] += escape * row[mask] / denom
+            accounted[seen] = True
+            escape *= distinct / denom
+
+        # Order 5 (hashed) — only walked if user has enabled it.
+        if self.count5 is not None:
+            ctx5 = (
+                (self.prev5 << 32)
+                | (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            fold(
+                self.count5[
+                    literal_context_bucket(ctx5, LITERAL_ORDER5_BUCKETS)
+                ].astype(np.float64)
+            )
+
+        # Order 4 (hashed)
+        if self.count4 is not None:
+            ctx4 = (
+                (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            fold(
+                self.count4[
+                    literal_context_bucket(ctx4, LITERAL_ORDER4_BUCKETS)
+                ].astype(np.float64)
+            )
+
+        # Order 3 (hashed) — disabled by default.
+        if self.count3 is not None:
+            ctx3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
+            fold(
+                self.count3[
+                    literal_context_bucket(ctx3, LITERAL_ORDER3_BUCKETS)
+                ].astype(np.float64)
+            )
+
+        # Order 2 (dense)
+        ctx2 = (self.prev2 << 8) | self.prev
+        fold(self.count2[ctx2].astype(np.float64))
+
+        # Order 1 (dense, float counts include prior)
+        fold(self.count1[self.prev])
+
+        # Order 0 (float counts always positive due to prior=1.0)
+        fold(self.count0)
+
+        # Anything still unaccounted (only possible if all orders had
+        # s=0, which can't happen because order 0 always has prior=1.0).
+        # Spread remaining escape uniformly as a defensive fallback.
+        unaccounted = ~accounted
+        n_unaccounted = int(unaccounted.sum())
+        if n_unaccounted > 0:
+            p[unaccounted] += escape / 256.0
+
+        return p / p.sum()
+
     def probs(self, neural_probs: np.ndarray) -> np.ndarray:
+        if _LITERAL_STRATEGY == "ppm":
+            p_neural = neural_probs.astype(np.float64, copy=False)
+            n_sum = p_neural.sum()
+            if n_sum > 0.0:
+                p_neural = p_neural / n_sum
+            p_ppm = self._ppm_distribution()
+            w = LITERAL_NEURAL_WEIGHT
+            mixed = w * p_neural + (1.0 - w) * p_ppm
+            return mixed / mixed.sum()
+
         p = neural_probs.astype(np.float64, copy=True)
         if (
             LITERAL_ORDER0_WEIGHT <= 0.0

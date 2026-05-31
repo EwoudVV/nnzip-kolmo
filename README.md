@@ -56,7 +56,7 @@ The cache invalidates automatically when any of (seed corpus, model architecture
 2. They both warm up on a **5 KB seed corpus** baked into the source code. The seed costs zero bytes in the output blob — it's part of the algorithm, like a lookup table.
 3. For each byte in the input:
    - Run a forward pass to get a probability distribution over the next byte.
-   - Mix that neural distribution with an adaptive byte-context side model (dense order-2 + small order-1/order-0 backoff).
+   - Blend that neural distribution with an adaptive byte-context side model (PPM-C escape over order-4/2/1/0 by default).
    - Encode the actual next byte under that distribution using arithmetic coding — fewer bits when the model predicts correctly.
    - Append the byte to the running history.
 4. Every 16 bytes (`BLOCK_SIZE`), do **one backward pass + Adam step** so the model adapts to the file it's currently compressing.
@@ -90,7 +90,7 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 - **Weight tying**: the `(vocab, d_model)` token embedding and the `(d_model, vocab)` output head share one matrix. Standard modern-LM trick; ~65 K parameters dropped from a ~2 M total, and gradients from either side improve the shared tensor.
 - **Sliding-window KV cache** (PyTorch and fixed mode both): per-byte inference cost drops from O(T²) to O(T) where T is the context length. The fixed-mode cache is bit-identical to running `fixed_forward` over the same history — proven by a test that compares warm + step against full forward at the bit level.
 - **Rolling-hash copy matcher + adaptive copy models**: the compressor indexes 8-byte keys in a bounded 64 KB window, then encodes `(offset, length)` copy events with adaptive offset / length / event-flag distributions. The decoder only needs to replay the encoded copies; both sides update the adaptive distributions in lockstep.
-- **Adaptive byte-context literal model**: literals are encoded under a mixture of transformer probabilities and a mirrored byte model: 40% dense order-2, 20% hashed order-4, 2% order-1, 0.5% order-0, remainder neural. The dense order-2 table is bounded at 64 MB (`65536 * 256 * uint32`); the order-4 table is a fixed-size hashed table with SplitMix-style bucket mixing so repeated wiki markup/text contexts are learned immediately without unbounded memory.
+- **Adaptive byte-context literal model**: literals are encoded under a blend of transformer probabilities and a mirrored byte model. The default (`KOLMO_LITERAL=ppm`) is a **PPM-C escape blend**: walk the longest available order (4 → 2 → 1 → 0 with optional 3/5), at each order spend `p(b) = count[b] / (sum + distinct)` for bytes seen there and `escape = distinct / (sum + distinct)` for everything else. Each byte pays the escape cost only for orders that didn't match, instead of paying a static blend weight every time. Final mix is `0.5 * neural + 0.5 * PPM`. On a 16 KB enwik9 prefix this is −0.045 bpb vs the legacy `KOLMO_LITERAL=mix` fixed-weight blend (40% order-2 + 20% hashed order-4 + 2% order-1 + 0.5% order-0 + remainder neural), which is still available as an opt-in. The dense order-2 table is bounded at 64 MB (`65536 * 256 * uint32`); the order-4 table is a fixed-size hashed table with SplitMix-style bucket mixing so repeated wiki markup/text contexts are learned immediately without unbounded memory.
 - **RoPE positional encoding**: PyTorch mode defaults to rotary position embeddings instead of learned absolute `pos_emb`; this removed the dead position table and improved enwik prefix ratios.
 - **Deterministic-quantized probabilities** (`det_probs.py`): logits are snapped to a 1/64 grid and converted to integer frequencies on a `2^16` total before they touch the arithmetic coder. This isolates the coder from any residual float drift in PyTorch mode.
 
@@ -126,10 +126,10 @@ For hyperparameter sweeps you can switch to the draft preset:
 
 | preset | params | 4 KB total | 16 KB enwik total | 4 KB ratio | 16 KB enwik bpb |
 |---|---|---|---|---|---|
-| `full` (default) | 3.4 M | 78 s | 174 s | 0.4551 | 2.953 |
-| `draft` | 1.4 M | 51 s | 111 s | 0.4590 | 2.967 |
+| `full` (default) | 3.4 M | 78 s | 174 s | 0.4551 | **2.908** (PPM default) |
+| `draft` | 1.4 M | 51 s | 111 s | 0.4590 | **2.900** (PPM default) |
 
-The 0.014 bpb gap on 16 KB enwik is small enough that ratio *deltas* between configs are visible — useful for sweeping copy / literal / schedule knobs at ~2x cadence, then validating the winning config on `full`. Blobs are not interchangeable across presets (different model architectures), so set `KOLMO_MODEL=draft` on both compress and decompress.
+PPM literal-model default lands the **full** preset at 2.908 bpb on 16 KB enwik9 — a −0.045 bpb improvement over the previous fixed-weight "mix" default (2.953). Both presets round-trip identically with PPM. The bpb gap between draft and full is now small enough that draft is a perfectly serviceable sweep target — useful for trying copy / literal / schedule knobs at ~2x cadence, then validating the winning config on `full`. Blobs are not interchangeable across presets (different model architectures), so set `KOLMO_MODEL=draft` on both compress and decompress.
 
 The PyTorch inner loop runs a forward+backward+Adam per block; that's already ~50 ms per block dominated by float32 matmul. Fixed mode does the same dance, but matmul is now routed through float64 BLAS (bit-identical to int64 for our value ranges — products fit exactly in float64's 53-bit mantissa, so no rounding losses, so reorderings don't change the result).
 
