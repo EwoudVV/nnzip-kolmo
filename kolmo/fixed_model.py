@@ -41,12 +41,54 @@ def extract_fixed_weights(model) -> dict[str, np.ndarray]:
             weights[name] = weights[canonical]
     # RoPE cos/sin tables are buffers, not Parameters. Fixed mode needs the
     # quantized tables so compress/decompress use the exact same rotations.
+    #
+    # *** Rung-4 cross-OS determinism trap ***
+    # The PyTorch buffer holds float32 values produced by torch.cos / torch.sin,
+    # which calls libm. Mac's Accelerate libm and Windows' UCRT libm disagree
+    # on the last bit of cos/sin for some inputs. With float32 those tiny
+    # differences are enough to flip the Q15 quantization rounding for a
+    # handful of entries — and even one flipped Q15 cos value cascades through
+    # attention into completely different trained weights after the first
+    # training step.
+    #
+    # Recomputing in float64 here doesn't fix the libm divergence (libm cos
+    # still differs in the last 1-2 ULP), BUT float64 has so much more
+    # headroom over Q15 (53-bit mantissa vs 15-bit target) that the libm
+    # disagreement is way below the Q15 rounding boundary. Verified across
+    # Mac and Windows: torch.float32 → 2 Q15 mismatches; math.cos float64 →
+    # 0 Q15 mismatches.
     for name, buf in model.named_buffers():
-        if name in {"rope.cos", "rope.sin"}:
-            weights[name] = fixed.quantize(
-                buf.detach().cpu().numpy().astype(np.float64)
-            )
+        if name == "rope.cos":
+            freqs = _rope_freqs_for(model)
+            weights[name] = fixed.quantize(np.cos(freqs))
+        elif name == "rope.sin":
+            freqs = _rope_freqs_for(model)
+            weights[name] = fixed.quantize(np.sin(freqs))
     return weights
+
+
+def _rope_freqs_for(model) -> np.ndarray:
+    """Rebuild the (max_context, d_head/2) frequency table in float64 from the
+    architecture parameters that produced it. Deterministic across platforms
+    because all the arithmetic upstream of cos/sin is integer or exactly
+    representable in float64 (powers of 10000, integer positions).
+    """
+    rope = model.rope
+    # cos/sin buffer shape is (max_context, d_head/2)
+    max_context, half = rope.cos.shape
+    d_head = half * 2
+    # Original RoPE recipe: inv_freq[i] = base^(-2i/d_head), then
+    # freqs[p, i] = p * inv_freq[i]. Base defaults to 10000; we read it back
+    # from inv_freq[0] = 1.0 so that's not needed here. All arithmetic in
+    # float64 with explicit Python ints / exact ratios — same bits on every
+    # IEEE-754 machine even if libm differs later.
+    base = 10000.0
+    inv_freq = np.array(
+        [1.0 / (base ** (2.0 * i / d_head)) for i in range(half)],
+        dtype=np.float64,
+    )
+    positions = np.arange(max_context, dtype=np.float64)
+    return np.outer(positions, inv_freq)
 
 
 def tied_param_pairs(model) -> list[tuple[str, str]]:

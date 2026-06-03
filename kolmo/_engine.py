@@ -8,6 +8,7 @@ a full forward over the recent history with gradient tracking, but that's
 only done once per block.
 """
 
+import math
 import os
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -335,7 +336,7 @@ def offset_probs(n: int) -> np.ndarray:
     if n <= 0:
         return np.array([], dtype=np.float64)
     raw = 1.0 / np.sqrt(np.arange(1, n + 1, dtype=np.float64))
-    return raw / raw.sum()
+    return raw / math.fsum(raw)
 
 
 def length_probs(n: int) -> np.ndarray:
@@ -345,7 +346,7 @@ def length_probs(n: int) -> np.ndarray:
     if n <= 0:
         return np.array([], dtype=np.float64)
     raw = 1.0 / np.arange(1, n + 1, dtype=np.float64)
-    return raw / raw.sum()
+    return raw / math.fsum(raw)
 
 
 class LengthModel:
@@ -388,13 +389,13 @@ class LengthModel:
             weights=exact_prior,
             minlength=n.bit_length(),
         )
-        prior = prior / prior.sum() * prior_strength
+        prior = prior / math.fsum(prior) * prior_strength
         self.counts = prior.astype(np.float64)
         self.residual_counts: list[np.ndarray] = []
         for bucket in range(n.bit_length()):
             lo, hi = self.bucket_bounds(bucket, n)
             exact = exact_prior[lo : hi + 1].copy()
-            exact = exact / exact.sum() * residual_prior_strength
+            exact = exact / math.fsum(exact) * residual_prior_strength
             self.residual_counts.append(exact.astype(np.float64))
 
     @staticmethod
@@ -420,13 +421,13 @@ class LengthModel:
         if max_n <= 0:
             return np.array([], dtype=np.float64)
         p = self.counts[: max_n.bit_length()].copy()
-        return p / p.sum()
+        return p / math.fsum(p)
 
     def residual_probs_for(self, bucket: int, max_n: int) -> np.ndarray:
         lo, hi = self.bucket_bounds(bucket, max_n)
         width = hi - lo + 1
         p = self.residual_counts[bucket][:width].copy()
-        return p / p.sum()
+        return p / math.fsum(p)
 
     def observe(self, length_offset: int) -> None:
         bucket = self.bucket_for(length_offset)
@@ -530,7 +531,11 @@ class LiteralModel:
 
         def fold(row: np.ndarray) -> None:
             nonlocal escape
-            s = row.sum()
+            # row is float64 of small exact-integer counts; sum is small enough
+            # to be exact regardless of order, but fsum makes that guarantee
+            # version-independent. seen.sum() is a bool reduction → integer
+            # count, already deterministic.
+            s = math.fsum(row)
             if s <= 0.0:
                 return
             seen = row > 0.0
@@ -597,18 +602,25 @@ class LiteralModel:
         if n_unaccounted > 0:
             p[unaccounted] += escape / 256.0
 
-        return p / p.sum()
+        # Use math.fsum for the final renorm: numpy's vectorized .sum()
+        # gives platform-dependent results in the last ULP across SIMD
+        # widths and numpy versions, which propagates through float
+        # division and ultimately changes the int frequencies passed to
+        # the arithmetic coder — a Rung-4 (cross-platform) bug. fsum is
+        # the correctly-rounded float sum, order-independent, stdlib.
+        return p / math.fsum(p)
 
     def probs(self, neural_probs: np.ndarray) -> np.ndarray:
         if _LITERAL_STRATEGY == "ppm":
             p_neural = neural_probs.astype(np.float64, copy=False)
-            n_sum = p_neural.sum()
+            # fsum, not np.sum: see comment at end of _ppm_distribution.
+            n_sum = math.fsum(p_neural)
             if n_sum > 0.0:
                 p_neural = p_neural / n_sum
             p_ppm = self._ppm_distribution()
             w = LITERAL_NEURAL_WEIGHT
             mixed = w * p_neural + (1.0 - w) * p_ppm
-            return mixed / mixed.sum()
+            return mixed / math.fsum(mixed)
 
         p = neural_probs.astype(np.float64, copy=True)
         if (
@@ -619,7 +631,7 @@ class LiteralModel:
             and LITERAL_ORDER4_WEIGHT <= 0.0
             and LITERAL_ORDER5_WEIGHT <= 0.0
         ):
-            return p / p.sum()
+            return p / math.fsum(p)
 
         order5_w = 0.0
         p5 = p
@@ -680,9 +692,13 @@ class LiteralModel:
                 )
                 order3_w = LITERAL_ORDER3_WEIGHT * confidence3
 
-        p0 = self.count0 / self.count0.sum()
+        # count0/count1 hold exact-integer float64 values whose sum is small
+        # enough to be exact in float64 regardless of summation order, so
+        # np.sum here is *probably* deterministic — but let's not depend on
+        # numpy's vectorized reduction being conservative across versions.
+        p0 = self.count0 / math.fsum(self.count0)
         row = self.count1[self.prev]
-        p1 = row / row.sum()
+        p1 = row / math.fsum(row)
         context2 = (self.prev2 << 8) | self.prev
         row2 = self.count2[context2]
         row2_sum = int(row2.sum())
@@ -715,7 +731,7 @@ class LiteralModel:
             + order4_w * p4
             + order5_w * p5
         )
-        return mixed / mixed.sum()
+        return mixed / math.fsum(mixed)
 
     def observe(self, byte: int) -> None:
         self.count0[byte] += 1.0
@@ -771,7 +787,7 @@ class LiteralModel:
         if not seq:
             return 0.0
         base_p = 2.0 ** (-neural_bpb)
-        count0_sum = self.count0.sum()
+        count0_sum = math.fsum(self.count0)
         prev5 = self.prev5
         prev4 = self.prev4
         prev3 = self.prev3
@@ -781,7 +797,7 @@ class LiteralModel:
         for byte in seq:
             p0 = float(self.count0[byte] / count0_sum)
             row1 = self.count1[prev]
-            p1 = float(row1[byte] / row1.sum())
+            p1 = float(row1[byte] / math.fsum(row1))
 
             context2 = (prev2 << 8) | prev
             row2 = self.count2[context2]
@@ -917,7 +933,7 @@ class OffsetModel:
         buckets = np.array([self.bucket_for(int(o)) for o in offsets], dtype=np.int64)
         raw = 1.0 / np.sqrt(offsets.astype(np.float64))
         prior = np.bincount(buckets, weights=raw, minlength=window.bit_length())
-        prior = prior / prior.sum() * prior_strength
+        prior = prior / math.fsum(prior) * prior_strength
         self.counts = prior.astype(np.float64)
         self.residual_counts: list[np.ndarray] = []
         for bucket in range(window.bit_length()):
@@ -926,7 +942,7 @@ class OffsetModel:
             residual_prior = 1.0 / np.sqrt(bucket_offsets)
             residual_prior = (
                 residual_prior
-                / residual_prior.sum()
+                / math.fsum(residual_prior)
                 * residual_prior_strength
             )
             self.residual_counts.append(residual_prior.astype(np.float64))
@@ -936,7 +952,7 @@ class OffsetModel:
         if max_offset <= 0:
             return np.array([], dtype=np.float64)
         p = self.counts[: max_offset.bit_length()].copy()
-        return p / p.sum()
+        return p / math.fsum(p)
 
     @staticmethod
     def bucket_for(offset: int) -> int:
@@ -958,7 +974,7 @@ class OffsetModel:
         lo, hi = self.bucket_bounds(bucket, max_offset)
         width = hi - lo + 1
         p = self.residual_counts[bucket][:width].copy()
-        return p / p.sum()
+        return p / math.fsum(p)
 
     def observe(self, offset: int) -> None:
         """Record an offset observation by bucket and residual."""
