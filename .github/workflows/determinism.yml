@@ -59,6 +59,12 @@ jobs:
             python benchmarks/determinism/hash_fixed_training.py
             echo "== hash_fixed_compress =="
             python benchmarks/determinism/hash_fixed_compress.py
+            echo "== hash_fixed_compress_long =="
+            # Longer PPM-mode probe — added after a real cross-OS bug
+            # (RoPE Q15 cos table flipped on a libm last-bit difference) shipped
+            # under green CI because the short probe didn't trigger enough
+            # training to expose the cascade. See the probe's docstring.
+            python benchmarks/determinism/hash_fixed_compress_long.py
           } > "determinism-${{ matrix.label }}.txt"
           cat "determinism-${{ matrix.label }}.txt"
 

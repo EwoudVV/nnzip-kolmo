@@ -331,6 +331,53 @@ def test_extract_fixed_weights_aliases_tied_head():
     assert tied_param_pairs(model) == [("token_emb.weight", "head.weight")]
 
 
+def test_extract_fixed_weights_uses_float64_rope_cos_sin():
+    """The Q15 RoPE cos/sin tables must be computed from a float64 freqs
+    table, not from the PyTorch model's float32 buffer.
+
+    Why: torch.cos / torch.sin on the float32 freqs buffer was producing
+    Q15 cos values that disagreed in 2 entries between Mac's Accelerate
+    libm and Windows' UCRT libm. One flipped Q15 cos cascaded through
+    attention into completely different trained weights after the first
+    training step, breaking Rung 4 cross-OS determinism. The fix routes
+    extraction through a freshly-recomputed float64 freqs table whose
+    libm output has ~38 bits of headroom over Q15.
+
+    Structural check: the Q15 cos table extracted from the model must
+    equal `fixed.quantize(np.cos(freqs))` computed from the same
+    architecture parameters in pure float64. If they differ, someone
+    reintroduced the float32 path.
+    """
+    from kolmo import fixed
+    from kolmo.fixed_model import _rope_freqs_for
+
+    model = KolmoTransformer(
+        d_model=64,
+        n_heads=4,
+        n_layers=2,
+        max_context=128,
+        tie_weights=False,
+        use_rope=True,
+    )
+    stable_init_model(model, seed=42)
+    weights = extract_fixed_weights(model)
+
+    freqs = _rope_freqs_for(model)
+    assert freqs.dtype == np.float64, (
+        "_rope_freqs_for must return float64 — the entire point of the "
+        "Rung-4 fix is to have ~38 bits of headroom over Q15"
+    )
+    expected_cos_q = fixed.quantize(np.cos(freqs))
+    expected_sin_q = fixed.quantize(np.sin(freqs))
+    assert np.array_equal(weights["rope.cos"], expected_cos_q), (
+        "rope.cos Q15 table doesn't match np.cos(float64 freqs) — "
+        "someone reintroduced a path that uses the PyTorch float32 buffer"
+    )
+    assert np.array_equal(weights["rope.sin"], expected_sin_q), (
+        "rope.sin Q15 table doesn't match np.sin(float64 freqs)"
+    )
+
+
 def test_fixed_train_block_respects_weight_tying():
     """One training step in fixed mode must:
     1. Sum head + token_emb gradients before Adam (matching PyTorch's autograd
