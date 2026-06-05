@@ -51,6 +51,14 @@ BLOCK_SIZE = 16  # base bytes between optimizer steps (early in file)
 # saves more backward calls without losing meaningful early-file adaptation.
 _TRAIN_SCHEDULE_DOUBLING_BYTES = 2048
 _TRAIN_SCHEDULE_MAX_MULT = 32
+# Coalesce multiplier on the schedule threshold. Larger = fewer training
+# steps, each one over a proportionally larger block. Effect saturates at
+# the CONTEXT-1 cap (when COALESCE * BLOCK_SIZE * mult >= CONTEXT-1 the
+# multiplier stops mattering). cProfile on a 2 KB compress showed
+# `train_block` is ~57% of total runtime — coalescing is the directly
+# targetable lever for that bucket. Both compress and decompress read this
+# value at module load, so they stay in lockstep without exchanging state.
+_TRAIN_COALESCE = max(1, int(os.environ.get("KOLMO_TRAIN_COALESCE", "1")))
 
 
 def training_block_size_at(bytes_observed: int) -> int:
@@ -63,7 +71,7 @@ def training_block_size_at(bytes_observed: int) -> int:
     """
     bucket = bytes_observed // _TRAIN_SCHEDULE_DOUBLING_BYTES
     mult = min(1 << bucket, _TRAIN_SCHEDULE_MAX_MULT)
-    return min(BLOCK_SIZE * mult, CONTEXT - 1)
+    return min(_TRAIN_COALESCE * BLOCK_SIZE * mult, CONTEXT - 1)
 BOS = 0  # implicit start-of-stream byte, never written to disk
 COPY_PROB = 0.005
 COPY_WINDOW = 65536
@@ -1103,6 +1111,26 @@ def new_model_and_optimizer() -> tuple[KolmoTransformer | FixedModelState, torch
         return fixed_model, None
     model.to(_select_device())
     model.train()
+    if os.environ.get("KOLMO_TORCH_COMPILE", "0").lower() not in ("0", "false", ""):
+        # Opt-in torch.compile. The profile shows ~3.7 s spent in
+        # torch._C._nn.linear on a 2 KB compress, almost all of it small-
+        # matmul dispatch overhead — exactly what compile fuses away.
+        # Default OFF because: (1) determinism guarantees are PyTorch-mode-
+        # only and we haven't proven the compiled graph is bit-identical
+        # across machines; (2) the first call triggers a compile pass that
+        # can take several seconds, which is annoying for the tiny-payload
+        # regression tests; (3) Dynamo isn't supported on every (torch,
+        # python) pair — torch 2.2 on Python 3.12 raises at compile time.
+        # Toggle with KOLMO_TORCH_COMPILE=1.
+        try:
+            model = torch.compile(model)
+        except RuntimeError as exc:
+            import warnings
+            warnings.warn(
+                f"KOLMO_TORCH_COMPILE=1 but torch.compile failed "
+                f"({exc!r}); falling back to eager mode",
+                stacklevel=2,
+            )
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
     if not _skip_prime():
         _prime_model(model, optimizer)
