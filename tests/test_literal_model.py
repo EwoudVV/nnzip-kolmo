@@ -137,10 +137,17 @@ def test_literal_model_ppm_learns_observed_transition(monkeypatch):
 
 
 def test_literal_model_ppm_pure_no_neural(monkeypatch):
-    """LITERAL_NEURAL_WEIGHT=0 should ignore the neural distribution
-    entirely. Feeding a degenerate neural prob mass on byte 'x' must
-    not push p(x) up at all if PPM is the sole signal."""
+    """LITERAL_NEURAL_WEIGHT=0 in the *legacy* fixed-weight path should
+    ignore the neural distribution entirely.
+
+    Has to explicitly opt out of the cost-aware adaptive blend (now
+    default), because adaptive ignores LITERAL_NEURAL_WEIGHT and
+    computes the weight from PPM peak instead — so with adaptive on
+    and an untrained model (uniform PPM, peak=1/256) the neural
+    distribution still gets through with weight ≈ HIGH = 0.70.
+    """
     monkeypatch.setattr(engine, "_LITERAL_STRATEGY", "ppm")
+    monkeypatch.setattr(engine, "_ADAPTIVE_WEIGHT", False)
     monkeypatch.setattr(engine, "LITERAL_NEURAL_WEIGHT", 0.0)
     model = LiteralModel()
     # No learning — just check that the neural input has no effect.
@@ -149,6 +156,80 @@ def test_literal_model_ppm_pure_no_neural(monkeypatch):
     p0 = model.probs(np.ones(256, dtype=np.float64) / 256.0)
     p1 = model.probs(pinned)
     assert np.allclose(p0, p1)
+
+
+def test_adaptive_blend_shifts_weight_with_ppm_confidence(monkeypatch):
+    """The cost-aware blend (KOLMO_ADAPTIVE_WEIGHT=1, default) should put
+    relatively MORE weight on PPM when PPM is sharply peaked, and LESS
+    when PPM is uniform. We can't directly read the per-call weight, but
+    we can engineer two cases and assert the output distribution shifts
+    in the expected direction.
+
+    Setup: pin LITERAL_NEURAL_WEIGHT_LOW=0.0, LITERAL_NEURAL_WEIGHT_HIGH=1.0
+    — these are extreme but make the dependence loud.
+    Case A: PPM is uniform (untrained model, all-prior order-0). Adaptive
+            weight ≈ HIGH = 1.0, so output ≈ p_neural exactly.
+    Case B: train PPM with a strong (a,b)->c transition. p_ppm.max() will be
+            close to 1.0, adaptive weight ≈ LOW = 0.0, so output ≈ p_ppm.
+    """
+    monkeypatch.setattr(engine, "_LITERAL_STRATEGY", "ppm")
+    monkeypatch.setattr(engine, "_ADAPTIVE_WEIGHT", True)
+    monkeypatch.setattr(engine, "LITERAL_NEURAL_WEIGHT_LOW", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_NEURAL_WEIGHT_HIGH", 1.0)
+
+    # A non-uniform neural — pin mass on byte 'x' — so we can detect when
+    # adaptive lets it through vs damps it.
+    pinned_neural = np.full(256, (1.0 - 0.9) / 255, dtype=np.float64)
+    pinned_neural[ord("x")] = 0.9
+
+    # Case A: uniform PPM (no training). Adaptive weight → HIGH = 1.0, so
+    # output should be ≈ pinned_neural (modulo PPM's tiny order-0 prior).
+    fresh = LiteralModel()
+    out_uniform = fresh.probs(pinned_neural)
+    assert out_uniform[ord("x")] > 0.5, (
+        "uniform PPM should let neural's 0.9 mass on 'x' come through"
+    )
+
+    # Case B: sharply trained PPM. (a,b)->c repeated many times so order-2
+    # picks up p(c|a,b) ≈ 1.0. Adaptive weight → LOW = 0.0, so output
+    # should be ≈ p_ppm, dominated by 'c'.
+    trained = LiteralModel()
+    for _ in range(40):
+        trained.observe(ord("a"))
+        trained.observe(ord("b"))
+        trained.observe(ord("c"))
+    trained.observe(ord("a"))
+    trained.observe(ord("b"))
+    out_trained = trained.probs(pinned_neural)
+    assert out_trained[ord("c")] > out_trained[ord("x")], (
+        "sharp PPM should suppress neural's 'x' bias and let PPM's 'c' win"
+    )
+    assert out_trained[ord("c")] > 0.8, (
+        "with adaptive LOW=0.0, sharp PPM should dominate the blend"
+    )
+
+
+def test_adaptive_blend_can_be_disabled(monkeypatch):
+    """Setting KOLMO_ADAPTIVE_WEIGHT=0 must fall back to the static
+    LITERAL_NEURAL_WEIGHT — preserves the legacy code path for
+    bisection and historical comparison."""
+    monkeypatch.setattr(engine, "_LITERAL_STRATEGY", "ppm")
+    monkeypatch.setattr(engine, "_ADAPTIVE_WEIGHT", False)
+    monkeypatch.setattr(engine, "LITERAL_NEURAL_WEIGHT", 0.5)
+    monkeypatch.setattr(engine, "LITERAL_NEURAL_WEIGHT_LOW", 0.0)
+    monkeypatch.setattr(engine, "LITERAL_NEURAL_WEIGHT_HIGH", 1.0)
+
+    pinned_neural = np.full(256, (1.0 - 0.9) / 255, dtype=np.float64)
+    pinned_neural[ord("x")] = 0.9
+
+    model = LiteralModel()
+    out = model.probs(pinned_neural)
+    # With static weight=0.5 and uniform PPM, output[x] ≈ 0.5*0.9 + 0.5*(1/256)
+    # ≈ 0.452. With adaptive (LOW=0, HIGH=1, uniform PPM → w=1) it would be
+    # ≈ 0.9. The static-path assertion is the lower one.
+    assert 0.4 < out[ord("x")] < 0.55, (
+        f"static weight=0.5 + 'x'=0.9 in neural should give ~0.45, got {out[ord('x')]}"
+    )
 
 
 def test_literal_context_bucket_avalanches_shared_suffix_contexts():

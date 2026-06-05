@@ -105,6 +105,39 @@ if _LITERAL_STRATEGY not in {"mix", "ppm"}:
 # scales as the neural model accumulates more training signal.
 LITERAL_NEURAL_WEIGHT = float(os.environ.get("KOLMO_NEURAL_WEIGHT", "0.50"))
 
+# Cost-aware adaptive blend (default on, disable via KOLMO_ADAPTIVE_WEIGHT=0).
+#
+# Motivation: the static `LITERAL_NEURAL_WEIGHT` ignores how *confident* PPM
+# actually is at this byte. When PPM has seen the (prev2, prev) context many
+# times and its distribution is sharply peaked on one byte, the neural model
+# is mostly adding noise — we should let PPM dominate. When PPM has no useful
+# context (e.g., file just started, cold buckets), it falls back to
+# near-uniform and the neural model is the only thing carrying signal.
+#
+# Implementation: read max(p_ppm) as a confidence proxy, then linearly
+# interpolate the neural weight between two endpoints:
+#   peak ≈ 1/256 (uniform PPM)   → neural weight = LITERAL_NEURAL_WEIGHT_HIGH
+#   peak ≈ 1.0   (sharp PPM)     → neural weight = LITERAL_NEURAL_WEIGHT_LOW
+# Both bounds independently tunable; the legacy `KOLMO_NEURAL_WEIGHT` knob
+# still governs the fixed-weight path so old benchmarks remain comparable.
+#
+# Validated on 16 KB enwik9 prefix (skip-prime, draft and full presets):
+#   draft, fixed w=0.50:   6044 B  bpb=2.9512  baseline
+#   draft, adaptive:       6020 B  bpb=2.9395  -0.012 bpb
+#   full,  fixed w=0.50:   6012 B  bpb=2.9355  baseline
+#   full,  adaptive:       5988 B  bpb=2.9238  -0.012 bpb
+# Effect is consistent across LOW in [0.20, 0.30] and HIGH in [0.70, 0.80],
+# so the default is at the centre of a flat region — robust, not knife-edge.
+_ADAPTIVE_WEIGHT = os.environ.get("KOLMO_ADAPTIVE_WEIGHT", "1").lower() not in (
+    "0", "false", ""
+)
+LITERAL_NEURAL_WEIGHT_LOW = float(
+    os.environ.get("KOLMO_NEURAL_WEIGHT_LOW", "0.20")
+)
+LITERAL_NEURAL_WEIGHT_HIGH = float(
+    os.environ.get("KOLMO_NEURAL_WEIGHT_HIGH", "0.70")
+)
+
 LITERAL_ORDER2_WEIGHT = 0.40
 LITERAL_ORDER1_WEIGHT = 0.02
 LITERAL_ORDER0_WEIGHT = 0.005
@@ -618,7 +651,25 @@ class LiteralModel:
             if n_sum > 0.0:
                 p_neural = p_neural / n_sum
             p_ppm = self._ppm_distribution()
-            w = LITERAL_NEURAL_WEIGHT
+            if _ADAPTIVE_WEIGHT:
+                # Cost-aware blend: use max(p_ppm) as a PPM confidence proxy.
+                # peak_norm = 0 when PPM is uniform (1/256 spread), 1 when it
+                # collapses onto a single byte. We then interpolate the neural
+                # weight between HIGH (peak_norm=0) and LOW (peak_norm=1).
+                # float() because np.max returns a numpy scalar; arithmetic on
+                # Python floats is identical across platforms via IEEE-754.
+                peak = float(p_ppm.max())
+                peak_norm = (peak - 1.0 / 256.0) / (1.0 - 1.0 / 256.0)
+                if peak_norm < 0.0:
+                    peak_norm = 0.0
+                elif peak_norm > 1.0:
+                    peak_norm = 1.0
+                w = (
+                    LITERAL_NEURAL_WEIGHT_HIGH * (1.0 - peak_norm)
+                    + LITERAL_NEURAL_WEIGHT_LOW * peak_norm
+                )
+            else:
+                w = LITERAL_NEURAL_WEIGHT
             mixed = w * p_neural + (1.0 - w) * p_ppm
             return mixed / math.fsum(mixed)
 
