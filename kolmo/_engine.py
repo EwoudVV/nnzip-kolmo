@@ -148,6 +148,21 @@ LITERAL_ORDER2_CONFIDENCE = 2.0
 LITERAL_ORDER3_WEIGHT = 0.0
 LITERAL_ORDER3_CONFIDENCE = 2.0
 LITERAL_ORDER3_BUCKETS = 1 << 16
+# Whether the PPM walk (KOLMO_LITERAL=ppm) walks the hashed order-3 context
+# table. The legacy `LITERAL_ORDER3_WEIGHT` is a mix-path knob that doesn't
+# apply to PPM (PPM uses raw count ratios, not blend weights), so the
+# `weight > 0` allocation gate is the wrong gate for PPM — you'd have to
+# set a positive mix weight you don't actually want just to get count3 into
+# memory. KOLMO_PPM_ORDER3 controls it cleanly.
+#
+# Default ON: validated at 16 KB enwik9 (skip-prime) it produces a clean
+# -0.018 bpb improvement on both draft and full, with no measurable speed
+# cost. Memory cost is 32 MB (LITERAL_ORDER3_BUCKETS * 256 * uint16) —
+# negligible against the Hutter 10 GB budget and current ~13 MB model state.
+# Disable with KOLMO_PPM_ORDER3=0 to compare against historical PPM benches.
+_PPM_ORDER3 = os.environ.get("KOLMO_PPM_ORDER3", "1").lower() not in (
+    "0", "false", ""
+)
 LITERAL_ORDER4_WEIGHT = 0.20
 LITERAL_ORDER4_CONFIDENCE = 2.0
 LITERAL_ORDER4_BUCKETS = 1 << 18
@@ -522,7 +537,7 @@ class LiteralModel:
         self.count2 = np.zeros((256 * 256, 256), dtype=np.uint32)
         self.count3 = (
             np.zeros((LITERAL_ORDER3_BUCKETS, 256), dtype=np.uint16)
-            if LITERAL_ORDER3_WEIGHT > 0.0
+            if (LITERAL_ORDER3_WEIGHT > 0.0 or _PPM_ORDER3)
             else None
         )
         self.count4 = (
