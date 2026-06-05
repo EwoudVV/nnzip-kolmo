@@ -55,9 +55,23 @@ _TRAIN_SCHEDULE_MAX_MULT = 32
 # steps, each one over a proportionally larger block. Effect saturates at
 # the CONTEXT-1 cap (when COALESCE * BLOCK_SIZE * mult >= CONTEXT-1 the
 # multiplier stops mattering). cProfile on a 2 KB compress showed
-# `train_block` is ~57% of total runtime — coalescing is the directly
-# targetable lever for that bucket. Both compress and decompress read this
-# value at module load, so they stay in lockstep without exchanging state.
+# `train_block` is ~57% of total runtime, but the trade between bpb cost
+# and wall-time savings turned out unfavorable at small scales:
+#
+#   16 KB enwik9, skip-prime:
+#       coalesce  draft bpb  full bpb  draft time  full time
+#       1         2.922      2.906     54.5 s       81.8 s   (baseline)
+#       2         2.945      2.934     61.8 s       67.3 s   +0.027 bpb / -18% (full)
+#       4         3.016      3.010     39.8 s       60.1 s   +0.10  bpb / -27%
+#       8         3.078      3.049     38.9 s       56.3 s   +0.15  bpb / -31%
+#
+# Even COALESCE=2 erases more bpb than the cost-aware adaptive blend gained
+# (-0.012). The ratio cost is the model adapting more slowly — early-file
+# updates are where the gradient signal matters most. Default stays at 1.
+# Worth re-benching at 1 MB+ scales where the slower adaptation matters
+# less and the speed savings are larger in absolute time.
+# Both compress and decompress read this value at module load, so they
+# stay in lockstep without exchanging state.
 _TRAIN_COALESCE = max(1, int(os.environ.get("KOLMO_TRAIN_COALESCE", "1")))
 
 
