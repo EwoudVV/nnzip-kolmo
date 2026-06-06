@@ -17,6 +17,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from kolmo._predictors import (
+    CostAwareAdaptiveMixer,
+    Mixer,
+    PostCopyPredictor,
+    Predictor,
+)
 from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
 from kolmo.fixed import dequantize
 from kolmo.fixed_kv_cache import fixed_step, fixed_warm, trim_caches
@@ -932,36 +938,78 @@ class LiteralModel:
         self.prev2 = BOS
         self.prev = BOS
 
-        # Post-copy predictor state (third predictor, see KOLMO_POST_COPY).
-        # `post_copy_counts[last_byte_of_copy, next_byte_observed]` is
-        # incremented after the next literal observe immediately following
-        # `mark_copy_end()`. Prior 1.0 so an unseen (last, next) gives a
-        # uniform-with-weight-1 distribution before any observations.
-        self.post_copy_counts = np.full((256, 256), 1.0, dtype=np.float64)
-        # When True, the *next* call to observe() should record into
-        # post_copy_counts[_last_copy_end_byte, byte] before clearing.
-        self._after_copy = False
-        self._last_copy_end_byte = 0
+        # Predictor framework (see kolmo/_predictors.py).
+        # PostCopy was the third predictor that lived inline here pre-refactor;
+        # now it's a proper Predictor instance. Adding the fourth, fifth, etc.
+        # is a matter of appending to `self._extra_predictors` and the mixer
+        # picking them up — no edits to LiteralModel itself.
+        self._post_copy_predictor = PostCopyPredictor()
+        self._extra_predictors: list[Predictor] = []
+        # The mixer owns the blend logic. Reading the env-var-controlled
+        # globals at construction time, not call time, means a benchmark
+        # that monkey-patches `_ADAPTIVE_WEIGHT` mid-run still works as
+        # long as it constructs a fresh LiteralModel afterwards (which all
+        # tests do). For tests that monkey-patch the globals *and* expect
+        # the existing LiteralModel to pick them up, see the unit-test
+        # `_rebuild_mixer` helper accessible via the property setter below.
+        self._mixer: Mixer = self._build_mixer()
+
+    def _build_mixer(self) -> "Mixer":
+        """Construct the default CostAwareAdaptiveMixer with the current
+        env-var-controlled globals snapshotted into it. Tests can call this
+        after monkey-patching globals to refresh the mixer."""
+        return CostAwareAdaptiveMixer(
+            adaptive=_ADAPTIVE_WEIGHT,
+            static_neural_weight=LITERAL_NEURAL_WEIGHT,
+            neural_weight_low=LITERAL_NEURAL_WEIGHT_LOW,
+            neural_weight_high=LITERAL_NEURAL_WEIGHT_HIGH,
+            post_copy_enabled=_POST_COPY,
+            post_copy_weight=LITERAL_POST_COPY_WEIGHT,
+        )
+
+    # --- Backward-compat attribute accessors ----------------------------
+    # The post-copy state used to live as raw attributes on LiteralModel
+    # (post_copy_counts, _after_copy, _last_copy_end_byte). Several tests
+    # read those directly and one test *assigns* `post_copy_counts` to a
+    # fresh array. Forward both reads and writes to the PostCopyPredictor
+    # so the refactor is invisible to those tests.
+
+    @property
+    def post_copy_counts(self) -> np.ndarray:
+        return self._post_copy_predictor.counts
+
+    @post_copy_counts.setter
+    def post_copy_counts(self, value: np.ndarray) -> None:
+        self._post_copy_predictor.counts = value
+
+    @property
+    def _after_copy(self) -> bool:
+        return self._post_copy_predictor._armed
+
+    @property
+    def _last_copy_end_byte(self) -> int:
+        return self._post_copy_predictor._last_byte
+
+    # --- Predictor framework API ---------------------------------------
+
+    def register_predictor(self, predictor: "Predictor") -> None:
+        """Add an extra predictor to the ensemble. The current default mixer
+        only consumes PPM + post-copy + neural — extra predictors are
+        accepted, their `observe()` and `mark_copy_end()` are called in
+        lockstep with the rest of the model, but the *blend* itself isn't
+        consumed yet (the mixer doesn't know about them). This is the
+        extension point future commits will build on; a mixer that handles
+        N predictors generically is the next step."""
+        self._extra_predictors.append(predictor)
 
     def mark_copy_end(self, last_byte: int) -> None:
         """Tell the model the most recent event was a copy whose last byte
-        was `last_byte`. The next observe() will be recorded as a post-copy
-        transition, and the next probs() call will blend in the conditional
-        post-copy distribution. No-op if the post-copy predictor is disabled,
-        but the bookkeeping is cheap so we always do it.
-        """
-        self._after_copy = True
-        self._last_copy_end_byte = int(last_byte)
-
-    def _post_copy_distribution(self) -> np.ndarray | None:
-        """Conditional distribution over the next byte given that the
-        previous event was a copy ending in `_last_copy_end_byte`. Returns
-        None if we're not in a post-copy state (so the caller knows to skip
-        the blend term)."""
-        if not self._after_copy:
-            return None
-        row = self.post_copy_counts[self._last_copy_end_byte]
-        return row / math.fsum(row)
+        was `last_byte`. Forwarded to every predictor that cares (post-copy
+        is the canonical example; extras follow if they implement
+        mark_copy_end)."""
+        self._post_copy_predictor.mark_copy_end(last_byte)
+        for predictor in self._extra_predictors:
+            predictor.mark_copy_end(last_byte)
 
     def _ppm_distribution(self) -> np.ndarray:
         """PPM-C blended byte distribution.
@@ -1067,48 +1115,26 @@ class LiteralModel:
 
     def probs(self, neural_probs: np.ndarray) -> np.ndarray:
         if _LITERAL_STRATEGY == "ppm":
-            p_neural = neural_probs.astype(np.float64, copy=False)
-            # fsum, not np.sum: see comment at end of _ppm_distribution.
-            n_sum = math.fsum(p_neural)
-            if n_sum > 0.0:
-                p_neural = p_neural / n_sum
-            p_ppm = self._ppm_distribution()
-            if _ADAPTIVE_WEIGHT:
-                # Cost-aware blend: use max(p_ppm) as a PPM confidence proxy.
-                # peak_norm = 0 when PPM is uniform (1/256 spread), 1 when it
-                # collapses onto a single byte. We then interpolate the neural
-                # weight between HIGH (peak_norm=0) and LOW (peak_norm=1).
-                # float() because np.max returns a numpy scalar; arithmetic on
-                # Python floats is identical across platforms via IEEE-754.
-                peak = float(p_ppm.max())
-                peak_norm = (peak - 1.0 / 256.0) / (1.0 - 1.0 / 256.0)
-                if peak_norm < 0.0:
-                    peak_norm = 0.0
-                elif peak_norm > 1.0:
-                    peak_norm = 1.0
-                w = (
-                    LITERAL_NEURAL_WEIGHT_HIGH * (1.0 - peak_norm)
-                    + LITERAL_NEURAL_WEIGHT_LOW * peak_norm
-                )
-            else:
-                w = LITERAL_NEURAL_WEIGHT
-            # Optional 3-way blend with post-copy distribution. Active only
-            # right after a copy event and only if KOLMO_POST_COPY=1. We
-            # scale the post-copy weight down proportionally from the PPM
-            # side so neural's weight is unchanged — the intuition is that
-            # PPM and post-copy are both "structural" signals that the
-            # neural model partly overlaps; the neural model is independent.
-            if _POST_COPY:
-                post = self._post_copy_distribution()
-                if post is not None:
-                    pc = LITERAL_POST_COPY_WEIGHT
-                    if pc > 1.0 - w:
-                        pc = 1.0 - w
-                    w_ppm = 1.0 - w - pc
-                    mixed = w * p_neural + w_ppm * p_ppm + pc * post
-                    return mixed / math.fsum(mixed)
-            mixed = w * p_neural + (1.0 - w) * p_ppm
-            return mixed / math.fsum(mixed)
+            # Gather predictor outputs in a name -> probs dict and hand it
+            # to the mixer. The mixer (CostAwareAdaptiveMixer by default)
+            # owns the actual blend logic that used to live inline here.
+            # See kolmo/_predictors.py for the framework.
+            predictor_outputs: dict[str, np.ndarray | None] = {
+                "ppm": self._ppm_distribution(),
+                "post_copy": self._post_copy_predictor.probs(),
+            }
+            for predictor in self._extra_predictors:
+                # Late-bound: extras are CALLED for the side-effect of being
+                # observed but the default mixer doesn't blend them yet.
+                # That happens in a follow-up commit once the generic
+                # multi-predictor mixer lands.
+                predictor_outputs[predictor.name] = predictor.probs()
+            # Snapshot global config into a fresh mixer each call. Cheap
+            # (just stores six floats); guarantees that env-var monkey-
+            # patches in tests take effect immediately without callers
+            # having to remember to rebuild the mixer.
+            mixer = self._build_mixer()
+            return mixer.combine(predictor_outputs, neural_probs)
 
         p = neural_probs.astype(np.float64, copy=True)
         if (
@@ -1222,13 +1248,14 @@ class LiteralModel:
         return mixed / math.fsum(mixed)
 
     def observe(self, byte: int) -> None:
-        # Record post-copy transition if the previous event was a copy.
-        # We always do the bookkeeping (even when KOLMO_POST_COPY=0) — it's
-        # one float increment, cheaper than the env-var read it'd take to
-        # gate. The blend itself is what's gated, in probs().
-        if self._after_copy:
-            self.post_copy_counts[self._last_copy_end_byte, byte] += 1.0
-            self._after_copy = False
+        # Forward to predictors in the framework. PostCopy disarms itself
+        # after recording; the bookkeeping is cheap so we always do it
+        # regardless of KOLMO_POST_COPY (the env var only gates whether
+        # the mixer *uses* the post-copy distribution, not whether the
+        # predictor maintains its counts).
+        self._post_copy_predictor.observe(byte)
+        for predictor in self._extra_predictors:
+            predictor.observe(byte)
         self.count0[byte] += 1.0
         self.count1[self.prev, byte] += 1.0
         context2 = (self.prev2 << 8) | self.prev

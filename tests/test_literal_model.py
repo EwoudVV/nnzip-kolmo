@@ -305,6 +305,51 @@ def test_post_copy_disabled_by_default(monkeypatch):
     assert np.allclose(out_a, out_b, atol=1e-12)
 
 
+def test_register_predictor_forwards_observe_and_mark_copy_end():
+    """The predictor framework's extension point: a custom Predictor
+    registered via `register_predictor()` must receive `observe(byte)`
+    on every literal-model observation and `mark_copy_end(byte)` on
+    every copy-event end. The current default mixer doesn't blend
+    extra predictors into the output yet (that's a follow-up commit),
+    but the dataflow plumbing is exercised here so it's caught early
+    if a future refactor breaks the wiring.
+    """
+    from kolmo._predictors import Predictor
+
+    class _RecordingPredictor(Predictor):
+        name = "test_recording"
+
+        def __init__(self):
+            self.observed = []
+            self.copy_ends = []
+
+        def probs(self):
+            return None  # silent — mixer ignores it
+
+        def observe(self, byte):
+            self.observed.append(byte)
+
+        def mark_copy_end(self, last_byte):
+            self.copy_ends.append(last_byte)
+
+    rec = _RecordingPredictor()
+    model = LiteralModel()
+    model.register_predictor(rec)
+
+    # Drive a literal-byte sequence.
+    for ch in b"hello":
+        model.observe(ch)
+    assert rec.observed == list(b"hello"), (
+        "register_predictor() must wire observe() forwarding"
+    )
+
+    # And a copy-event end.
+    model.mark_copy_end(ord(" "))
+    assert rec.copy_ends == [ord(" ")], (
+        "register_predictor() must wire mark_copy_end() forwarding"
+    )
+
+
 def test_literal_context_bucket_avalanches_shared_suffix_contexts():
     """High-order byte contexts often share suffix bytes on real text.
 
