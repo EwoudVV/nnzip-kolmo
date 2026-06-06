@@ -65,6 +65,12 @@ jobs:
             # under green CI because the short probe didn't trigger enough
             # training to expose the cascade. See the probe's docstring.
             python benchmarks/determinism/hash_fixed_compress_long.py
+            echo "== assert_ratio_floor =="
+            # Ratio-regression guard. The other probes catch "blob differs
+            # across machines"; this one catches "blob silently got bigger
+            # on every machine equally." See the probe's docstring for
+            # how to bump the floor when a legitimate ratio win lands.
+            python benchmarks/determinism/assert_ratio_floor.py
           } > "determinism-${{ matrix.label }}.txt"
           cat "determinism-${{ matrix.label }}.txt"
 
