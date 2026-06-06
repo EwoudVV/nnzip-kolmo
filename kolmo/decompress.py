@@ -147,6 +147,11 @@ def decompress(blob: bytes) -> bytes:
             copied = bytes(copy_history[start : start + length])
             output.extend(copied)
             observe_byte_sequence(copied)
+            # Mirror the compress side: the literal model needs to know the
+            # next byte is right after a copy so its third predictor stays
+            # in lockstep. See compress.py for the rationale.
+            if copied:
+                literal_model.mark_copy_end(copied[-1])
             decoded_total += length
             continue
 

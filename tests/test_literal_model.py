@@ -232,6 +232,79 @@ def test_adaptive_blend_can_be_disabled(monkeypatch):
     )
 
 
+def test_post_copy_predictor_records_and_uses_transitions(monkeypatch):
+    """The third predictor: after `mark_copy_end(last_byte)`, the next
+    observe() must increment post_copy_counts[last_byte, observed_byte],
+    and the next probs() call should reflect that transition via a
+    3-way blend (only when KOLMO_POST_COPY is on).
+
+    Three-step assertion:
+    1. Without mark_copy_end, probs() ignores post_copy_counts entirely.
+    2. After mark_copy_end + observe, the count for (last, observed)
+       is +1 from its prior.
+    3. With KOLMO_POST_COPY enabled, the next probs() after mark_copy_end
+       shifts mass toward the bytes commonly seen post-copy.
+    """
+    monkeypatch.setattr(engine, "_LITERAL_STRATEGY", "ppm")
+    monkeypatch.setattr(engine, "_POST_COPY", True)
+    monkeypatch.setattr(engine, "LITERAL_POST_COPY_WEIGHT", 0.5)
+
+    model = LiteralModel()
+
+    # Step 1: pristine state — post_copy_counts is all uniform priors.
+    assert np.all(model.post_copy_counts == 1.0)
+
+    # Teach the post-copy transition: after a copy ending in 'g', byte 'X'
+    # follows. Repeat enough times for the post-copy distribution to
+    # noticeably favor 'X'.
+    for _ in range(40):
+        model.mark_copy_end(ord("g"))
+        model.observe(ord("X"))
+
+    # Step 2: the count was incremented exactly 40 times.
+    assert model.post_copy_counts[ord("g"), ord("X")] == 1.0 + 40
+
+    # Step 3: probs() right after mark_copy_end blends in the post-copy
+    # row, which now heavily favors 'X'. Compare to a control where we
+    # didn't mark a copy end — that case should NOT have the bias.
+    neural = np.ones(256, dtype=np.float64) / 256.0
+    model.mark_copy_end(ord("g"))
+    probs_post_copy = model.probs(neural)
+
+    # Re-create a fresh model with the same trained post-copy counts, but
+    # don't mark_copy_end this time — control case.
+    control = LiteralModel()
+    control.post_copy_counts = model.post_copy_counts.copy()
+    probs_no_flag = control.probs(neural)
+
+    # The post-copy probs should put more mass on 'X' than the control.
+    assert probs_post_copy[ord("X")] > probs_no_flag[ord("X")] + 0.05
+
+
+def test_post_copy_disabled_by_default(monkeypatch):
+    """KOLMO_POST_COPY default is 0; mark_copy_end is still safe to call,
+    but probs() must produce the same output as if the call hadn't
+    happened. This is the bisection / rollback path."""
+    monkeypatch.setattr(engine, "_LITERAL_STRATEGY", "ppm")
+    monkeypatch.setattr(engine, "_POST_COPY", False)
+
+    model_a = LiteralModel()
+    model_b = LiteralModel()
+    for _ in range(40):
+        model_a.mark_copy_end(ord("g"))
+        model_a.observe(ord("X"))
+        model_b.observe(ord("X"))
+
+    neural = np.ones(256, dtype=np.float64) / 256.0
+    model_a.mark_copy_end(ord("g"))
+    out_a = model_a.probs(neural)
+    out_b = model_b.probs(neural)
+    # Should be very close — model_a observed extra ordering data
+    # (alternating mark_copy_end + observe) but the BLEND in probs()
+    # ignores it when _POST_COPY is False.
+    assert np.allclose(out_a, out_b, atol=1e-12)
+
+
 def test_literal_context_bucket_avalanches_shared_suffix_contexts():
     """High-order byte contexts often share suffix bytes on real text.
 

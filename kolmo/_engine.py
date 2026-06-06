@@ -185,6 +185,25 @@ LITERAL_ORDER3_BUCKETS = 1 << 16
 _PPM_ORDER3 = os.environ.get("KOLMO_PPM_ORDER3", "1").lower() not in (
     "0", "false", ""
 )
+
+# Third predictor: post-copy byte distribution. After a copy event ends, the
+# next byte often has a strongly non-uniform distribution conditioned on the
+# last byte of the copy — finishing a word, closing a tag, the space after a
+# template, etc. PPM doesn't know about copy events at all (it just sees the
+# byte stream), so this is genuinely new signal complementary to PPM + neural.
+#
+# State cost: 256x256 float64 counts = 524 KB per LiteralModel. Negligible.
+# Speed cost: one extra blend term whenever the *previous* event was a copy
+# (~5-15% of literal predictions in practice).
+#
+# KOLMO_POST_COPY=1 enables; default 0 until benched. KOLMO_POST_COPY_WEIGHT
+# sets its blend weight (0.0 -> ignore post-copy, 1.0 -> only post-copy).
+_POST_COPY = os.environ.get("KOLMO_POST_COPY", "0").lower() not in (
+    "0", "false", ""
+)
+LITERAL_POST_COPY_WEIGHT = float(
+    os.environ.get("KOLMO_POST_COPY_WEIGHT", "0.15")
+)
 LITERAL_ORDER4_WEIGHT = 0.20
 LITERAL_ORDER4_CONFIDENCE = 2.0
 LITERAL_ORDER4_BUCKETS = 1 << 18
@@ -611,6 +630,37 @@ class LiteralModel:
         self.prev2 = BOS
         self.prev = BOS
 
+        # Post-copy predictor state (third predictor, see KOLMO_POST_COPY).
+        # `post_copy_counts[last_byte_of_copy, next_byte_observed]` is
+        # incremented after the next literal observe immediately following
+        # `mark_copy_end()`. Prior 1.0 so an unseen (last, next) gives a
+        # uniform-with-weight-1 distribution before any observations.
+        self.post_copy_counts = np.full((256, 256), 1.0, dtype=np.float64)
+        # When True, the *next* call to observe() should record into
+        # post_copy_counts[_last_copy_end_byte, byte] before clearing.
+        self._after_copy = False
+        self._last_copy_end_byte = 0
+
+    def mark_copy_end(self, last_byte: int) -> None:
+        """Tell the model the most recent event was a copy whose last byte
+        was `last_byte`. The next observe() will be recorded as a post-copy
+        transition, and the next probs() call will blend in the conditional
+        post-copy distribution. No-op if the post-copy predictor is disabled,
+        but the bookkeeping is cheap so we always do it.
+        """
+        self._after_copy = True
+        self._last_copy_end_byte = int(last_byte)
+
+    def _post_copy_distribution(self) -> np.ndarray | None:
+        """Conditional distribution over the next byte given that the
+        previous event was a copy ending in `_last_copy_end_byte`. Returns
+        None if we're not in a post-copy state (so the caller knows to skip
+        the blend term)."""
+        if not self._after_copy:
+            return None
+        row = self.post_copy_counts[self._last_copy_end_byte]
+        return row / math.fsum(row)
+
     def _ppm_distribution(self) -> np.ndarray:
         """PPM-C blended byte distribution.
 
@@ -740,6 +790,21 @@ class LiteralModel:
                 )
             else:
                 w = LITERAL_NEURAL_WEIGHT
+            # Optional 3-way blend with post-copy distribution. Active only
+            # right after a copy event and only if KOLMO_POST_COPY=1. We
+            # scale the post-copy weight down proportionally from the PPM
+            # side so neural's weight is unchanged — the intuition is that
+            # PPM and post-copy are both "structural" signals that the
+            # neural model partly overlaps; the neural model is independent.
+            if _POST_COPY:
+                post = self._post_copy_distribution()
+                if post is not None:
+                    pc = LITERAL_POST_COPY_WEIGHT
+                    if pc > 1.0 - w:
+                        pc = 1.0 - w
+                    w_ppm = 1.0 - w - pc
+                    mixed = w * p_neural + w_ppm * p_ppm + pc * post
+                    return mixed / math.fsum(mixed)
             mixed = w * p_neural + (1.0 - w) * p_ppm
             return mixed / math.fsum(mixed)
 
@@ -855,6 +920,13 @@ class LiteralModel:
         return mixed / math.fsum(mixed)
 
     def observe(self, byte: int) -> None:
+        # Record post-copy transition if the previous event was a copy.
+        # We always do the bookkeeping (even when KOLMO_POST_COPY=0) — it's
+        # one float increment, cheaper than the env-var read it'd take to
+        # gate. The blend itself is what's gated, in probs().
+        if self._after_copy:
+            self.post_copy_counts[self._last_copy_end_byte, byte] += 1.0
+            self._after_copy = False
         self.count0[byte] += 1.0
         self.count1[self.prev, byte] += 1.0
         context2 = (self.prev2 << 8) | self.prev

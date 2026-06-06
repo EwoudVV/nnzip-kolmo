@@ -213,6 +213,12 @@ def compress(data: bytes) -> bytes:
             start = len(copy_history) - offset
             copied = bytes(copy_history[start : start + length])
             observe_byte_sequence(copied)
+            # Tell the literal model the next byte will be right after a
+            # copy whose last byte was copied[-1]. Used by the optional
+            # post-copy predictor in LiteralModel.probs(). No-op overhead
+            # if KOLMO_POST_COPY=0.
+            if copied:
+                literal_model.mark_copy_end(copied[-1])
             pos += length
             continue
 
