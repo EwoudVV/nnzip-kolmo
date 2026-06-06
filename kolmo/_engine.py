@@ -379,6 +379,34 @@ def _use_rope() -> bool:
 # configs is what matters, not absolute ratio. Blobs are NOT interchangeable
 # across presets; set KOLMO_MODEL on both sides.
 _MODEL_PRESETS = {
+    # Scale-to-preset matrix (rough rules of thumb; re-bench as data grows):
+    #
+    #   input scale     recommended preset    rationale
+    #   -----------     ------------------    ---------
+    #   < 32 KB         draft                 model has too little training
+    #                                         data to use bigger capacity;
+    #                                         draft trains fastest per byte
+    #                                         and is only ~0.014 bpb worse
+    #                                         than full at 16 KB enwik9.
+    #   32 KB - 1 MB    full (default)        the canonical preset; matches
+    #                                         the published bench numbers.
+    #   1 MB - 100 MB   large                 hypothesis: 10 M params can
+    #                                         actually be filled with signal
+    #                                         once we cross 1 MB. Not yet
+    #                                         confirmed — the earlier 16 KB
+    #                                         large test was WORSE than full
+    #                                         due to data starvation. The
+    #                                         long-running Windows-GPU enwik9
+    #                                         bench is the way to confirm.
+    #   > 100 MB        xl (experimental)     for the dev iteration loop
+    #                                         only; CPU compute makes this
+    #                                         impractical at Hutter scale,
+    #                                         so xl is GPU/cloud-only and
+    #                                         used to explore "does scaling
+    #                                         keep paying off?" not to ship.
+    #
+    # Blobs are NOT interchangeable across presets; KOLMO_MODEL must match on
+    # both compress and decompress.
     "full": dict(d_model=256, n_heads=8, n_layers=4),
     "draft": dict(d_model=192, n_heads=6, n_layers=3),
     # Scaling-law experiment: bigger than full. Earlier 10M-at-4-KB test
@@ -386,6 +414,11 @@ _MODEL_PRESETS = {
     # says it should win once the model has seen enough bytes to actually
     # use the extra capacity. ~11 M params.
     "large": dict(d_model=384, n_heads=8, n_layers=6),
+    # Experimental — for cloud/GPU iteration to test if scaling keeps
+    # paying off at very-large data. NOT viable for the Hutter Prize
+    # endgame (rules cap at single CPU core / 50 hours; xl is too slow
+    # for that). ~26 M params: d_model=512, 8 heads, 8 layers.
+    "xl": dict(d_model=512, n_heads=8, n_layers=8, max_context=1024),
 }
 
 
