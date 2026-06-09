@@ -623,27 +623,97 @@ def test_balanced_delimiter_probs_always_non_none():
     assert probs.shape == (256,)
 
 
-def test_balanced_delimiter_integrates_with_literal_model():
-    """Registered WordFragmentPredictor receives observe() forwarding
-    and appears in the predictor_outputs dict. The default mixer ignores
-    extra predictors, so this doesn't change output — it validates
-    framework plumbing end-to-end."""
-    from kolmo._predictors import WordFragmentPredictor
+def test_after_number_state_transitions():
+    """State machine: NORMAL during text, IN_NUMBER during digits,
+    AFTER_NUMBER on first non-digit after digits, then back to NORMAL."""
+    from kolmo._predictors import AfterNumberPredictor
 
-    wf = WordFragmentPredictor()
+    p = AfterNumberPredictor()
+    assert p._state == AfterNumberPredictor.NORMAL
+
+    states = []
+    for b in b"abc123 def":
+        p.observe(b)
+        states.append(p._state)
+
+    # a b c 1 2 3   d e f
+    # 0 0 0 1 1 1 2 0 0 0
+    assert states == [0, 0, 0, 1, 1, 1, 2, 0, 0, 0], (
+        f"expected [0,0,0,1,1,1,2,0,0,0], got {states}"
+    )
+
+
+def test_after_number_learns_in_number_distribution():
+    """After training on number sequences, the IN_NUMBER state should
+    favor digits over letters."""
+    from kolmo._predictors import AfterNumberPredictor
+
+    p = AfterNumberPredictor()
+    for b in b"1024 2048 4096 8192 ":
+        p.observe(b)
+
+    # Enter IN_NUMBER state and check distribution.
+    p.observe(ord("5"))  # now IN_NUMBER
+    probs = p.probs()
+    # Digits should be more likely than a typical letter.
+    digit_peak = max(probs[ord(str(d))] for d in range(10))
+    letter_peak = max(probs[c] for c in b"xyz")
+    assert digit_peak > letter_peak, (
+        "IN_NUMBER should favor digits over letters"
+    )
+
+
+def test_after_number_generalizes_across_numbers():
+    """Train on '1024.', '2048.', '4096.' — then IN_NUMBER should
+    favor '.' (number terminator) even for a number not seen before,
+    unlike PPM which would need to have seen the exact sequence.
+
+    The '.' byte is recorded as a transition from IN_NUMBER (state 1),
+    meaning 'inside a number, a period often follows'. AFTER_NUMBER
+    (state 2) records the byte after the number-ender, so ' ' should
+    be favored there."""
+    from kolmo._predictors import AfterNumberPredictor
+
+    p = AfterNumberPredictor()
+    for b in b"1024. 2048. 4096. ":
+        p.observe(b)
+
+    # Feed a NUMBER THAT PPM HASN'T SEEN before: 7777
+    # (not in the training set)
+    for b in b"7777":
+        p.observe(b)
+    # Now in IN_NUMBER state. '.' was frequently seen as a number
+    # terminator during training.
+    probs = p.probs()
+    assert probs[ord(".")] > probs[ord("x")], (
+        "IN_NUMBER should favor '.' even for unseen numbers"
+    )
+
+
+def test_after_number_probs_never_none():
+    """AfterNumberPredictor should always return a distribution —
+    every byte has a number-context state."""
+    from kolmo._predictors import AfterNumberPredictor
+
+    p = AfterNumberPredictor()
+    probs = p.probs()
+    assert probs is not None
+    assert np.isclose(probs.sum(), 1.0)
+    assert probs.shape == (256,)
+
+
+def test_after_number_integrates_with_literal_model():
+    """Registered AfterNumberPredictor receives observe() forwarding
+    and appears in the predictor_outputs dict."""
+    from kolmo._predictors import AfterNumberPredictor
+
+    an = AfterNumberPredictor()
     model = LiteralModel()
-    model.register_predictor(wf)
+    model.register_predictor(an)
 
-    # Feed a sentence — the predictor should build and reset fragments.
-    for b in b"hello world ":
+    for b in b"page 42 of 100":
         model.observe(b)
 
-    # After space, fragment is empty.
-    assert wf._fragment == [], "fragment should be empty after space"
-
-    # Feed 't' and 'e' — fragment should be ['t', 'e'].
-    model.observe(ord("t"))
-    model.observe(ord("e"))
-    assert wf._fragment == [ord("t"), ord("e")], (
-        f"expected [t, e], got {wf._fragment}"
-    )
+    # After final byte, state depends on last char.
+    # '0','0' → IN_NUMBER, so state is IN_NUMBER.
+    assert an._state == AfterNumberPredictor.IN_NUMBER

@@ -553,6 +553,67 @@ class BalancedDelimiterPredictor(Predictor):
         pass
 
 
+class AfterNumberPredictor(Predictor):
+    """Predicts the next byte given the current digit-run state.
+
+    Tracks whether we are (a) inside a digit sequence, (b) on the first
+    non-digit byte immediately after a digit sequence, or (c) in normal
+    text. Each state captures a different next-byte distribution:
+
+      NORMAL (0):       broad distribution; digits possible but rare.
+      IN_NUMBER (1):    heavily favors digits 0-9; also `.`, `,`, `:`.
+      AFTER_NUMBER (2): favors `.`, ` `, `]`, `}`, `\n`, `|`, `,`, `-`.
+
+    Why this is novel:
+      PPM's byte-N-gram model memorises specific number sequences (e.g.
+      "1024." is a distinct context from "2048.") and cannot generalise
+      across them. AfterNumberPredictor treats ALL digit runs identically,
+      so the transition "IN_NUMBER → `.`" is learned once and applies to
+      every number regardless of its digits. This is genuinely orthogonal
+      signal: in enwik9, numbers appear as page IDs, timestamps,
+      coordinates, and sizes — each with a distinctive following-byte
+      distribution that PPM cannot exploit until it has seen the exact
+      same number multiple times.
+
+    The 3-state machine uses 768 float64 entries (~6 KB) with a prior
+    of 1.0. Every byte position maps to exactly one state, so probs()
+    never returns None.
+    """
+
+    name = "after_number"
+
+    #: ASCII codes for digits 0-9.
+    _DIGITS = frozenset({ord(str(d)) for d in range(10)})
+
+    # State constants for readability.
+    NORMAL = 0
+    IN_NUMBER = 1
+    AFTER_NUMBER = 2
+
+    def __init__(self):
+        self.counts = np.ones((3, 256), dtype=np.float64)
+        self._state = self.NORMAL
+
+    def probs(self) -> np.ndarray:
+        row = self.counts[self._state]
+        return row / math.fsum(row)
+
+    def observe(self, byte: int) -> None:
+        # Record the transition from the state BEFORE this byte.
+        self.counts[self._state, int(byte)] += 1.0
+
+        # Advance the state machine.
+        if int(byte) in self._DIGITS:
+            self._state = self.IN_NUMBER
+        elif self._state == self.IN_NUMBER:
+            self._state = self.AFTER_NUMBER
+        else:
+            self._state = self.NORMAL
+
+    def mark_copy_end(self, last_byte: int) -> None:
+        pass
+
+
 def _encode_context(ctx: list[int], max_len: int) -> int:
     """Pack the last up-to-`max_len` bytes of `ctx` into an integer.
 
