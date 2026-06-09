@@ -22,7 +22,9 @@ from kolmo._predictors import (
     LinearEnsembleMixer,
     Mixer,
     PostCopyPredictor,
+    PPMPredictor,
     Predictor,
+    literal_context_bucket,  # re-export for callers (incl. tests)
     parse_linear_weights,
 )
 from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
@@ -213,6 +215,8 @@ LITERAL_POST_COPY_WEIGHT = float(
     os.environ.get("KOLMO_POST_COPY_WEIGHT", "0.15")
 )
 
+
+
 # Mixer selection. The default cost_aware adaptive blend is what's shipped
 # and benched; the linear mixer is the generic N-way blend that can consume
 # extra predictors registered via LiteralModel.register_predictor(). Bench
@@ -242,32 +246,11 @@ LITERAL_ORDER4_BUCKETS = 1 << 18
 LITERAL_ORDER5_WEIGHT = 0.0
 LITERAL_ORDER5_CONFIDENCE = 4.0
 LITERAL_ORDER5_BUCKETS = 1 << 18
-_MASK64 = 0xFFFFFFFFFFFFFFFF
 
-
-def literal_context_bucket(context: int, buckets: int) -> int:
-    """Map a byte context integer to a hashed literal-model bucket.
-
-    The high-order literal tables are bounded and hashed. The old code used
-    `context * odd_constant % buckets`; when `buckets` is a power of two, that
-    mostly preserves low-bit structure. For byte contexts, low bits are just
-    the most recent byte(s), so many distinct order-4 contexts collapsed into
-    surprisingly few buckets on enwik prefixes.
-
-    SplitMix64's finalizer gives a cheap avalanche: nearby contexts and
-    contexts sharing suffix bytes spread across the whole table. Collisions
-    still happen (bounded memory is the point), but they become random noise
-    instead of systematic suffix aliasing.
-    """
-    if buckets <= 0:
-        raise ValueError("bucket count must be positive")
-    x = (int(context) + 0x9E3779B97F4A7C15) & _MASK64
-    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
-    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
-    x = (x ^ (x >> 31)) & _MASK64
-    if buckets & (buckets - 1) == 0:
-        return x & (buckets - 1)
-    return x % buckets
+# `literal_context_bucket` and its _MASK64 constant moved to kolmo/_predictors
+# alongside PPMPredictor (the primary consumer). Re-imported at the top of
+# this file so callers (including tests that do `from kolmo._engine import
+# literal_context_bucket`) keep working.
 
 
 # Seed corpus: baked into both encoder and decoder code, costs zero bytes in
@@ -940,29 +923,20 @@ class LiteralModel:
     """
 
     def __init__(self, prior: float = 1.0):
-        self.count0 = np.full(256, prior, dtype=np.float64)
-        self.count1 = np.full((256, 256), prior, dtype=np.float64)
-        self.count2 = np.zeros((256 * 256, 256), dtype=np.uint32)
-        self.count3 = (
-            np.zeros((LITERAL_ORDER3_BUCKETS, 256), dtype=np.uint16)
-            if (LITERAL_ORDER3_WEIGHT > 0.0 or _PPM_ORDER3)
-            else None
+        # PPM state lives on a PPMPredictor instance now. LiteralModel
+        # exposes it through backward-compat properties (see below) so
+        # mix-mode code, proxy_bits, and tests that read `model.count0`
+        # / `model.prev` etc. keep working without edits.
+        self._ppm = PPMPredictor(
+            prior=prior,
+            enable_order3=(LITERAL_ORDER3_WEIGHT > 0.0 or _PPM_ORDER3),
+            enable_order4=LITERAL_ORDER4_WEIGHT > 0.0,
+            enable_order5=LITERAL_ORDER5_WEIGHT > 0.0,
+            order3_buckets=LITERAL_ORDER3_BUCKETS,
+            order4_buckets=LITERAL_ORDER4_BUCKETS,
+            order5_buckets=LITERAL_ORDER5_BUCKETS,
+            bos=BOS,
         )
-        self.count4 = (
-            np.zeros((LITERAL_ORDER4_BUCKETS, 256), dtype=np.uint16)
-            if LITERAL_ORDER4_WEIGHT > 0.0
-            else None
-        )
-        self.count5 = (
-            np.zeros((LITERAL_ORDER5_BUCKETS, 256), dtype=np.uint16)
-            if LITERAL_ORDER5_WEIGHT > 0.0
-            else None
-        )
-        self.prev5 = BOS
-        self.prev4 = BOS
-        self.prev3 = BOS
-        self.prev2 = BOS
-        self.prev = BOS
 
         # Predictor framework (see kolmo/_predictors.py).
         # PostCopy was the third predictor that lived inline here pre-refactor;
@@ -1024,6 +998,77 @@ class LiteralModel:
     def _last_copy_end_byte(self) -> int:
         return self._post_copy_predictor._last_byte
 
+    # PPM state lives on self._ppm: PPMPredictor. The mix-mode probs()
+    # code, proxy_bits(), and the existing test surface all read these
+    # attributes directly — forwarding via properties keeps the refactor
+    # invisible. Counts are arrays, so in-place mutations (count0[byte] +=
+    # 1.0 etc.) work through the read-only property; prev/* are scalars
+    # so they need read+write properties for the history shift.
+
+    @property
+    def count0(self) -> np.ndarray:
+        return self._ppm.count0
+
+    @property
+    def count1(self) -> np.ndarray:
+        return self._ppm.count1
+
+    @property
+    def count2(self) -> np.ndarray:
+        return self._ppm.count2
+
+    @property
+    def count3(self) -> np.ndarray | None:
+        return self._ppm.count3
+
+    @property
+    def count4(self) -> np.ndarray | None:
+        return self._ppm.count4
+
+    @property
+    def count5(self) -> np.ndarray | None:
+        return self._ppm.count5
+
+    @property
+    def prev(self) -> int:
+        return self._ppm.prev
+
+    @prev.setter
+    def prev(self, value: int) -> None:
+        self._ppm.prev = value
+
+    @property
+    def prev2(self) -> int:
+        return self._ppm.prev2
+
+    @prev2.setter
+    def prev2(self, value: int) -> None:
+        self._ppm.prev2 = value
+
+    @property
+    def prev3(self) -> int:
+        return self._ppm.prev3
+
+    @prev3.setter
+    def prev3(self, value: int) -> None:
+        self._ppm.prev3 = value
+
+    @property
+    def prev4(self) -> int:
+        return self._ppm.prev4
+
+    @prev4.setter
+    def prev4(self, value: int) -> None:
+        self._ppm.prev4 = value
+
+    @property
+    def prev5(self) -> int:
+        return self._ppm.prev5
+
+    @prev5.setter
+    def prev5(self, value: int) -> None:
+        self._ppm.prev5 = value
+
     # --- Predictor framework API ---------------------------------------
 
     def register_predictor(self, predictor: "Predictor") -> None:
@@ -1045,108 +1090,6 @@ class LiteralModel:
         for predictor in self._extra_predictors:
             predictor.mark_copy_end(last_byte)
 
-    def _ppm_distribution(self) -> np.ndarray:
-        """PPM-C blended byte distribution.
-
-        Walks orders 5, 4, 3, 2, 1, 0 from longest to shortest. Orders
-        whose count tables are None (weight = 0) are skipped. At each
-        order:
-          - p(b) = count[b] / (sum + distinct)  for b seen at this order
-          - escape = distinct / (sum + distinct)
-        A byte's final probability is the first (longest-context) match
-        times all the escapes above it. Bytes that never appear at any
-        order get a tiny uniform 1/256 share of the remaining escape.
-
-        This is the principled way to combine variable-order context
-        counts — every byte pays its actual escape cost only for the
-        orders that didn't match, instead of paying the static blend
-        every time like the legacy "mix" strategy.
-        """
-        p = np.zeros(256, dtype=np.float64)
-        accounted = np.zeros(256, dtype=bool)
-        escape = 1.0
-
-        def fold(row: np.ndarray) -> None:
-            nonlocal escape
-            # row is float64 of small exact-integer counts; sum is small enough
-            # to be exact regardless of order, but fsum makes that guarantee
-            # version-independent. seen.sum() is a bool reduction → integer
-            # count, already deterministic.
-            s = math.fsum(row)
-            if s <= 0.0:
-                return
-            seen = row > 0.0
-            distinct = float(seen.sum())
-            denom = s + distinct
-            mask = seen & ~accounted
-            p[mask] += escape * row[mask] / denom
-            accounted[seen] = True
-            escape *= distinct / denom
-
-        # Order 5 (hashed) — only walked if user has enabled it.
-        if self.count5 is not None:
-            ctx5 = (
-                (self.prev5 << 32)
-                | (self.prev4 << 24)
-                | (self.prev3 << 16)
-                | (self.prev2 << 8)
-                | self.prev
-            )
-            fold(
-                self.count5[
-                    literal_context_bucket(ctx5, LITERAL_ORDER5_BUCKETS)
-                ].astype(np.float64)
-            )
-
-        # Order 4 (hashed)
-        if self.count4 is not None:
-            ctx4 = (
-                (self.prev4 << 24)
-                | (self.prev3 << 16)
-                | (self.prev2 << 8)
-                | self.prev
-            )
-            fold(
-                self.count4[
-                    literal_context_bucket(ctx4, LITERAL_ORDER4_BUCKETS)
-                ].astype(np.float64)
-            )
-
-        # Order 3 (hashed) — disabled by default.
-        if self.count3 is not None:
-            ctx3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
-            fold(
-                self.count3[
-                    literal_context_bucket(ctx3, LITERAL_ORDER3_BUCKETS)
-                ].astype(np.float64)
-            )
-
-        # Order 2 (dense)
-        ctx2 = (self.prev2 << 8) | self.prev
-        fold(self.count2[ctx2].astype(np.float64))
-
-        # Order 1 (dense, float counts include prior)
-        fold(self.count1[self.prev])
-
-        # Order 0 (float counts always positive due to prior=1.0)
-        fold(self.count0)
-
-        # Anything still unaccounted (only possible if all orders had
-        # s=0, which can't happen because order 0 always has prior=1.0).
-        # Spread remaining escape uniformly as a defensive fallback.
-        unaccounted = ~accounted
-        n_unaccounted = int(unaccounted.sum())
-        if n_unaccounted > 0:
-            p[unaccounted] += escape / 256.0
-
-        # Use math.fsum for the final renorm: numpy's vectorized .sum()
-        # gives platform-dependent results in the last ULP across SIMD
-        # widths and numpy versions, which propagates through float
-        # division and ultimately changes the int frequencies passed to
-        # the arithmetic coder — a Rung-4 (cross-platform) bug. fsum is
-        # the correctly-rounded float sum, order-independent, stdlib.
-        return p / math.fsum(p)
-
     def probs(self, neural_probs: np.ndarray) -> np.ndarray:
         if _LITERAL_STRATEGY == "ppm":
             # Gather predictor outputs in a name -> probs dict and hand it
@@ -1154,7 +1097,7 @@ class LiteralModel:
             # owns the actual blend logic that used to live inline here.
             # See kolmo/_predictors.py for the framework.
             predictor_outputs: dict[str, np.ndarray | None] = {
-                "ppm": self._ppm_distribution(),
+                "ppm": self._ppm.probs(),
                 "post_copy": self._post_copy_predictor.probs(),
             }
             for predictor in self._extra_predictors:

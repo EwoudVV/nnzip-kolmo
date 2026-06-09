@@ -443,3 +443,80 @@ def test_literal_context_bucket_avalanches_shared_suffix_contexts():
     contexts = [(i << 8) | ord(" ") for i in range(4096)]
     occupied = {literal_context_bucket(ctx, buckets) for ctx in contexts}
     assert len(occupied) > 4000
+
+
+def test_word_fragment_predictor_learns_word_internal_transitions():
+    """WordFragmentPredictor should learn that after 'he' the next byte
+    is likely 'l' (from 'hello'), even though both are separate words
+    separated by delimiters. The fragment resets on whitespace so the
+    statistics are word-internal only."""
+    from kolmo._predictors import WordFragmentPredictor
+
+    p = WordFragmentPredictor(max_context_len=2, table_buckets=1 << 8)
+
+    # Train on "hello world" — teaches transitional patterns inside words.
+    for b in b"hello world ":
+        p.observe(b)
+
+    # After space, fragment is []. Now feed "he".
+    p.observe(ord("h"))  # no learning (fragment was empty)
+    p.observe(ord("e"))  # records: 'h' -> 'e'
+    probs = p.probs()
+    # Context 'he' was seen during 'hello' where 'l' followed.
+    assert probs[ord("l")] > probs[ord("x")], (
+        "context 'he' should favor 'l' from 'hello' training"
+    )
+
+    # After space, feed "wor".
+    p.observe(ord(" "))  # records 'he' -> ' ', fragment cleared
+    p.observe(ord("w"))
+    p.observe(ord("o"))
+    p.observe(ord("r"))
+    probs = p.probs()
+    # Context 'or' was seen during 'world' where 'l' followed.
+    assert probs[ord("l")] > probs[ord("x")], (
+        "context 'or' should favor 'l' from 'world' training"
+    )
+
+
+def test_word_fragment_predictor_returns_none_between_words():
+    """Probs() returns None when the fragment is empty (between words)."""
+    from kolmo._predictors import WordFragmentPredictor
+
+    p = WordFragmentPredictor()
+    assert p.probs() is None, "fresh predictor has empty fragment"
+
+    p.observe(ord("h"))
+    assert p.probs() is not None, "inside a word, probs is not None"
+
+    p.observe(ord(" "))  # delimiter
+    assert p.probs() is None, "after space, fragment is empty"
+
+    p.observe(ord("\n"))  # consecutive delimiters
+    assert p.probs() is None, "after newline, fragment is empty"
+
+
+def test_word_fragment_predictor_integrates_with_literal_model():
+    """Registered WordFragmentPredictor receives observe() forwarding
+    and appears in the predictor_outputs dict. The default mixer ignores
+    extra predictors, so this doesn't change output — it validates
+    framework plumbing end-to-end."""
+    from kolmo._predictors import WordFragmentPredictor
+
+    wf = WordFragmentPredictor()
+    model = LiteralModel()
+    model.register_predictor(wf)
+
+    # Feed a sentence — the predictor should build and reset fragments.
+    for b in b"hello world ":
+        model.observe(b)
+
+    # After space, fragment is empty.
+    assert wf._fragment == [], "fragment should be empty after space"
+
+    # Feed 't' and 'e' — fragment should be ['t', 'e'].
+    model.observe(ord("t"))
+    model.observe(ord("e"))
+    assert wf._fragment == [ord("t"), ord("e")], (
+        f"expected [t, e], got {wf._fragment}"
+    )

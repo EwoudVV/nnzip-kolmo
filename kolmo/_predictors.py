@@ -50,6 +50,33 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
+# Helpers shared between predictors
+# ---------------------------------------------------------------------------
+
+
+_MASK64 = 0xFFFFFFFFFFFFFFFF
+
+
+def literal_context_bucket(context: int, buckets: int) -> int:
+    """Map a byte context integer to a hashed literal-model bucket.
+
+    SplitMix64 finalizer. Used by the hashed order-3/4/5 PPM tables to
+    spread contexts that share suffix bytes across the whole table
+    instead of collapsing them into a tiny fraction of buckets the way a
+    plain multiplicative hash would. See PPMPredictor for callers.
+    """
+    if buckets <= 0:
+        raise ValueError("bucket count must be positive")
+    x = (int(context) + 0x9E3779B97F4A7C15) & _MASK64
+    x = ((x ^ (x >> 30)) * 0xBF58476D1CE4E5B9) & _MASK64
+    x = ((x ^ (x >> 27)) * 0x94D049BB133111EB) & _MASK64
+    x = (x ^ (x >> 31)) & _MASK64
+    if buckets & (buckets - 1) == 0:
+        return x & (buckets - 1)
+    return x % buckets
+
+
+# ---------------------------------------------------------------------------
 # Interfaces
 # ---------------------------------------------------------------------------
 
@@ -150,6 +177,316 @@ class PostCopyPredictor(Predictor):
     def mark_copy_end(self, last_byte: int) -> None:
         self._armed = True
         self._last_byte = int(last_byte)
+
+
+class PPMPredictor(Predictor):
+    """PPM-C with full backoff over orders {5, 4, 3, 2, 1, 0}.
+
+    Owns its own state — count tables for each order plus a five-byte
+    history. `probs()` walks the orders from longest to shortest and
+    accumulates probability mass with escape-on-novel-byte semantics
+    (the same algorithm that lived inline in `LiteralModel`
+    pre-refactor).
+
+    Memory profile (with default bucket sizes):
+      count0  256                           float64    ~2 KB
+      count1  256 * 256                     float64    ~512 KB
+      count2  65536 * 256                   uint32     ~64 MB
+      count3  (1<<16) * 256  if enabled     uint16     ~32 MB
+      count4  (1<<18) * 256  if enabled     uint16     ~128 MB
+      count5  (1<<18) * 256  if enabled     uint16     ~128 MB
+
+    Order-3 / 4 / 5 are hashed because the dense table size grows like
+    256^k and orders past 2 are infeasible dense. `literal_context_bucket`
+    (SplitMix64 finalizer) avalanches contexts that share suffix bytes
+    across the whole table.
+
+    Cross-OS determinism: every float reduction in this class uses
+    `math.fsum` (correctly-rounded, order-independent across SIMD widths
+    and numpy versions). Integer reductions and per-element ops are
+    deterministic by IEEE-754 / int arithmetic semantics.
+    """
+
+    name = "ppm"
+
+    #: Default bucket sizes for the hashed orders. Match what the engine
+    #: shipped pre-refactor; can be overridden at construction.
+    DEFAULT_ORDER3_BUCKETS = 1 << 16
+    DEFAULT_ORDER4_BUCKETS = 1 << 18
+    DEFAULT_ORDER5_BUCKETS = 1 << 18
+
+    def __init__(
+        self,
+        prior: float = 1.0,
+        *,
+        enable_order3: bool = False,
+        enable_order4: bool = True,
+        enable_order5: bool = False,
+        order3_buckets: int = DEFAULT_ORDER3_BUCKETS,
+        order4_buckets: int = DEFAULT_ORDER4_BUCKETS,
+        order5_buckets: int = DEFAULT_ORDER5_BUCKETS,
+        bos: int = 0,
+    ):
+        self.count0 = np.full(256, prior, dtype=np.float64)
+        self.count1 = np.full((256, 256), prior, dtype=np.float64)
+        self.count2 = np.zeros((256 * 256, 256), dtype=np.uint32)
+        self.count3 = (
+            np.zeros((order3_buckets, 256), dtype=np.uint16)
+            if enable_order3
+            else None
+        )
+        self.count4 = (
+            np.zeros((order4_buckets, 256), dtype=np.uint16)
+            if enable_order4
+            else None
+        )
+        self.count5 = (
+            np.zeros((order5_buckets, 256), dtype=np.uint16)
+            if enable_order5
+            else None
+        )
+        self._order3_buckets = order3_buckets
+        self._order4_buckets = order4_buckets
+        self._order5_buckets = order5_buckets
+        self.prev5 = bos
+        self.prev4 = bos
+        self.prev3 = bos
+        self.prev2 = bos
+        self.prev = bos
+
+    def probs(self) -> np.ndarray:
+        """PPM-C backoff walk over orders 5..0.
+
+        At each order: compute the conditional distribution from the
+        relevant count row, allocate a chunk of the remaining escape mass
+        to the byte values seen at this order, carry the rest forward as
+        escape to the next order down. Byte values not seen at any order
+        get a small share of the residual escape distributed uniformly.
+        """
+        p = np.zeros(256, dtype=np.float64)
+        accounted = np.zeros(256, dtype=bool)
+        escape = 1.0
+
+        def fold(row: np.ndarray) -> None:
+            nonlocal escape
+            # row is float64 of small exact-integer counts; sum is small
+            # enough to be exact regardless of order, but fsum makes that
+            # guarantee version-independent. seen.sum() is a bool reduction
+            # to an integer count, deterministic by construction.
+            s = math.fsum(row)
+            if s <= 0.0:
+                return
+            seen = row > 0.0
+            distinct = float(seen.sum())
+            denom = s + distinct
+            mask = seen & ~accounted
+            p[mask] += escape * row[mask] / denom
+            accounted[seen] = True
+            escape *= distinct / denom
+
+        # Order 5 (hashed) — only walked if enabled.
+        if self.count5 is not None:
+            ctx5 = (
+                (self.prev5 << 32)
+                | (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            fold(
+                self.count5[
+                    literal_context_bucket(ctx5, self._order5_buckets)
+                ].astype(np.float64)
+            )
+
+        # Order 4 (hashed)
+        if self.count4 is not None:
+            ctx4 = (
+                (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            fold(
+                self.count4[
+                    literal_context_bucket(ctx4, self._order4_buckets)
+                ].astype(np.float64)
+            )
+
+        # Order 3 (hashed) — disabled by default.
+        if self.count3 is not None:
+            ctx3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
+            fold(
+                self.count3[
+                    literal_context_bucket(ctx3, self._order3_buckets)
+                ].astype(np.float64)
+            )
+
+        # Order 2 (dense)
+        ctx2 = (self.prev2 << 8) | self.prev
+        fold(self.count2[ctx2].astype(np.float64))
+
+        # Order 1 (dense, float counts include prior)
+        fold(self.count1[self.prev])
+
+        # Order 0 (float counts always positive due to prior=1.0)
+        fold(self.count0)
+
+        # Anything still unaccounted (only possible if all orders had
+        # s=0, which can't happen because order 0 always has prior=1.0).
+        # Spread remaining escape uniformly as a defensive fallback.
+        unaccounted = ~accounted
+        n_unaccounted = int(unaccounted.sum())
+        if n_unaccounted > 0:
+            p[unaccounted] += escape / 256.0
+
+        # fsum, not np.sum, for the same reason as everywhere else.
+        return p / math.fsum(p)
+
+    def observe(self, byte: int) -> None:
+        """Update count tables for every active order, then shift the
+        five-byte history. The history shift comes AFTER the count
+        updates so the counts use the pre-shift context."""
+        self.count0[byte] += 1.0
+        self.count1[self.prev, byte] += 1.0
+        context2 = (self.prev2 << 8) | self.prev
+        self.count2[context2, byte] += 1
+        if self.count3 is not None:
+            context3 = (self.prev3 << 16) | (self.prev2 << 8) | self.prev
+            bucket3 = literal_context_bucket(context3, self._order3_buckets)
+            if self.count3[bucket3, byte] < np.iinfo(np.uint16).max:
+                self.count3[bucket3, byte] += 1
+        if self.count4 is not None:
+            context4 = (
+                (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            bucket4 = literal_context_bucket(context4, self._order4_buckets)
+            if self.count4[bucket4, byte] < np.iinfo(np.uint16).max:
+                self.count4[bucket4, byte] += 1
+        if self.count5 is not None:
+            context5 = (
+                (self.prev5 << 32)
+                | (self.prev4 << 24)
+                | (self.prev3 << 16)
+                | (self.prev2 << 8)
+                | self.prev
+            )
+            bucket5 = literal_context_bucket(context5, self._order5_buckets)
+            if self.count5[bucket5, byte] < np.iinfo(np.uint16).max:
+                self.count5[bucket5, byte] += 1
+        # Shift the five-byte history.
+        self.prev5 = self.prev4
+        self.prev4 = self.prev3
+        self.prev3 = self.prev2
+        self.prev2 = self.prev
+        self.prev = byte
+
+
+class WordFragmentPredictor(Predictor):
+    """Predicts the next byte given the current word-internal byte fragment.
+
+    Tracks bytes since the last whitespace delimiter (space, newline, tab,
+    carriage return). The last K bytes of the current fragment are hashed
+    into a bounded count table, producing a distribution over the next byte.
+
+    Why this is novel:
+      PPM's order-K contexts span word boundaries, so its counts for a
+      byte pair like "th" include both word-internal transitions ("the",
+      "that", "there") and cross-boundary noise (period+space, comma+space,
+      tag boundaries). WordFragmentPredictor only fires inside words, so
+      its statistics are purer — "th" inside a word is almost always
+      followed by a vowel, never by space or punctuation. This is genuinely
+      complementary signal that cmix-style LSTM mixers don't explicitly
+      model.
+
+    The table is deliberately small (1<<12 buckets * 256 bytes ≈ 8 MB
+    float64). Collisions smear rare fragments into nearby ones, which acts
+    as a soft regularizer.
+
+    Cross-OS determinism: same `math.fsum`-and-SplitMix64 policy as the
+    rest of the framework.
+    """
+
+    name = "word_fragment"
+
+    # Whitelist of characters that reset the fragment. These are true word
+    # boundaries — inside a word we track the raw byte sequence.
+    _DELIMS = frozenset({ord(" "), ord("\n"), ord("\t"), ord("\r")})
+
+    def __init__(
+        self,
+        max_context_len: int = 4,
+        table_buckets: int = 1 << 12,
+    ):
+        self.max_context_len = max_context_len
+        self.table_buckets = table_buckets
+        # Prior 1.0 per (fragment_hash, next_byte) — unseen combinations
+        # get a uniform nudge instead of impossible zero.
+        self.counts = np.ones((table_buckets, 256), dtype=np.float64)
+        self._fragment: list[int] = []
+
+    def probs(self) -> np.ndarray | None:
+        if not self._fragment:
+            return None
+        ctx = self._fragment[-self.max_context_len :]
+        bucket = literal_context_bucket(
+            _encode_context(ctx, self.max_context_len),
+            self.table_buckets,
+        )
+        row = self.counts[bucket]
+        return row / math.fsum(row)
+
+    def observe(self, byte: int) -> None:
+        # Record the transition from the CURRENT fragment state (before
+        # updating). If the fragment was non-empty, the last probs() call
+        # produced a distribution using it, and now we know which byte
+        # actually followed that fragment — that's the learning signal.
+        # If the fragment was empty, this predictor was silent (probs()
+        # returned None), so there's nothing to learn from this byte for
+        # this predictor; we just start building the fragment for future
+        # predictions.
+        if self._fragment:
+            ctx = self._fragment[-self.max_context_len :]
+            bucket = literal_context_bucket(
+                _encode_context(ctx, self.max_context_len),
+                self.table_buckets,
+            )
+            # Float64 can hold counts up to ~1e308; the 1e200 cap is
+            # defensive against any edge-case overflow.
+            if self.counts[bucket, int(byte)] < 1e200:
+                self.counts[bucket, int(byte)] += 1.0
+
+        # Update the fragment for the NEXT prediction.
+        if byte in self._DELIMS:
+            self._fragment.clear()
+        else:
+            self._fragment.append(int(byte))
+
+    def mark_copy_end(self, last_byte: int) -> None:
+        # Copy events end mid-word or at a word boundary. The copied bytes
+        # have already been observed via observe() calls (from
+        # observe_byte_sequence in compress/decompress), so the fragment
+        # already reflects the post-copy state. Nothing extra to do.
+        pass
+
+
+def _encode_context(ctx: list[int], max_len: int) -> int:
+    """Pack the last up-to-`max_len` bytes of `ctx` into an integer.
+
+    Zero-pads on the left so that short fragments get a consistent hash.
+    For example, with max_len=4 and fragment ['h', 'i'], the context
+    becomes 0x00_00_68_69 (little-endian byte order).
+    """
+    value = 0
+    # Iterate from the end so the most recent byte is in the lowest 8 bits.
+    for i, b in enumerate(reversed(ctx)):
+        if i >= max_len:
+            break
+        value = (value << 8) | int(b)
+    return value
 
 
 # ---------------------------------------------------------------------------
