@@ -614,6 +614,55 @@ class AfterNumberPredictor(Predictor):
         pass
 
 
+class InTextPredictor(Predictor):
+    """Predicts the next byte given whether we are inside XML text content
+    (between ``>`` and ``<``) or inside XML markup (between ``<`` and ``>``).
+
+    The state machine is trivial: ``>`` sets ``in_text = True``, ``<`` sets
+    ``in_text = False``. This captures the fundamental XML/document structure
+    of enwik9: inside ``<text>...</text>`` we see wiki markup (letters, ``{{``,
+    ``[[``, ``|``, ``\n``, ``#``, ``*``, ``'``); outside — in XML tags and
+    metadata — we see ``<``, ``>``, ``"``, ``/``, ``=``, and digits from
+    IDs and timestamps.
+
+    Why this is novel:
+      PPM at order-5 sees a 5-byte sliding window that cannot encode "we are
+      100 bytes into a text block." After 100 bytes inside ``<text>...</text>``,
+      the 5-byte context is something like ``tent.`` or ``he qu`` — there is no
+      trace of the ``<text>`` tag that opened the region. InTextPredictor's
+      single bit (``in_text`` vs not) is preserved across arbitrarily long
+      runs, and the byte distributions for the two states differ dramatically:
+      ``"`` appears only in XML attribute values (markup state), ``'`` appears
+      only in wiki text. Near-perfect discrimination at minimal cost.
+
+    The count table is (2, 256) float64 = ~4 KB with prior 1.0. Every byte
+    position maps to exactly one state, so ``probs()`` never returns ``None``.
+    """
+
+    name = "in_text"
+
+    def __init__(self):
+        self.counts = np.ones((2, 256), dtype=np.float64)
+        self._in_text = False
+
+    def probs(self) -> np.ndarray:
+        row = self.counts[1 if self._in_text else 0]
+        return row / math.fsum(row)
+
+    def observe(self, byte: int) -> None:
+        state_before = 1 if self._in_text else 0
+        self.counts[state_before, int(byte)] += 1.0
+
+        byte_ = int(byte)
+        if byte_ == ord(">"):
+            self._in_text = True
+        elif byte_ == ord("<"):
+            self._in_text = False
+
+    def mark_copy_end(self, last_byte: int) -> None:
+        pass
+
+
 def _encode_context(ctx: list[int], max_len: int) -> int:
     """Pack the last up-to-`max_len` bytes of `ctx` into an integer.
 

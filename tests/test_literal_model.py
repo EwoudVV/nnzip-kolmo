@@ -717,3 +717,89 @@ def test_after_number_integrates_with_literal_model():
     # After final byte, state depends on last char.
     # '0','0' → IN_NUMBER, so state is IN_NUMBER.
     assert an._state == AfterNumberPredictor.IN_NUMBER
+
+
+def test_in_text_tracks_angle_bracket_state():
+    """InTextPredictor should be True between > and <, False otherwise."""
+    from kolmo._predictors import InTextPredictor
+
+    p = InTextPredictor()
+    assert p._in_text is False
+
+    for b in b"<tag>":
+        p.observe(b)
+    # After '>', _in_text is True
+    assert p._in_text is True, "after >, should be in text"
+
+    for b in b" content ":
+        p.observe(b)
+    assert p._in_text is True, "content stays in text"
+
+    p.observe(ord("<"))
+    assert p._in_text is False, "after <, should be in markup"
+
+    p.observe(ord("/"))
+    assert p._in_text is False, "in markup stays False"
+
+    p.observe(ord(">"))
+    assert p._in_text is True, "after >, back in text"
+
+
+def test_in_text_learns_distinct_distributions():
+    """The two states should learn visibly different distributions when
+    trained on XML-like text. Markup state should favor <, >, ", /;
+    text state should favor letters and wiki punctuation."""
+    from kolmo._predictors import InTextPredictor
+
+    p = InTextPredictor()
+
+    # Simulate alternating XML markup and wiki text.
+    xml_chunk = b"<page>\n  <title>PageName</title>\n</page>\n"
+    for _ in range(20):
+        for b in xml_chunk:
+            p.observe(b)
+
+    # Re-enter markup state (<) and check.
+    p.observe(ord("<"))
+    probs_markup = p.probs()
+    # In markup, <, >, " should be more likely than a random letter.
+    assert probs_markup[ord("<")] > probs_markup[ord("z")]
+    assert probs_markup[ord(">")] > probs_markup[ord("z")]
+
+    # Enter text state (>) and check.
+    p.observe(ord(">"))
+    probs_text = p.probs()
+    # In text, letters and newlines should be more likely than "
+    # which only appears in XML attributes (markup state).
+    assert probs_text[ord("a")] > probs_text[ord('"')], (
+        "text state should favor letters over quotes"
+    )
+    assert probs_text[ord("\n")] > probs_text[ord('"')], (
+        "text state should favor newlines over quotes"
+    )
+
+
+def test_in_text_integrates_with_literal_model():
+    """Registered InTextPredictor receives observe() forwarding."""
+    from kolmo._predictors import InTextPredictor
+
+    it = InTextPredictor()
+    model = LiteralModel()
+    model.register_predictor(it)
+
+    for b in b"<page> content </page>":
+        model.observe(b)
+
+    # After final '>', _in_text should be True.
+    assert it._in_text is True
+
+
+def test_in_text_probs_never_none():
+    """InTextPredictor should always return a distribution."""
+    from kolmo._predictors import InTextPredictor
+
+    p = InTextPredictor()
+    probs = p.probs()
+    assert probs is not None
+    assert np.isclose(probs.sum(), 1.0)
+    assert probs.shape == (256,)
