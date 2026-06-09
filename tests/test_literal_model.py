@@ -496,7 +496,134 @@ def test_word_fragment_predictor_returns_none_between_words():
     assert p.probs() is None, "after newline, fragment is empty"
 
 
-def test_word_fragment_predictor_integrates_with_literal_model():
+def test_balanced_delimiter_tracks_curly_brace_nesting():
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    p = BalancedDelimiterPredictor()
+    assert p.curly_depth == 0
+
+    p.observe(ord("{"))  # depth → 1
+    assert p.curly_depth == 1
+    p.observe(ord("{"))  # depth → 2
+    assert p.curly_depth == 2
+
+    p.observe(ord("}"))  # depth → 1
+    assert p.curly_depth == 1
+    p.observe(ord("}"))  # depth → 0
+    assert p.curly_depth == 0
+
+    # Extra closes should clamp to 0.
+    p.observe(ord("}"))
+    assert p.curly_depth == 0
+
+
+def test_balanced_delimiter_tracks_multiple_bracket_types():
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    p = BalancedDelimiterPredictor()
+    p.observe(ord("["))   # square 1
+    p.observe(ord("{"))   # curly 1, square 1
+    assert p.square_depth == 1
+    assert p.curly_depth == 1
+    assert p.paren_depth == 0
+    assert p.angle_depth == 0
+
+    p.observe(ord("]"))   # square 0, curly 1
+    assert p.square_depth == 0
+    assert p.curly_depth == 1
+
+    p.observe(ord("}"))   # all 0
+    assert p.curly_depth == 0
+    assert p.square_depth == 0
+
+
+def test_balanced_delimiter_depth_clamps_at_three():
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    p = BalancedDelimiterPredictor()
+    for _ in range(5):
+        p.observe(ord("{"))
+    # state method uses min(depth, 3), so the
+    # _state-encoded depth should be 3.
+    assert p.curly_depth == 5  # raw can exceed 3
+    assert (p._state() & 3) == 3  # clamped
+
+
+def test_balanced_delimiter_learns_template_patterns():
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    p = BalancedDelimiterPredictor()
+    # Train on a template: {{Infobox | name = Foo }}
+    for b in b"{{Abox | name = Foo }} ":
+        p.observe(b)
+
+    # Now re-enter {{ and check the prediction.
+    p.observe(ord("{"))
+    p.observe(ord("{"))
+    probs = p.probs()
+    # At depth=2 (inside {{), | and } should be more likely than a typical
+    # letter like 'z'.
+    assert probs[ord("|")] > probs[ord("z")], (
+        "inside {{, pipe should be favored over 'z'"
+    )
+    assert probs[ord("}")] > probs[ord("z")], (
+        "inside {{, closing brace should be favored over 'z'"
+    )
+
+
+def test_balanced_delimiter_state_encoding_lower_bits_for_curly():
+    """State key should use lower 2 bits for curly depth, next 2 for square,
+    etc. This is a property test on the encoding scheme, not on the learned
+    distribution."""
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    p = BalancedDelimiterPredictor()
+    # At no depth, state = 0.
+    assert p._state() == 0
+
+    # One { -> curly=1, state should be 1 (binary 00000001, bits 0-1).
+    p.observe(ord("{"))
+    assert p._state() == 1
+
+    # Add one [ -> square=1, state should be 1 | (1 << 2) = 5.
+    p.observe(ord("["))
+    assert p._state() == 5
+
+
+def test_balanced_delimiter_integrates_with_literal_model():
+    """Registered BalancedDelimiterPredictor receives observe() forwarding
+    and appears in the predictor_outputs dict. The default mixer ignores
+    extra predictors, so this doesn't change output — it validates
+    framework plumbing end-to-end."""
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    bd = BalancedDelimiterPredictor()
+    model = LiteralModel()
+    model.register_predictor(bd)
+
+    # Feed a string with nested brackets.
+    for b in b"{{Infobox | name = Foo }} [[link]]":
+        model.observe(b)
+
+    # After all closes, depth should be back to 0.
+    assert bd.curly_depth == 0
+    assert bd.square_depth == 0
+
+
+def test_balanced_delimiter_probs_always_non_none():
+    """Unlike post_copy or word_fragment, balanced_delimiter should always
+    return a distribution — even at state 0 the table has a uniform prior,
+    and the distribution is always informative."""
+    from kolmo._predictors import BalancedDelimiterPredictor
+
+    p = BalancedDelimiterPredictor()
+    probs = p.probs()
+    assert probs is not None
+    assert np.isclose(probs.sum(), 1.0)
+    assert probs.shape == (256,)
+
+
+def test_balanced_delimiter_integrates_with_literal_model():
     """Registered WordFragmentPredictor receives observe() forwarding
     and appears in the predictor_outputs dict. The default mixer ignores
     extra predictors, so this doesn't change output — it validates

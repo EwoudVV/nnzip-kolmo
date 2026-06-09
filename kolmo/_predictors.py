@@ -473,6 +473,86 @@ class WordFragmentPredictor(Predictor):
         pass
 
 
+class BalancedDelimiterPredictor(Predictor):
+    """Predicts the next byte given the current nesting depth of bracket
+    characters.
+
+    Tracks four bracket types: curly ({}), square ([]), paren (()), and
+    angle (<>). Each depth is clamped to the range 0..3, producing a
+    4-bit-deep * 4-bracket-type = 256-state encoding. The count table
+    records transitions from each state to the next byte observed.
+
+    Why this is novel:
+      PPM's byte-N-gram model loses depth information after ~4 bytes
+      inside a [[link]] or {{template}} — at that point the active n-gram
+      context is just the last few raw bytes, regardless of whether we are
+      1 or 5 levels deep in nested brackets. BalancedDelimiterPredictor
+      retains that structural state across arbitrarily long spans, which
+      gives it orthogonal signal: inside a template (depth > 0), `|` and
+      `}` are far more likely than normal; inside a wiki link, `|` and `]`
+      are far more likely.
+
+    The state is updated on every observe() call. Brackets pairs are tracked
+    by the open/close character individually: each `{` increments the curly
+    counter, each `}` decrements it. This naturally handles `{{...}}` (two
+    increments from the two `{` bytes, two decrements from the two `}` bytes)
+    without needing explicit multi-character detection.
+
+    Cross-OS determinism: same ``math.fsum``-and-SplitMix64 policy as the
+    rest of the framework.
+    """
+
+    name = "balanced_delimiter"
+
+    def __init__(self):
+        # 4 depth counters, each clamped to 0..3 → 4^4 = 256 states.
+        self.curly_depth = 0
+        self.square_depth = 0
+        self.paren_depth = 0
+        self.angle_depth = 0
+        # Count table with prior 1.0 — unseen (state, byte) pairs get
+        # a uniform nudge instead of zero.
+        self.counts = np.ones((256, 256), dtype=np.float64)
+
+    def _state(self) -> int:
+        c = min(self.curly_depth, 3)
+        s = min(self.square_depth, 3)
+        p = min(self.paren_depth, 3)
+        a = min(self.angle_depth, 3)
+        return c | (s << 2) | (p << 4) | (a << 6)
+
+    def probs(self) -> np.ndarray:
+        row = self.counts[self._state()]
+        return row / math.fsum(row)
+
+    def observe(self, byte: int) -> None:
+        # Record the transition from the state BEFORE this byte, then
+        # update depths based on the byte we just observed.
+        state_before = self._state()
+        self.counts[state_before, int(byte)] += 1.0
+
+        byte_ = int(byte)
+        if byte_ == ord("{"):
+            self.curly_depth += 1
+        elif byte_ == ord("}"):
+            self.curly_depth = max(0, self.curly_depth - 1)
+        elif byte_ == ord("["):
+            self.square_depth += 1
+        elif byte_ == ord("]"):
+            self.square_depth = max(0, self.square_depth - 1)
+        elif byte_ == ord("("):
+            self.paren_depth += 1
+        elif byte_ == ord(")"):
+            self.paren_depth = max(0, self.paren_depth - 1)
+        elif byte_ == ord("<"):
+            self.angle_depth += 1
+        elif byte_ == ord(">"):
+            self.angle_depth = max(0, self.angle_depth - 1)
+
+    def mark_copy_end(self, last_byte: int) -> None:
+        pass
+
+
 def _encode_context(ctx: list[int], max_len: int) -> int:
     """Pack the last up-to-`max_len` bytes of `ctx` into an integer.
 
