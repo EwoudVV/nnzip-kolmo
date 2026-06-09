@@ -242,3 +242,127 @@ class CostAwareAdaptiveMixer(Mixer):
             mixed = w_neural * p_neural + (1.0 - w_neural) * ppm
 
         return mixed / math.fsum(mixed)
+
+
+class LinearEnsembleMixer(Mixer):
+    """Generic N-way linear blend of predictor outputs and the neural
+    distribution. Static weights set at construction time.
+
+    Constructed from a list of `(name, weight)` pairs. The special name
+    "neural" refers to the `neural_probs` argument passed to `combine()`;
+    every other name must match a key in the `predictor_outputs` dict.
+
+    None-handling: if a predictor returns None at combine time (e.g.
+    PostCopy when it's not armed), it is silently dropped and its weight
+    is redistributed proportionally across the remaining contributors.
+    This matches how the cost-aware mixer collapses to a 2-way blend
+    when post-copy is silent.
+
+    Cross-OS determinism: same `math.fsum`-everywhere policy as the
+    cost-aware mixer.
+
+    This mixer is opt-in (KOLMO_MIXER=linear). The default for now
+    remains the cost-aware adaptive blend — flipping the default would
+    change ratio output. Once the linear mixer has been benched against
+    the cost-aware one at scale and a winning config identified, we'll
+    revisit.
+    """
+
+    def __init__(self, weights: list[tuple[str, float]]):
+        if not weights:
+            raise ValueError("LinearEnsembleMixer needs at least one weight")
+        # Allow duplicate names for now — the last one wins, which is
+        # surprising but matches how dict() handles duplicate keys.
+        # Negative weights are rejected because they aren't meaningful
+        # in a probability mixture (the renormalization at the end can't
+        # rescue a negative contribution).
+        for name, weight in weights:
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"predictor name must be a non-empty string, got {name!r}")
+            if not isinstance(weight, (int, float)) or weight < 0:
+                raise ValueError(
+                    f"weight for {name!r} must be a non-negative number, got {weight!r}"
+                )
+        self.weights = [(name, float(weight)) for name, weight in weights]
+
+    def combine(
+        self,
+        predictor_outputs: dict[str, np.ndarray | None],
+        neural_probs: np.ndarray,
+    ) -> np.ndarray:
+        # Normalize neural the same way the cost-aware mixer does.
+        p_neural = neural_probs.astype(np.float64, copy=False)
+        n_sum = math.fsum(p_neural)
+        if n_sum > 0.0:
+            p_neural = p_neural / n_sum
+
+        # Collect the active contributors: (probs, weight) pairs whose
+        # predictor produced a non-None output (or whose name is "neural").
+        active: list[tuple[np.ndarray, float]] = []
+        for name, weight in self.weights:
+            if weight <= 0.0:
+                continue
+            if name == "neural":
+                active.append((p_neural, weight))
+            else:
+                probs = predictor_outputs.get(name)
+                if probs is not None:
+                    active.append((probs, weight))
+
+        if not active:
+            # Defensive fallback: a configuration where nothing contributed
+            # (e.g., only post_copy is in the weights and post_copy is
+            # silent right now). Uniform distribution beats crashing.
+            return np.full(256, 1.0 / 256.0, dtype=np.float64)
+
+        # Renormalize the active weights so they sum to 1. fsum to keep
+        # platform determinism.
+        total = math.fsum(w for _, w in active)
+        if total <= 0.0:
+            return np.full(256, 1.0 / 256.0, dtype=np.float64)
+
+        # Linear blend — accumulate weighted contributions element-wise
+        # (no reduction step, so deterministic per-element).
+        result = np.zeros(256, dtype=np.float64)
+        for probs, weight in active:
+            result += (weight / total) * probs
+
+        # Final renormalization (small ULP drift from the per-element
+        # adds and the / total above).
+        return result / math.fsum(result)
+
+
+def parse_linear_weights(spec: str) -> list[tuple[str, float]]:
+    """Parse a `KOLMO_LINEAR_WEIGHTS` value into a list of (name, weight)
+    pairs. The format is comma-separated `name:weight` entries, e.g.
+    `neural:0.4,ppm:0.5,post_copy:0.1`. Whitespace around tokens is
+    stripped. Raises ValueError on malformed input — better to surface
+    a config error at module load than silently fall back to a default.
+    """
+    result: list[tuple[str, float]] = []
+    for raw_part in spec.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                f"KOLMO_LINEAR_WEIGHTS entry {raw_part!r} is missing ':'; "
+                f"expected 'name:weight'"
+            )
+        name, _, weight_str = part.partition(":")
+        name = name.strip()
+        weight_str = weight_str.strip()
+        if not name:
+            raise ValueError(
+                f"KOLMO_LINEAR_WEIGHTS entry {raw_part!r} has an empty name"
+            )
+        try:
+            weight = float(weight_str)
+        except ValueError:
+            raise ValueError(
+                f"KOLMO_LINEAR_WEIGHTS entry {raw_part!r} has a non-numeric weight"
+            ) from None
+        result.append((name, weight))
+    if not result:
+        raise ValueError("KOLMO_LINEAR_WEIGHTS must contain at least one entry")
+    return result

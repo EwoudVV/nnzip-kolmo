@@ -19,9 +19,11 @@ import torch.nn.functional as F
 
 from kolmo._predictors import (
     CostAwareAdaptiveMixer,
+    LinearEnsembleMixer,
     Mixer,
     PostCopyPredictor,
     Predictor,
+    parse_linear_weights,
 )
 from kolmo.det_probs import TOTAL_FREQ, logits_to_int_freqs
 from kolmo.fixed import dequantize
@@ -210,6 +212,30 @@ _POST_COPY = os.environ.get("KOLMO_POST_COPY", "0").lower() not in (
 LITERAL_POST_COPY_WEIGHT = float(
     os.environ.get("KOLMO_POST_COPY_WEIGHT", "0.15")
 )
+
+# Mixer selection. The default cost_aware adaptive blend is what's shipped
+# and benched; the linear mixer is the generic N-way blend that can consume
+# extra predictors registered via LiteralModel.register_predictor(). Bench
+# linear vs cost_aware to find a winning config before flipping the default.
+#
+# KOLMO_LINEAR_WEIGHTS supplies the weights for the linear mixer. Default
+# matches the spirit of the cost-aware mixer's mid-PPM-confidence regime
+# (neural ~0.4, ppm ~0.5, post_copy ~0.1) but without the per-byte adaptive
+# adjustment. Format: "name:weight" comma-separated. The special name
+# "neural" refers to the transformer's output distribution.
+_MIXER_NAME = os.environ.get("KOLMO_MIXER", "cost_aware").strip().lower()
+if _MIXER_NAME not in {"cost_aware", "linear"}:
+    raise ValueError(
+        f"KOLMO_MIXER must be 'cost_aware' or 'linear', got {_MIXER_NAME!r}"
+    )
+_LINEAR_WEIGHTS_SPEC = os.environ.get(
+    "KOLMO_LINEAR_WEIGHTS",
+    "neural:0.40,ppm:0.50,post_copy:0.10",
+)
+# Parse at module load so a malformed spec fails loudly during import
+# instead of silently at first compress.
+_LINEAR_WEIGHTS = parse_linear_weights(_LINEAR_WEIGHTS_SPEC)
+
 LITERAL_ORDER4_WEIGHT = 0.20
 LITERAL_ORDER4_CONFIDENCE = 2.0
 LITERAL_ORDER4_BUCKETS = 1 << 18
@@ -955,9 +981,17 @@ class LiteralModel:
         self._mixer: Mixer = self._build_mixer()
 
     def _build_mixer(self) -> "Mixer":
-        """Construct the default CostAwareAdaptiveMixer with the current
-        env-var-controlled globals snapshotted into it. Tests can call this
-        after monkey-patching globals to refresh the mixer."""
+        """Construct a mixer from current env-var-controlled globals.
+
+        Selects between mixers based on KOLMO_MIXER (parsed at module load
+        into _MIXER_NAME). Snapshotting globals at call time (rather than
+        at `__init__`) means tests can monkeypatch the relevant module-
+        level variables and a *fresh* `probs()` call picks them up — no
+        need to remember to rebuild the model.
+        """
+        if _MIXER_NAME == "linear":
+            return LinearEnsembleMixer(_LINEAR_WEIGHTS)
+        # Default: the shipped, benched cost-aware adaptive blend.
         return CostAwareAdaptiveMixer(
             adaptive=_ADAPTIVE_WEIGHT,
             static_neural_weight=LITERAL_NEURAL_WEIGHT,

@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 import kolmo._engine as engine
 from kolmo._engine import LiteralModel, literal_context_bucket
@@ -303,6 +304,86 @@ def test_post_copy_disabled_by_default(monkeypatch):
     # (alternating mark_copy_end + observe) but the BLEND in probs()
     # ignores it when _POST_COPY is False.
     assert np.allclose(out_a, out_b, atol=1e-12)
+
+
+def test_linear_ensemble_mixer_blends_predictors_and_neural():
+    """LinearEnsembleMixer with equal weights on neural and ppm should
+    average them. The output must be normalized."""
+    from kolmo._predictors import LinearEnsembleMixer
+
+    mixer = LinearEnsembleMixer([("neural", 0.5), ("ppm", 0.5)])
+    # Make neural strongly favor byte 'x', ppm strongly favor byte 'y'.
+    neural = np.full(256, 0.001, dtype=np.float64)
+    neural[ord("x")] = 0.745
+    neural = neural / neural.sum()
+    ppm = np.full(256, 0.001, dtype=np.float64)
+    ppm[ord("y")] = 0.745
+    ppm = ppm / ppm.sum()
+
+    out = mixer.combine({"ppm": ppm}, neural)
+    assert np.isclose(out.sum(), 1.0)
+    # With equal weights, x and y should be roughly tied.
+    assert np.isclose(out[ord("x")], out[ord("y")], atol=1e-9)
+    # Both should dominate over a random other byte.
+    assert out[ord("x")] > 10 * out[ord("a")]
+
+
+def test_linear_ensemble_mixer_drops_none_outputs_and_renormalizes():
+    """A predictor that returns None should be dropped from the blend
+    and its weight redistributed across remaining contributors."""
+    from kolmo._predictors import LinearEnsembleMixer
+
+    mixer = LinearEnsembleMixer(
+        [("neural", 0.5), ("ppm", 0.3), ("post_copy", 0.2)]
+    )
+    neural = np.full(256, 1.0 / 256.0, dtype=np.float64)
+    ppm = np.full(256, 0.001, dtype=np.float64)
+    ppm[ord("e")] = 0.745
+    ppm = ppm / ppm.sum()
+
+    # post_copy returns None: weights should be neural=0.5/0.8=0.625,
+    # ppm=0.3/0.8=0.375 after renorm.
+    out = mixer.combine({"ppm": ppm, "post_copy": None}, neural)
+    assert np.isclose(out.sum(), 1.0)
+    # Result should be a 62.5% neural + 37.5% ppm blend, so 'e' gets
+    # ~0.375 * 0.745 + 0.625 * (1/256) ≈ 0.28 + 0.0024 ≈ 0.28.
+    assert 0.27 < out[ord("e")] < 0.29
+
+
+def test_linear_ensemble_mixer_handles_all_silent_predictors():
+    """If every predictor in the weights is silent AND neural isn't
+    listed, fall back to uniform rather than crash. Defensive."""
+    from kolmo._predictors import LinearEnsembleMixer
+
+    mixer = LinearEnsembleMixer([("post_copy", 1.0)])
+    neural = np.full(256, 1.0 / 256.0, dtype=np.float64)
+    out = mixer.combine({"post_copy": None}, neural)
+    assert np.isclose(out.sum(), 1.0)
+    assert np.allclose(out, 1.0 / 256.0)
+
+
+def test_parse_linear_weights_accepts_standard_spec():
+    from kolmo._predictors import parse_linear_weights
+
+    result = parse_linear_weights("neural:0.4,ppm:0.5,post_copy:0.1")
+    assert result == [("neural", 0.4), ("ppm", 0.5), ("post_copy", 0.1)]
+
+    # Whitespace tolerance.
+    result = parse_linear_weights("  neural : 0.4 , ppm : 0.5 ")
+    assert result == [("neural", 0.4), ("ppm", 0.5)]
+
+
+def test_parse_linear_weights_rejects_malformed_input():
+    from kolmo._predictors import parse_linear_weights
+
+    with pytest.raises(ValueError, match="missing ':'"):
+        parse_linear_weights("neural=0.4")
+    with pytest.raises(ValueError, match="non-numeric"):
+        parse_linear_weights("neural:high")
+    with pytest.raises(ValueError, match="empty name"):
+        parse_linear_weights(":0.5")
+    with pytest.raises(ValueError, match="at least one entry"):
+        parse_linear_weights("")
 
 
 def test_register_predictor_forwards_observe_and_mark_copy_end():
