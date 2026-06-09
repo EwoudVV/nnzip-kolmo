@@ -803,3 +803,92 @@ def test_in_text_probs_never_none():
     assert probs is not None
     assert np.isclose(probs.sum(), 1.0)
     assert probs.shape == (256,)
+
+
+def test_position_modulo_tracks_line_position():
+    from kolmo._predictors import PositionModuloPredictor
+
+    p = PositionModuloPredictor()
+    assert p._pos == 0
+
+    positions = []
+    for b in b"abc\ndef\n":
+        p.observe(b)
+        positions.append(p._pos)
+
+    # a b c \n d e f \n
+    # 1 2 3 0  1 2 3 0
+    assert positions == [1, 2, 3, 0, 1, 2, 3, 0], (
+        f"expected [1,2,3,0,1,2,3,0], got {positions}"
+    )
+
+
+def test_position_modulo_bucket_eleven_for_long_lines():
+    """Positions beyond 10 should all map to bucket 11."""
+    from kolmo._predictors import PositionModuloPredictor
+
+    p = PositionModuloPredictor()
+    for b in b"abcdefghijklmnop":
+        p.observe(b)
+
+    # After 16 non-newline bytes, pos should be 16.
+    # probs() should read bucket 11.
+    probs = p.probs()
+    assert np.isclose(probs.sum(), 1.0)
+
+    # The counts for buckets 0..10 should be untouched beyond position 10.
+    assert p._pos == 16
+    # All the bytes went into the correct buckets.
+    # Trailing bytes in buckets 10+ go to bucket 11.
+    assert p.counts[11, ord("n")] > 1.0, "bucket 11 should have 'n'"
+
+
+def test_position_modulo_learns_line_start_distribution():
+    """After training on wiki-like text, bucket 0 should favor line-start
+    characters like *, {, = over typical mid-line characters like ','."""
+    from kolmo._predictors import PositionModuloPredictor
+
+    p = PositionModuloPredictor()
+
+    wiki = b"== heading ==\n* bullet\n{{template}}\nnormal text\n"
+    for _ in range(20):
+        for b in wiki:
+            p.observe(b)
+
+    # Reset to position 0 (line start).
+    p.observe(ord("\n"))
+    probs = p.probs()
+    # Bucket 0 should favor line-start markers.
+    assert probs[ord("*")] > probs[ord(",")], (
+        "position 0 should favor '*' over ','"
+    )
+    assert probs[ord("{")] > probs[ord(",")], (
+        "position 0 should favor '{' over ','"
+    )
+    assert probs[ord("=")] > probs[ord(",")], (
+        "position 0 should favor '=' over ','"
+    )
+
+
+def test_position_modulo_integrates_with_literal_model():
+    from kolmo._predictors import PositionModuloPredictor
+
+    pm = PositionModuloPredictor()
+    model = LiteralModel()
+    model.register_predictor(pm)
+
+    for b in b"line one\nline two\n":
+        model.observe(b)
+
+    # After final '\n', pos should be 0.
+    assert pm._pos == 0
+
+
+def test_position_modulo_probs_never_none():
+    from kolmo._predictors import PositionModuloPredictor
+
+    p = PositionModuloPredictor()
+    probs = p.probs()
+    assert probs is not None
+    assert np.isclose(probs.sum(), 1.0)
+    assert probs.shape == (256,)
