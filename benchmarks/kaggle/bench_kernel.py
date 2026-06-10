@@ -16,8 +16,12 @@ import sys
 import zipfile
 
 REPO = "https://github.com/EwoudVV/nnzip-kolmo.git"
+# Everything in /kaggle/working is preserved (and later downloaded) as
+# run output — keep only results.txt there. The clone and the corpus go
+# to /kaggle/temp, which is discarded with the session.
 WORK = "/kaggle/working"
-SRC = f"{WORK}/nnzip-kolmo"
+TMP = "/kaggle/temp"
+SRC = f"{TMP}/nnzip-kolmo"
 
 
 def sh(cmd: str) -> None:
@@ -25,13 +29,14 @@ def sh(cmd: str) -> None:
     subprocess.run(cmd, shell=True, check=True)
 
 
+sh(f"mkdir -p {TMP}")
 sh(f"git clone --depth 1 {REPO} {SRC}")
 sh(f"pip install -q -e {SRC}")
 sh(
-    f"wget -q http://mattmahoney.net/dc/enwik8.zip -O {WORK}/enwik8.zip"
-    f" || wget -q https://mattmahoney.net/dc/enwik8.zip -O {WORK}/enwik8.zip"
+    f"wget -q http://mattmahoney.net/dc/enwik8.zip -O {TMP}/enwik8.zip"
+    f" || wget -q https://mattmahoney.net/dc/enwik8.zip -O {TMP}/enwik8.zip"
 )
-zipfile.ZipFile(f"{WORK}/enwik8.zip").extract("enwik8", WORK)
+zipfile.ZipFile(f"{TMP}/enwik8.zip").extract("enwik8", TMP)
 
 # The kernels API doesn't let us pick the GPU model, and Kaggle's torch
 # build has dropped Pascal (P100 = sm_60): cuda.is_available() lies, the
@@ -63,16 +68,15 @@ BEST = {
 BASE = {"KOLMO_MODEL": "draft", "KOLMO_SKIP_PRIME": "1", "KOLMO_PROGRESS": "1"}
 
 CONFIGS = [
-    ("cpu  | default  |  8K", 8192, {"KOLMO_DEVICE": "cpu"}),
-    ("cuda | default  |  8K", 8192, {"KOLMO_DEVICE": "cuda"}),
-    ("cpu  | best b=1 |  8K", 8192, {"KOLMO_DEVICE": "cpu", **BEST}),
+    # Pipeline-validation campaign: one quick sanity row, then the 64 KB
+    # point the notebook session didn't cover (Mac CPU reference: 743s).
     ("cuda | best b=1 |  8K", 8192, {"KOLMO_DEVICE": "cuda", **BEST}),
-    ("cuda | best b=1 | 16K", 16384, {"KOLMO_DEVICE": "cuda", **BEST}),
+    ("cuda | best b=1 | 64K", 65536, {"KOLMO_DEVICE": "cuda", **BEST}),
 ]
 
 CHILD = """
 import time, hashlib
-payload = open('/kaggle/working/enwik8', 'rb').read(SIZE)
+payload = open('/kaggle/temp/enwik8', 'rb').read(SIZE)
 from kolmo import compress, decompress
 t0 = time.time()
 blob = compress(payload)
