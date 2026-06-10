@@ -34,27 +34,55 @@ def kaggle(*args: str) -> subprocess.CompletedProcess:
 
 
 def main() -> int:
-    push = kaggle("kernels", "push", "-p", str(HERE))
-    print((push.stdout + push.stderr).strip(), flush=True)
-    if push.returncode != 0 or "error" in (push.stdout + push.stderr).lower():
-        return 1
+    # `--watch` attaches to the run already in flight (poll + fetch only).
+    # Without it, the script pushes a NEW version first — never use the
+    # bare form to "check on" a running campaign or you will restart it.
+    if "--watch" not in sys.argv:
+        push = kaggle("kernels", "push", "-p", str(HERE))
+        print((push.stdout + push.stderr).strip(), flush=True)
+        if push.returncode != 0 or "error" in (push.stdout + push.stderr).lower():
+            return 1
 
     print(f"polling every {POLL_SECONDS}s ...", flush=True)
+    # Only a real KernelWorkerStatus verdict ends the watch. Anything else
+    # (DNS blips, timeouts, API hiccups — their tracebacks contain "Error"
+    # and used to be mistaken for a failed run) is transient: keep polling
+    # unless it fails many times in a row.
+    consecutive_failures = 0
     while True:
         time.sleep(POLL_SECONDS)
         st = kaggle("kernels", "status", KERNEL)
         line = (st.stdout + st.stderr).strip()
+        if "KernelWorkerStatus" not in line:
+            consecutive_failures += 1
+            print(
+                time.strftime("%H:%M:%S"),
+                f"poll failed ({consecutive_failures}/20): "
+                + line.splitlines()[-1][:120],
+                flush=True,
+            )
+            if consecutive_failures >= 20:
+                print("giving up after ~15 min without connectivity; "
+                      "the Kaggle-side run continues — rerun this script "
+                      "or `kaggle kernels output` later to fetch results")
+                return 1
+            continue
+        consecutive_failures = 0
         print(time.strftime("%H:%M:%S"), line, flush=True)
-        low = line.lower()
-        if "complete" in low:
-            break
-        if "error" in low or "cancel" in low:
+        if "KernelWorkerStatus.RUNNING" in line or "QUEUED" in line:
+            continue
+        if "KernelWorkerStatus.COMPLETE" not in line:
             print("run did not complete cleanly; fetching log anyway")
-            break
+        break
 
     out = RUNS / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True, exist_ok=True)
-    fetch = kaggle("kernels", "output", KERNEL, "-p", str(out))
+    for attempt in range(3):
+        fetch = kaggle("kernels", "output", KERNEL, "-p", str(out))
+        if fetch.returncode == 0:
+            break
+        print(f"fetch attempt {attempt + 1} failed; retrying in 60s")
+        time.sleep(60)
     print((fetch.stdout + fetch.stderr).strip(), flush=True)
 
     results = out / "results.txt"
