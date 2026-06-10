@@ -18,7 +18,9 @@ import torch
 import torch.nn.functional as F
 
 from kolmo._predictors import (
+    BitTreeLogisticMixer,
     CostAwareAdaptiveMixer,
+    EXTRA_PREDICTORS,
     LinearEnsembleMixer,
     Mixer,
     PostCopyPredictor,
@@ -228,10 +230,18 @@ LITERAL_POST_COPY_WEIGHT = float(
 # adjustment. Format: "name:weight" comma-separated. The special name
 # "neural" refers to the transformer's output distribution.
 _MIXER_NAME = os.environ.get("KOLMO_MIXER", "cost_aware").strip().lower()
-if _MIXER_NAME not in {"cost_aware", "linear"}:
+if _MIXER_NAME not in {"cost_aware", "linear", "logistic"}:
     raise ValueError(
-        f"KOLMO_MIXER must be 'cost_aware' or 'linear', got {_MIXER_NAME!r}"
+        f"KOLMO_MIXER must be 'cost_aware', 'linear', or 'logistic', "
+        f"got {_MIXER_NAME!r}"
     )
+_LOGISTIC_BUCKETS = int(os.environ.get("KOLMO_LOGISTIC_BUCKETS", "16"))
+_LOGISTIC_LR = float(os.environ.get("KOLMO_LOGISTIC_LR", "0.01"))
+# The linear default is a convex probability-space blend; the logistic
+# mixer's warm start lives in logit space and has different sane defaults
+# (BitTreeLogisticMixer.DEFAULT_INIT). Only an explicitly-set env var
+# should override the latter, so remember whether the user set it.
+_LINEAR_WEIGHTS_SET = "KOLMO_LINEAR_WEIGHTS" in os.environ
 _LINEAR_WEIGHTS_SPEC = os.environ.get(
     "KOLMO_LINEAR_WEIGHTS",
     "neural:0.40,ppm:0.50,post_copy:0.10",
@@ -239,6 +249,23 @@ _LINEAR_WEIGHTS_SPEC = os.environ.get(
 # Parse at module load so a malformed spec fails loudly during import
 # instead of silently at first compress.
 _LINEAR_WEIGHTS = parse_linear_weights(_LINEAR_WEIGHTS_SPEC)
+
+# Optional structural predictors, enabled by name. Example:
+#   KOLMO_PREDICTORS=balanced_delimiter,after_number,in_text,position_modulo
+# Each name maps to a class in kolmo._predictors.EXTRA_PREDICTORS and is
+# registered on every fresh LiteralModel. Default empty: no behavior or
+# ratio change. Validated at module load so typos fail loudly.
+_EXTRA_PREDICTOR_NAMES: list[str] = [
+    name.strip()
+    for name in os.environ.get("KOLMO_PREDICTORS", "").split(",")
+    if name.strip()
+]
+for _name in _EXTRA_PREDICTOR_NAMES:
+    if _name not in EXTRA_PREDICTORS:
+        raise ValueError(
+            f"KOLMO_PREDICTORS entry {_name!r} is not a known predictor; "
+            f"choose from {sorted(EXTRA_PREDICTORS)}"
+        )
 
 LITERAL_ORDER4_WEIGHT = 0.20
 LITERAL_ORDER4_CONFIDENCE = 2.0
@@ -953,6 +980,12 @@ class LiteralModel:
         # the existing LiteralModel to pick them up, see the unit-test
         # `_rebuild_mixer` helper accessible via the property setter below.
         self._mixer: Mixer = self._build_mixer()
+        # Env-enabled structural predictors (KOLMO_PREDICTORS). Read at
+        # construction time like the rest of the config snapshot; tests
+        # and benches monkeypatch _EXTRA_PREDICTOR_NAMES and construct a
+        # fresh LiteralModel.
+        for name in _EXTRA_PREDICTOR_NAMES:
+            self.register_predictor(EXTRA_PREDICTORS[name]())
 
     def _build_mixer(self) -> "Mixer":
         """Construct a mixer from current env-var-controlled globals.
@@ -962,9 +995,26 @@ class LiteralModel:
         at `__init__`) means tests can monkeypatch the relevant module-
         level variables and a *fresh* `probs()` call picks them up — no
         need to remember to rebuild the model.
+
+        Exception: the logistic mixer owns trained weights, so probs()
+        never rebuilds it per call — it uses the persistent instance in
+        self._mixer, built here during __init__ and rebuilt only by
+        register_predictor when the predictor list changes.
         """
         if _MIXER_NAME == "linear":
             return LinearEnsembleMixer(_LINEAR_WEIGHTS)
+        if _MIXER_NAME == "logistic":
+            names = ["neural", "ppm", "post_copy"] + [
+                p.name for p in self._extra_predictors
+            ]
+            return BitTreeLogisticMixer(
+                names,
+                _LOGISTIC_BUCKETS,
+                _LOGISTIC_LR,
+                init_weights=(
+                    dict(_LINEAR_WEIGHTS) if _LINEAR_WEIGHTS_SET else None
+                ),
+            )
         # Default: the shipped, benched cost-aware adaptive blend.
         return CostAwareAdaptiveMixer(
             adaptive=_ADAPTIVE_WEIGHT,
@@ -1080,6 +1130,11 @@ class LiteralModel:
         extension point future commits will build on; a mixer that handles
         N predictors generically is the next step."""
         self._extra_predictors.append(predictor)
+        if isinstance(self._mixer, BitTreeLogisticMixer):
+            # Rebuild the mixer so it knows about the new predictor.
+            # This resets any trained weights, so register predictors
+            # before feeding data (LiteralModel.__init__ does).
+            self._mixer = self._build_mixer()
 
     def mark_copy_end(self, last_byte: int) -> None:
         """Tell the model the most recent event was a copy whose last byte
@@ -1101,11 +1156,11 @@ class LiteralModel:
                 "post_copy": self._post_copy_predictor.probs(),
             }
             for predictor in self._extra_predictors:
-                # Late-bound: extras are CALLED for the side-effect of being
-                # observed but the default mixer doesn't blend them yet.
-                # That happens in a follow-up commit once the generic
-                # multi-predictor mixer lands.
                 predictor_outputs[predictor.name] = predictor.probs()
+            # Logistic mixer: persistent (it owns trained weights), so it
+            # is NOT rebuilt per call like the stateless mixers below.
+            if isinstance(self._mixer, BitTreeLogisticMixer):
+                return self._probs_logistic(neural_probs, predictor_outputs)
             # Snapshot global config into a fresh mixer each call. Cheap
             # (just stores six floats); guarantees that env-var monkey-
             # patches in tests take effect immediately without callers
@@ -1223,6 +1278,39 @@ class LiteralModel:
             + order5_w * p5
         )
         return mixed / math.fsum(mixed)
+
+    # --- Logistic mixer helpers -----------------------------------------
+
+    def _probs_logistic(
+        self,
+        neural_probs: np.ndarray,
+        predictor_outputs: dict[str, np.ndarray | None],
+    ) -> np.ndarray:
+        """Logistic path: hand every distribution (neural included) to the
+        persistent bit-tree mixer. The mixer caches what its train() call
+        needs, so the engine keeps no pending state."""
+        prob_dict: dict[str, np.ndarray | None] = dict(predictor_outputs)
+        prob_dict["neural"] = neural_probs
+        return self._mixer.mix(prob_dict, self._logistic_bucket())
+
+    def _logistic_bucket(self) -> int:
+        """Determine the context bucket for the logistic mixer."""
+        if _LOGISTIC_BUCKETS <= 1:
+            return 0
+        return literal_context_bucket(
+            self._ppm.prev, _LOGISTIC_BUCKETS,
+        )
+
+    def train_on_literal(self, byte: int) -> None:
+        """Called after encoding/decoding a literal byte to update logistic
+        mixer weights. No-op for non-stateful mixers.
+
+        Exact call order: encoder.encode → observe_byte → train_on_literal.
+        Copy events do NOT call train_on_literal (the mixer only learns
+        from byte-level predictions it actually made).
+        """
+        if isinstance(self._mixer, BitTreeLogisticMixer):
+            self._mixer.train(byte)
 
     def observe(self, byte: int) -> None:
         # Forward to predictors in the framework. PostCopy disarms itself

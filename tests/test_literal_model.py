@@ -892,3 +892,163 @@ def test_position_modulo_probs_never_none():
     assert probs is not None
     assert np.isclose(probs.sum(), 1.0)
     assert probs.shape == (256,)
+
+
+# --- BitTreeLogisticMixer -------------------------------------------------
+
+
+def test_bit_tree_uniform_mass_is_logit_zero():
+    """Uniform mass must produce Q12 index 2048 (= probability 0.5) at
+    every node, which STRETCH maps to logit 0 — a uniform predictor is
+    automatically silent in the bit-tree."""
+    from kolmo._predictors import _STRETCH_NP, _bit_tree_q12
+
+    mass = np.full(256, 7, dtype=np.int64)
+    tree = _bit_tree_q12(mass)
+    assert tree.shape == (255,)
+    assert np.all(tree == 2048)
+    assert np.all(_STRETCH_NP[tree] == 0)
+
+
+def test_bit_tree_concentrated_mass_saturates_path():
+    """With nearly all mass on byte 0xFF, every node along 0xFF's
+    all-ones path must say bit=1 with near certainty."""
+    from kolmo._predictors import _bit_tree_q12
+
+    mass = np.ones(256, dtype=np.int64)
+    mass[255] = 1_000_000
+    tree = _bit_tree_q12(mass)
+    for k in range(8):
+        node = (1 << k) - 1 + (255 >> (8 - k))
+        assert tree[node] > 4000, f"level {k} node not saturated"
+    # And the opposite path (byte 0x00) must say bit=1 is unlikely.
+    for k in range(8):
+        node = (1 << k) - 1  # prefix 0 at every level
+        if k == 0:
+            continue  # root is shared with the 0xFF path
+        assert tree[node] <= 2048
+
+
+def test_bit_tree_q12_stays_in_table_range():
+    """Adversarial masses must keep Q12 indices within [0, 4095] — the
+    builder dispenses with clamping on this invariant."""
+    from kolmo._predictors import _bit_tree_q12
+
+    rng = np.random.default_rng(42)
+    for _ in range(20):
+        mass = rng.integers(1, 70000, size=256).astype(np.int64)
+        tree = _bit_tree_q12(mass)
+        assert tree.min() >= 0
+        assert tree.max() <= 4095
+
+
+def test_bittree_mixer_preserves_sharp_prediction():
+    """The regression that sank the byte-wise mixer: a confident neural
+    spike (p=0.5) must survive mixing with uninformative co-predictors.
+    The byte-wise squash+renorm emitted ~0.02 here (+4.5 bits wasted)."""
+    import math
+
+    from kolmo._predictors import BitTreeLogisticMixer
+
+    mixer = BitTreeLogisticMixer(
+        ["neural", "ppm", "a", "b"], n_buckets=1
+    )
+    neural = np.full(256, 0.5 / 255, dtype=np.float64)
+    neural[42] = 0.5
+    uniform = np.full(256, 1.0 / 256, dtype=np.float64)
+    out = mixer.mix(
+        {"neural": neural, "ppm": uniform, "a": uniform, "b": None}, 0
+    )
+    assert out[42] > 0.45
+    assert abs(math.fsum(out.tolist()) - 1.0) < 1e-9
+    assert np.all(out > 0.0)
+
+
+def test_bittree_mixer_silent_equals_uniform_equals_absent():
+    """None, uniform, and missing predictors must all be exact no-ops."""
+    from kolmo._predictors import BitTreeLogisticMixer
+
+    neural = np.full(256, 0.5 / 255, dtype=np.float64)
+    neural[7] = 0.5
+    uniform = np.full(256, 1.0 / 256, dtype=np.float64)
+
+    mixer = BitTreeLogisticMixer(["neural", "x"], n_buckets=1)
+    out_none = mixer.mix({"neural": neural, "x": None}, 0)
+    out_uni = mixer.mix({"neural": neural, "x": uniform}, 0)
+    out_absent = mixer.mix({"neural": neural}, 0)
+    np.testing.assert_array_equal(out_none, out_uni)
+    np.testing.assert_array_equal(out_none, out_absent)
+
+
+def test_bittree_mixer_training_learns_oracle():
+    """A predictor that is always right must earn weight from a zero
+    start, and the mixed probability of the oracle's byte must rise."""
+    from kolmo._predictors import BitTreeLogisticMixer
+
+    mixer = BitTreeLogisticMixer(["neural", "oracle"], n_buckets=1)
+    flat = np.full(256, 1.0 / 256, dtype=np.float64)
+    oracle = np.full(256, 0.1 / 255, dtype=np.float64)
+    oracle[7] = 0.9
+
+    before = mixer.mix({"neural": flat, "oracle": oracle}, 0)[7]
+    for _ in range(300):
+        mixer.mix({"neural": flat, "oracle": oracle}, 0)
+        mixer.train(7)
+    after = mixer.mix({"neural": flat, "oracle": oracle}, 0)[7]
+
+    assert after > before
+    assert after > 0.5
+    assert mixer.weights[1].mean() > 0.1  # oracle earned positive weight
+
+
+def test_bittree_mixer_train_consumes_cache():
+    """train() must consume the cached mix state: calling it twice in a
+    row must not double-apply the gradient."""
+    from kolmo._predictors import BitTreeLogisticMixer
+
+    mixer = BitTreeLogisticMixer(["neural"], n_buckets=1)
+    spiky = np.full(256, 0.5 / 255, dtype=np.float64)
+    spiky[3] = 0.5
+    mixer.mix({"neural": spiky}, 0)
+    mixer.train(3)
+    snapshot = mixer.weights.copy()
+    mixer.train(3)  # no preceding mix(): must be a no-op
+    np.testing.assert_array_equal(mixer.weights, snapshot)
+
+
+def test_bittree_mixer_via_literal_model(monkeypatch):
+    """End-to-end through LiteralModel: logistic path must produce a
+    valid distribution and train_on_literal must move mixer weights."""
+    monkeypatch.setattr(engine, "_MIXER_NAME", "logistic")
+
+    model = LiteralModel()
+    neural = np.full(256, 1.0 / 256, dtype=np.float64)
+
+    # Teach PPM a strong "a -> b" transition so its tree logits are
+    # nonzero and the ppm weight has gradient to receive.
+    for _ in range(30):
+        model.observe(ord("a"))
+        model.observe(ord("b"))
+
+    probs = model.probs(neural)
+    assert probs.shape == (256,)
+    assert np.all(probs > 0.0)
+    assert np.isclose(probs.sum(), 1.0)
+
+    w_before = model._mixer.weights.copy()
+    model.observe(ord("b"))
+    model.train_on_literal(ord("b"))
+    assert not np.array_equal(model._mixer.weights, w_before)
+
+
+def test_kolmo_predictors_env_registration(monkeypatch):
+    """KOLMO_PREDICTORS names must be registered on a fresh LiteralModel
+    without any monkey-patching of __init__."""
+    monkeypatch.setattr(
+        engine,
+        "_EXTRA_PREDICTOR_NAMES",
+        ["balanced_delimiter", "after_number"],
+    )
+    model = LiteralModel()
+    names = [p.name for p in model._extra_predictors]
+    assert names == ["balanced_delimiter", "after_number"]

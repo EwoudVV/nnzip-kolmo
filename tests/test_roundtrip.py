@@ -160,3 +160,27 @@ def test_compress_skips_final_useless_training_step(monkeypatch):
 def test_invalid_magic_rejected():
     with pytest.raises(ValueError, match="kolmo"):
         decompress(b"NOPE" + b"\x00" * 4)
+
+
+def test_logistic_mixer_roundtrip(monkeypatch):
+    """KOLMO_MIXER=logistic round-trip: the bit-tree mixer trains online
+    on both sides, so compressor and decompressor weights must stay in
+    lockstep or decoding diverges."""
+    monkeypatch.setattr(engine, "_MIXER_NAME", "logistic")
+    data = b"the quick brown fox jumps over the lazy dog. " * 6
+    blob = compress(data)
+    assert decompress(blob) == data
+
+
+def test_logistic_mixer_roundtrip_with_extra_predictors(monkeypatch):
+    """Same, with structural predictors enabled via KOLMO_PREDICTORS.
+    Their observe()/mark_copy_end() state must mirror across both sides."""
+    monkeypatch.setattr(engine, "_MIXER_NAME", "logistic")
+    monkeypatch.setattr(
+        engine,
+        "_EXTRA_PREDICTOR_NAMES",
+        ["balanced_delimiter", "after_number", "in_text", "position_modulo"],
+    )
+    data = b"<page>[[Wiki link|alias]] {{cite|year=1942}} (note)</page>" * 4
+    blob = compress(data)
+    assert decompress(blob) == data

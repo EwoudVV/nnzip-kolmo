@@ -228,6 +228,7 @@ def compress(data: bytes) -> bytes:
         byte = data[pos]
         encoder.encode(byte, literal_model.probs(probs))
         observe_byte(byte)
+        literal_model.train_on_literal(byte)
         pos += 1
 
     payload = encoder.finish()

@@ -159,6 +159,7 @@ def decompress(blob: bytes) -> bytes:
         byte = decoder.decode(literal_model.probs(probs))
         output.append(byte)
         observe_byte(byte)
+        literal_model.train_on_literal(byte)
         decoded_total += 1
 
     return bytes(output)
