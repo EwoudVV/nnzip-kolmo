@@ -45,15 +45,34 @@ Env knobs: `KOLMO_LOGISTIC_BUCKETS` (1/4/16), `KOLMO_LOGISTIC_LR`,
 warm start `neural=1.0, ppm=0.4` (override via KOLMO_LINEAR_WEIGHTS).
 
 ### Bit-tree bench (draft model, enwik9, KOLMO_SKIP_PRIME=1)
-| Config | 8 KB bpb | 16 KB bpb |
-|---|---|---|
-| cost_aware (default) | 2.8633 | 2.9219 |
-| logistic, no extras, b=16 | 2.8008 | — |
-| logistic+4p, b=16, lr=.01 | 2.7812 | 2.8496 |
-| logistic+4p, b=4, lr=.01 | 2.7422 | — |
-| **logistic+4p, b=1, lr=.01** | **2.6797** | **2.7949** |
-| logistic+4p, b=1, lr=.02 | 2.6719 | — |
-| logistic+4p, b=16, lr=.002 | 2.8633 | — |
+| Config | 8 KB bpb | 16 KB bpb | 64 KB bpb |
+|---|---|---|---|
+| cost_aware (default) | 2.8633 | 2.9219 | — |
+| logistic, no extras, b=16 | 2.8008 | — | — |
+| logistic, no extras, b=1 | — | 2.8301 | — |
+| logistic+4p, b=16, lr=.01 | 2.7812 | 2.8496 | — |
+| logistic+4p, b=4, lr=.01 | 2.7422 | — | — |
+| **logistic+4p, b=1, lr=.01** | **2.6797** | **2.7949** | **2.6475** |
+| logistic+4p, b=1, lr=.02 | 2.6719 | — | — |
+| logistic+4p, b=16, lr=.002 | 2.8633 | — | — |
+| logistic+4p+match, b=1 | 2.6797 | 2.7949 | 2.6484 |
+
+16 KB decomposition: mixer alone = −0.092 vs default; the 4 structural
+predictors add −0.035 on top.
+
+### MatchPredictor: null as ensemble predictor (do not re-bench as-is)
+The order-∞ match model (hash table -> last occurrence of the order-6
+context, verified pointer, adaptive per-length-bucket confidence) is
+individually strong — fires on 48% of bytes at 64 KB with 71% hit rate,
+fire rate grows with history (40% -> 56% across the first 64 KB). But
+as an ensemble member it adds exactly 0 bytes at 8/16 KB and +8 B at
+64 KB: everywhere it is right, the LZ77 copy path or neural+PPM already
+covered it, and the mixer correctly learns ~zero weight for it (the
++8 B is the cost of learning that). Shipped anyway (registry name
+"match") as reference + infrastructure. The promising follow-up is
+match state as MIXER CONTEXT, not predictor: PAQ lineage uses "is a
+match active / how long" to select mixer weight sets — that extracts
+the signal even where the prediction is redundant.
 
 Findings: (1) learned mixing alone beats the hand-tuned default by
 -0.06 bpb; (2) the 4 structural predictors add real signal on top;

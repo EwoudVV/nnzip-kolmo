@@ -12,9 +12,9 @@ This is the same architecture that the current Hutter Prize contenders use, in c
 |---:|---|---|
 | 1 | PyTorch online-training prototype, single machine | ✅ done |
 | 2 | Bit-deterministic on a single machine (drop PyTorch's nondeterminism) | ✅ done — `KOLMO_FIXED=1` |
-| 3 | Beat gzip on real enwik prefixes, then chase nnzip / Hutter-scale ratios | ✅ started — beats `gzip -9` on 16-128 KB enwik9 prefixes |
+| 3 | Beat gzip on real enwik prefixes | ✅ done — beats `gzip -9` by 5-7% on 16-128 KB enwik9 prefixes |
 | 4 | Cross-platform fixed-point math (Mac/Linux/x86/ARM identical) | ✅ done (folded into Rung 2 via Q15 integer engine; CI verifies on every push) |
-| 5 | Match SOTA on enwik9 (~0.85 bpb) | — |
+| 5 | Climb toward SOTA on enwik9 (~0.85 bpb) | 🔨 **current focus** — predictor ensemble + learned bit-tree mixing landed June 2026 (−4.3% over the hand-tuned blend at 16 KB, opt-in) |
 | 6 | Submit to Marcus Hutter and win the actual prize | — |
 
 Rungs 2 and 4 collapsed into one fix: a Q15 fixed-point integer engine (forward, backward, Adam, KV cache, training step). Integer addition is associative regardless of SIMD width or thread count, so the same input produces byte-identical output on Mac, Linux, x86, and ARM. CI on every push runs four hash probes on all three OSes and fails if any runner's transcript drifts from the others.
@@ -93,6 +93,59 @@ Result: `kolmo` in fixed mode produces a SHA-256-identical blob on Mac, Windows,
 - **Adaptive byte-context literal model**: literals are encoded under a blend of transformer probabilities and a mirrored byte model. The default (`KOLMO_LITERAL=ppm`) is a **PPM-C escape blend**: walk the longest available order (4 → 2 → 1 → 0 with optional 3/5), at each order spend `p(b) = count[b] / (sum + distinct)` for bytes seen there and `escape = distinct / (sum + distinct)` for everything else. Each byte pays the escape cost only for orders that didn't match, instead of paying a static blend weight every time. The final blend weight is **cost-aware** (`KOLMO_ADAPTIVE_WEIGHT=1`, default on): when PPM's distribution is sharply peaked on one byte (max(p_ppm) close to 1) the neural model is mostly noise and we let PPM dominate (weight `LITERAL_NEURAL_WEIGHT_LOW=0.20`); when PPM is near-uniform (cold contexts) the neural model is the only signal and gets `LITERAL_NEURAL_WEIGHT_HIGH=0.70`. On a 16 KB enwik9 prefix the full preset lands at 2.906 bpb (with the default order-3 walk also on) — −0.047 bpb vs the legacy `KOLMO_LITERAL=mix` fixed-weight blend (40% order-2 + 20% hashed order-4 + 2% order-1 + 0.5% order-0 + remainder neural), which is still available as an opt-in. Disable adaptive (`KOLMO_ADAPTIVE_WEIGHT=0`) to fall back to a fixed `KOLMO_NEURAL_WEIGHT=0.50` blend for historical comparison. The dense order-2 table is bounded at 64 MB (`65536 * 256 * uint32`); the order-4 table is a fixed-size hashed table with SplitMix-style bucket mixing so repeated wiki markup/text contexts are learned immediately without unbounded memory.
 - **RoPE positional encoding**: PyTorch mode defaults to rotary position embeddings instead of learned absolute `pos_emb`; this removed the dead position table and improved enwik prefix ratios.
 - **Deterministic-quantized probabilities** (`det_probs.py`): logits are snapped to a 1/64 grid and converted to integer frequencies on a `2^16` total before they touch the arithmetic coder. This isolates the coder from any residual float drift in PyTorch mode.
+
+## Predictor ensemble + learned mixing (June 2026)
+
+The literal model is now a **PAQ-style ensemble**: any number of cheap
+predictors (each a small class in `kolmo/_predictors.py`) plus a mixer
+that combines their distributions with the transformer's. The default
+mixer is still the hand-tuned cost-aware blend (so default output is
+byte-identical to before), but the interesting one is opt-in:
+
+```sh
+KOLMO_MIXER=logistic KOLMO_PREDICTORS=balanced_delimiter,after_number,in_text,position_modulo kolmo c file
+```
+
+`BitTreeLogisticMixer` does true PAQ-family logistic mixing: each byte
+is coded as 8 binary decisions (MSB first), every predictor's 256-way
+distribution induces an exact binary opinion at each of the 255 nodes of
+that decision tree (integer-exact), opinions are mixed in logit space
+with **online-learned weights**, and the output distribution is the
+product of per-level factors — it sums to 1 by construction. The mixer
+trains itself during compression (8 bit-level SGD updates per literal)
+and the decompressor mirrors every update, so the weights never need to
+be stored. A predictor with no opinion contributes exactly logit 0 and
+gets no gradient — being wrong is cheap, so predictors are cheap to try.
+
+(A first byte-wise attempt — mix all 256 logits, squash, renormalize —
+failed badly: renormalizing 256 independent estimates destroys confident
+predictions. Post-mortem in `AGENTS.md`. The bit-tree formulation has no
+renormalization step, which is the whole point.)
+
+No libm in the runtime path: stretch/squash are precomputed Q15 integer
+tables (generator committed as `kolmo/_generate_tables.py`), so the
+logistic path is cross-platform deterministic by the same integer-math
+argument as the fixed-point engine.
+
+Measured on enwik9 prefixes (draft preset, `KOLMO_SKIP_PRIME=1`):
+
+| Config | 8 KB bpb | 16 KB bpb |
+|---|---:|---:|
+| cost-aware blend (default) | 2.8633 | 2.9219 |
+| logistic mixer alone | 2.8008 | 2.8301 |
+| logistic + 4 structural predictors | **2.6797** | **2.7949** |
+
+The learned mixer alone beats the hand-tuned blend, and the structural
+predictors (bracket-nesting depth, digit-run state, XML text-vs-markup,
+line position) add real signal on top. One context bucket beats sixteen
+at these sizes — specialized weights starve for training data below
+~64 KB — so `KOLMO_LOGISTIC_BUCKETS=1` is the right call for small
+payloads until the crossover point is mapped.
+
+Adding a predictor is deliberately trivial: subclass `Predictor` (two
+methods: `probs()` returning a 256-way distribution or `None`, and
+`observe(byte)`), add one line to the `EXTRA_PREDICTORS` registry, and
+bench it with the env var. The mixer learns its weight automatically.
 
 ## Speed (May 2026)
 
@@ -211,6 +264,13 @@ python benchmarks/determinism/hash_fixed_compress.py
 | `KOLMO_DEVICE` | auto | force PyTorch path to `cpu` or `cuda` |
 | `KOLMO_MODEL` | `full` | `draft` selects a smaller 1.4 M model for faster iteration (set on both compress + decompress; blobs aren't interchangeable) |
 | `KOLMO_USE_ROPE` | `1` | `0` falls back to learned absolute position embeddings |
+| `KOLMO_LITERAL` | `ppm` | literal side-model strategy; `mix` selects the legacy fixed-weight blend |
+| `KOLMO_ADAPTIVE_WEIGHT` | `1` | `0` disables the cost-aware neural/PPM blend weight (fixed 0.50 fallback) |
+| `KOLMO_MIXER` | `cost_aware` | `logistic` enables the learned bit-tree mixer; `linear` a static N-way blend (set on both sides) |
+| `KOLMO_PREDICTORS` | (empty) | comma-separated structural predictors to register, e.g. `balanced_delimiter,after_number,in_text,position_modulo,match` |
+| `KOLMO_LOGISTIC_BUCKETS` | `16` | mixer weight-context buckets (1/4/16); use `1` below ~64 KB |
+| `KOLMO_LOGISTIC_LR` | `0.01` | mixer SGD learning rate |
+| `KOLMO_LINEAR_WEIGHTS` | `neural:0.40,ppm:0.50,post_copy:0.10` | weights for `linear`; also overrides the logistic warm start |
 
 ## License
 
