@@ -9,7 +9,10 @@ trajectory.
 """
 
 import math
+import os
 import struct
+import sys
+import time
 
 from kolmo._engine import (
     BOS,
@@ -40,6 +43,13 @@ MAGIC = b"KMO2"
 def compress(data: bytes) -> bytes:
     if len(data) == 0:
         raise ValueError("cannot compress empty data")
+
+    # Live progress on stderr (KOLMO_PROGRESS=1). Read at call time, not
+    # module load, so notebooks can toggle it via os.environ between
+    # calls. Reporting only reads state — the coded stream is unaffected.
+    progress = os.environ.get("KOLMO_PROGRESS", "0") == "1"
+    progress_t0 = time.time()
+    progress_next = 4096
 
     model, optimizer = new_model_and_optimizer()
     encoder = RangeEncoder()
@@ -179,6 +189,17 @@ def compress(data: bytes) -> bytes:
 
     pos = 0
     while pos < len(data):
+        if progress and pos >= progress_next:
+            elapsed = time.time() - progress_t0
+            print(
+                f"[kolmo c] {pos}/{len(data)}"
+                f" ({100.0 * pos / len(data):5.1f}%)"
+                f"  {encoder.bits_written / pos:.4f} bpb so far"
+                f"  {pos / max(elapsed, 1e-9):.0f} B/s",
+                file=sys.stderr,
+                flush=True,
+            )
+            progress_next += 4096
         copy = choose_copy(pos)
         if copy is not None:
             offset, length = copy

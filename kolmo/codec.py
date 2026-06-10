@@ -28,6 +28,12 @@ class RangeEncoder:
     def encode_uniform(self, symbol: int, n_symbols: int) -> None:
         self.encode(symbol, np.ones(n_symbols, dtype=np.float64) / n_symbols)
 
+    @property
+    def bits_written(self) -> int:
+        """Bits emitted so far. Read-only; used by KOLMO_PROGRESS reporting
+        to show the running bpb while a compress is in flight."""
+        return int(self._enc.num_bits())
+
     def finish(self) -> bytes:
         return self._enc.get_compressed().tobytes()
 

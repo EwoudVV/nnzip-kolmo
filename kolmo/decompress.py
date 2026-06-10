@@ -6,7 +6,10 @@ recent output history. Both paths still feed the reconstructed bytes through
 the model and train every BLOCK_SIZE bytes.
 """
 
+import os
 import struct
+import sys
+import time
 
 from kolmo._engine import (
     BOS,
@@ -35,6 +38,11 @@ def decompress(blob: bytes) -> bytes:
         raise ValueError(f"not a kolmo blob (expected magic {MAGIC!r})")
     n_bytes = struct.unpack(">I", blob[4:8])[0]
     payload = blob[8:]
+
+    # Mirror of the compress-side progress hook; see compress.py.
+    progress = os.environ.get("KOLMO_PROGRESS", "0") == "1"
+    progress_t0 = time.time()
+    progress_next = 4096
 
     model, optimizer = new_model_and_optimizer()
     decoder = RangeDecoder(payload)
@@ -106,6 +114,16 @@ def decompress(blob: bytes) -> bytes:
 
     decoded_total = 0
     while decoded_total < n_bytes:
+        if progress and decoded_total >= progress_next:
+            elapsed = time.time() - progress_t0
+            print(
+                f"[kolmo d] {decoded_total}/{n_bytes}"
+                f" ({100.0 * decoded_total / n_bytes:5.1f}%)"
+                f"  {decoded_total / max(elapsed, 1e-9):.0f} B/s",
+                file=sys.stderr,
+                flush=True,
+            )
+            progress_next += 4096
         event = decoder.decode(event_model.probs())
         event_model.observe(event)
         if event == 1:
