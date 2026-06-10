@@ -184,3 +184,14 @@ def test_logistic_mixer_roundtrip_with_extra_predictors(monkeypatch):
     data = b"<page>[[Wiki link|alias]] {{cite|year=1942}} (note)</page>" * 4
     blob = compress(data)
     assert decompress(blob) == data
+
+
+def test_logistic_mixer_roundtrip_with_match_predictor(monkeypatch):
+    """Match predictor state (pointer, table, confidence counters) must
+    mirror exactly across compress/decompress, including across copy
+    events that feed observe() in batches."""
+    monkeypatch.setattr(engine, "_MIXER_NAME", "logistic")
+    monkeypatch.setattr(engine, "_EXTRA_PREDICTOR_NAMES", ["match"])
+    data = b"the cat sat on the mat. the cat sat on the hat. " * 5
+    blob = compress(data)
+    assert decompress(blob) == data

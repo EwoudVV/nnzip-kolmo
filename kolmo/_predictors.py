@@ -726,6 +726,121 @@ class PositionModuloPredictor(Predictor):
         pass
 
 
+class MatchPredictor(Predictor):
+    """Predicts the continuation of the longest recent repeat of the
+    current context — the PAQ-family "match model".
+
+    PPM tops out at order 5; this is effectively order-infinity. A hash
+    table maps the order-K context (last K bytes) to the position right
+    after its most recent occurrence. When the current context matches a
+    past one (byte-verified, so hash collisions can't fake a match), the
+    predictor points at the byte that followed last time and keeps
+    advancing the pointer as long as reality keeps agreeing — a match of
+    length 200 keeps predicting with no table lookups at all.
+
+    Why this still earns its keep next to the LZ77 copy events: copies
+    only fire when a repeat is long enough to amortize its offset/length
+    header, and the encoder must *commit* at the repeat start. The match
+    model predicts the first bytes of every repeat (before a copy becomes
+    worthwhile), covers short repeats the copy path rejects, and costs
+    nothing when wrong — the mixer just down-weights it.
+
+    Confidence is not hand-tuned: per match-length-bucket (hit, miss)
+    counters learn "how often is a length-L match right on THIS data" and
+    probs() emits that learned probability as a spike on the predicted
+    byte with the remainder spread uniformly. In bit-tree mixing a spike
+    distribution votes only along the predicted byte's path — exactly the
+    right shape for a single-byte oracle.
+
+    Cross-OS determinism: history compares and table updates are pure
+    integer/bytes ops; the only float math is one IEEE division per
+    probs() call and the counter increments. No libm, no reductions.
+
+    Memory: the history buffer mirrors the full input (1 GB at enwik9 —
+    inside the 10 GB Hutter envelope) and the table is 8 MB.
+    """
+
+    name = "match"
+
+    def __init__(
+        self,
+        min_match: int = 6,
+        table_buckets: int = 1 << 20,
+    ):
+        self.min_match = min_match
+        self.table_buckets = table_buckets
+        # hash(context) -> index of the byte that followed that context,
+        # -1 for never-seen. Recency wins on collision; the byte-verify
+        # at acquisition repairs any false positive.
+        self.table = np.full(table_buckets, -1, dtype=np.int64)
+        self.history = bytearray()
+        self._ptr = -1  # index in history of the predicted next byte
+        self._match_len = 0
+        # (hit, miss) per match-length bucket, prior 1.0 each so a fresh
+        # bucket predicts 0.5 and adapts from there. Bucket = bit_length
+        # of the match length, clamped — lengths 6..7 share a bucket,
+        # 8..15 the next, etc.
+        self.length_stats = np.ones((16, 2), dtype=np.float64)
+
+    def _bucket(self) -> int:
+        b = self._match_len.bit_length()
+        return b if b < 15 else 15
+
+    def _context_hash(self) -> int:
+        ctx = int.from_bytes(self.history[-self.min_match :], "little")
+        return literal_context_bucket(ctx, self.table_buckets)
+
+    def probs(self) -> np.ndarray | None:
+        if self._ptr < 0:
+            return None
+        stats = self.length_stats[self._bucket()]
+        p = stats[0] / (stats[0] + stats[1])
+        out = np.full(256, (1.0 - p) / 255.0, dtype=np.float64)
+        out[self.history[self._ptr]] = p
+        return out
+
+    def observe(self, byte: int) -> None:
+        byte = int(byte)
+        # 1. Score the prediction that was live for this byte (if any).
+        if self._ptr >= 0:
+            if self.history[self._ptr] == byte:
+                self.length_stats[self._bucket(), 0] += 1.0
+                self._ptr += 1
+                self._match_len += 1
+            else:
+                self.length_stats[self._bucket(), 1] += 1.0
+                self._ptr = -1
+                self._match_len = 0
+
+        # 2. Reveal the byte.
+        self.history.append(byte)
+
+        if len(self.history) < self.min_match:
+            return
+        h = self._context_hash()
+
+        # 3. Try to (re)acquire a match — lookup BEFORE the store below so
+        # we can only ever match a strictly earlier occurrence.
+        if self._ptr < 0:
+            pos = int(self.table[h])
+            if (
+                pos >= self.min_match
+                and self.history[pos - self.min_match : pos]
+                == self.history[-self.min_match :]
+            ):
+                self._ptr = pos
+                self._match_len = self.min_match
+
+        # 4. Record where the continuation of the current context will be.
+        self.table[h] = len(self.history)
+
+    def mark_copy_end(self, last_byte: int) -> None:
+        # Copied bytes already flowed through observe() on both sides, so
+        # the match state (including matches that span the copy) is
+        # current. Nothing extra to do.
+        pass
+
+
 def _encode_context(ctx: list[int], max_len: int) -> int:
     """Pack the last up-to-`max_len` bytes of `ctx` into an integer.
 
@@ -1176,4 +1291,5 @@ EXTRA_PREDICTORS: dict[str, type[Predictor]] = {
     AfterNumberPredictor.name: AfterNumberPredictor,
     InTextPredictor.name: InTextPredictor,
     PositionModuloPredictor.name: PositionModuloPredictor,
+    MatchPredictor.name: MatchPredictor,
 }

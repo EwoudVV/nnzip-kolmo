@@ -1052,3 +1052,74 @@ def test_kolmo_predictors_env_registration(monkeypatch):
     model = LiteralModel()
     names = [p.name for p in model._extra_predictors]
     assert names == ["balanced_delimiter", "after_number"]
+
+
+# --- MatchPredictor ---------------------------------------------------------
+
+
+def test_match_predictor_acquires_verified_match():
+    from kolmo._predictors import MatchPredictor
+
+    m = MatchPredictor()
+    for b in b"0123456789abcdef____0123456789":
+        m.observe(b)
+    # Context "456789" matched its earlier occurrence; continuation is 'a'.
+    probs = m.probs()
+    assert probs is not None
+    assert int(np.argmax(probs)) == ord("a")
+    assert np.isclose(probs.sum(), 1.0)
+
+
+def test_match_predictor_silent_without_repeat():
+    from kolmo._predictors import MatchPredictor
+
+    m = MatchPredictor()
+    for b in b"abcdefghijklmnopqrstuvwxyz":  # no 6-byte repeat
+        m.observe(b)
+    assert m.probs() is None
+
+
+def test_match_predictor_confidence_adapts_to_misses():
+    from kolmo._predictors import MatchPredictor
+
+    m = MatchPredictor()
+    # The 6-byte context "abcdef" recurs but its continuation always
+    # differs, so every acquired match immediately misses. The learned
+    # confidence for the min-length bucket must drop well below prior.
+    for tail in b"0123456789":
+        for b in b"abcdef":
+            m.observe(b)
+        m.observe(tail)
+    for b in b"abcdef":
+        m.observe(b)
+    probs = m.probs()
+    assert probs is not None
+    assert probs.max() < 0.3  # learned: length-6 matches are unreliable here
+
+
+def test_match_predictor_pointer_never_dangles():
+    from kolmo._predictors import MatchPredictor
+
+    rng = np.random.default_rng(7)
+    m = MatchPredictor(min_match=4)
+    # Periodic + noise stresses acquire/extend/miss cycling.
+    data = bytes(rng.integers(0, 8, size=2000).astype(np.uint8)) * 2
+    for b in data:
+        p = m.probs()
+        if p is not None:
+            assert m._ptr < len(m.history)
+        m.observe(b)
+
+
+def test_match_predictor_via_literal_model(monkeypatch):
+    monkeypatch.setattr(engine, "_MIXER_NAME", "logistic")
+    monkeypatch.setattr(engine, "_EXTRA_PREDICTOR_NAMES", ["match"])
+    model = LiteralModel()
+    assert [p.name for p in model._extra_predictors] == ["match"]
+    for b in b"the cat sat. the cat sat. the cat":
+        model.observe(b)
+    neural = np.full(256, 1.0 / 256, dtype=np.float64)
+    probs = model.probs(neural)
+    assert probs.shape == (256,)
+    assert np.all(probs > 0.0)
+    assert np.isclose(probs.sum(), 1.0)
