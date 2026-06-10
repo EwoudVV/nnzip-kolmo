@@ -67,11 +67,22 @@ BEST = {
 }
 BASE = {"KOLMO_MODEL": "draft", "KOLMO_SKIP_PRIME": "1", "KOLMO_PROGRESS": "1"}
 
+def _buckets(n: int) -> dict:
+    return {**BEST, "KOLMO_LOGISTIC_BUCKETS": str(n)}
+
+
 CONFIGS = [
-    # Pipeline-validation campaign: one quick sanity row, then the 64 KB
-    # point the notebook session didn't cover (Mac CPU reference: 743s).
-    ("cuda | best b=1 |  8K", 8192, {"KOLMO_DEVICE": "cuda", **BEST}),
-    ("cuda | best b=1 | 64K", 65536, {"KOLMO_DEVICE": "cuda", **BEST}),
+    # Bucket-crossover + default-flip campaign (~6-7 h on T4 hardware).
+    # Question 1: at what scale do bucketed mixer weights (more
+    # specialization, less data per weight) overtake b=1? At <=64 KB,
+    # b=1 wins decisively. Question 2: does logistic keep beating the
+    # cost_aware default as size grows? (default-flip evidence)
+    ("128K | logistic b=1 ", 131072, {"KOLMO_DEVICE": "cuda", **_buckets(1)}),
+    ("128K | logistic b=16", 131072, {"KOLMO_DEVICE": "cuda", **_buckets(16)}),
+    ("256K | cost_aware   ", 262144, {"KOLMO_DEVICE": "cuda"}),
+    ("256K | logistic b=1 ", 262144, {"KOLMO_DEVICE": "cuda", **_buckets(1)}),
+    ("256K | logistic b=4 ", 262144, {"KOLMO_DEVICE": "cuda", **_buckets(4)}),
+    ("256K | logistic b=16", 262144, {"KOLMO_DEVICE": "cuda", **_buckets(16)}),
 ]
 
 CHILD = """
@@ -97,8 +108,10 @@ for label, size, extra in CONFIGS:
     print(f"\n========== {label} ==========", flush=True)
     env = dict(os.environ, **BASE, **extra)
     code = CHILD.replace("SIZE", str(size)).replace("LABEL", label)
+    # 256 KB at T4-host speed extrapolates to ~70 min/config; give each
+    # config 2.5 h before declaring it hung. Kernel ceiling is 12 h.
     r = subprocess.run(
-        [sys.executable, "-c", code], cwd=SRC, env=env, timeout=3000
+        [sys.executable, "-c", code], cwd=SRC, env=env, timeout=9000
     )
     if r.returncode != 0:
         open(f"{WORK}/results.txt", "a").write(f"{label}  FAILED rc={r.returncode}\n")
